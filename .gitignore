@@ -1,0 +1,51 @@
+# Rust build artifacts
+/target
+
+# Local build temp (MinGW toolchains etc.)
+/temp
+
+# Release outputs (use GitHub Releases instead)
+/dist
+
+# Build logs
+*.log
+build_log*.txt
+check_*.log
+build_out.log
+build_err.log
+test_out.txt
+build_verify.txt
+
+# Backups
+*.bak*
+*.corrupt_bak
+
+# Local runtime config (may contain server paths)
+mcsrv_config.json
+
+# PCL2 reference code (optional: keep if you want them in repo, remove these 3 lines to include)
+pcl_*.cs
+pcl_*.xaml
+
+# Temp html
+temp_*.html
+
+# OS / editor
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp
+
+# Rust toolchain local override
+.cargo/
+
+# Vendored crate copy (not required for build; source replacement via .cargo/config.toml)
+/vendor
+
+# PCL-CE reference data (no code reference)
+pclce_tree.json
+
+# Session handover notes (internal)
+会话交接_*.md
+/docs/session-handover-*.md

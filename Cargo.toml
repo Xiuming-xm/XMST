@@ -1,0 +1,50 @@
+﻿[package]
+name = "xmst"
+version = "0.1.0-alpha"
+edition = "2021"
+description = "Xiuming's Minecraft Server Tool - Minecraft 服务器运行管理工具"
+default-run = "xmst"
+# Bug2: GUI 子系统，无控制台窗口；消除 conhost 常驻与 PowerShell 子进程窗口闪现
+windows_subsystem = "windows"
+
+[[bin]]
+name = "xmst"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.29"
+egui_extras = { version = "0.29", features = ["image"] }
+# egui_extras 的 image 加载器默认不含 webp 解码，显式启用以支持 Modrinth webp 图标
+image = { version = "0.25", features = ["webp"] }
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# Spark 输出文件解析（.sparkprofile/.sparkhealth = gzip 压缩的 protobuf）：本批引入依赖链，解析在下一批实现
+flate2 = "1"
+prost = "0.13"
+walkdir = "2"
+filetime = "0.2"
+rhai = "1"
+libc = "0.2"
+winapi = { version = "0.3", features = ["winbase", "wincon", "processenv", "handleapi", "synchapi", "fileapi", "namedpipeapi", "processthreadsapi", "errhandlingapi", "winerror", "winnt", "winuser", "tlhelp32", "psapi", "sysinfoapi", "winreg", "iphlpapi", "iprtrmib", "ifmib", "tcpestats", "memoryapi", "winsock2", "ntdef", "minwindef", "libloaderapi", "jobapi2"] }
+tray-icon = "0.19"
+encoding_rs = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json", "gzip"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[build-dependencies]
+embed-resource = "3"
+prost-build = "0.13"
+# prost-build 编译 proto 需要 protoc 二进制；开发机未安装 protoc 时使用 vendored 预编译版
+protoc-bin-vendored = "3"
+
