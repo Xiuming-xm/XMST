@@ -41,17 +41,19 @@ impl ThemeColors {
     }
 
     pub fn light() -> Self {
+        // 用户反馈「日间模式太亮、文字怪怪的」：把整体亮度压一档（纯白面板 → 略灰），
+        // 文字用接近纯黑的高对比深灰，控件底色与描边都比旧值更明确一点。
         Self {
-            bg: Color32::from_rgb(244, 244, 246),
-            panel: Color32::from_rgb(255, 255, 255),
-            text: Color32::from_rgb(38, 38, 42),
-            // weak: needs >= 4.5:1 on #f4f4f6 (WCAG AA body); gray 95 gives ~5.6:1.
-            weak: Color32::from_rgb(95, 95, 103),
-            accent: Color32::from_rgb(45, 75, 65), // light_adapt((28,150,130))
-            widget_bg: Color32::from_rgb(222, 222, 226),
-            widget_hover: Color32::from_rgb(204, 204, 210),
-            widget_active: Color32::from_rgb(186, 186, 194),
-            stroke: Color32::from_rgb(150, 150, 158),
+            bg: Color32::from_rgb(233, 235, 239),
+            panel: Color32::from_rgb(245, 246, 249),
+            text: Color32::from_rgb(28, 30, 34),
+            // weak: needs >= 4.5:1 on the panel; gray 88 gives ~6:1.
+            weak: Color32::from_rgb(88, 90, 98),
+            accent: Color32::from_rgb(38, 68, 60), // light_adapt((28,150,130))
+            widget_bg: Color32::from_rgb(219, 221, 226),
+            widget_hover: Color32::from_rgb(202, 205, 212),
+            widget_active: Color32::from_rgb(184, 188, 196),
+            stroke: Color32::from_rgb(154, 156, 164),
         }
     }
 

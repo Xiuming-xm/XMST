@@ -806,6 +806,8 @@ struct DlUiState {
     mod_search_busy: bool,
     /// 搜索参数在搜索进行中再次变化时置位：完成后立即用最新参数重搜（修复调数量后只显示一页/一个）
     mod_search_pending: bool,
+    /// 本页是否已做过首次自动搜索（进入搜索页时空关键词拉一批热门，避免空列表）
+    mod_search_started: bool,
     mod_search_error: Option<String>,
     mod_download_name: String,
     mod_download_target: String,
@@ -921,6 +923,7 @@ impl Default for DlUiState {
             mod_results: Vec::new(),
             mod_search_busy: false,
             mod_search_pending: false,
+            mod_search_started: false,
             mod_search_error: None,
             mod_download_name: String::new(),
             mod_download_target: String::new(),
@@ -5159,17 +5162,77 @@ fn single_instance_check() -> bool {
     }
 }
 
+/// 读取服务器目录里 .bat 的 `set "MAX_RESTARTS=n"`（用于发现 bat 自带的重启循环）。
+fn read_bat_max_restarts(dir: &Path) -> Option<(String, i32)> {
+    let rd = std::fs::read_dir(dir).ok()?;
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.extension().map(|x| x.eq_ignore_ascii_case("bat")).unwrap_or(false) {
+            let Ok(s) = std::fs::read_to_string(&p) else { continue };
+            for line in s.lines() {
+                let l = line.trim();
+                if l.to_ascii_uppercase().contains("MAX_RESTARTS") {
+                    // set "MAX_RESTARTS=5" / set MAX_RESTARTS=5
+                    if let Some(v) = l.split('=').nth(1) {
+                        let n = v.trim().trim_matches('"').trim().parse::<i32>().ok()?;
+                        return Some((
+                            p.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                            n,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 把 .bat 里的 `MAX_RESTARTS` 改成指定值（保持其它内容不变）。返回被修改的文件名。
+fn write_bat_max_restarts(dir: &Path, value: i32) -> Result<String, String> {
+    let rd = std::fs::read_dir(dir).map_err(|e| e.to_string())?;
+    for e in rd.flatten() {
+        let p = e.path();
+        if !p.extension().map(|x| x.eq_ignore_ascii_case("bat")).unwrap_or(false) {
+            continue;
+        }
+        let s = std::fs::read_to_string(&p).map_err(|e| e.to_string())?;
+        if !s.to_ascii_uppercase().contains("MAX_RESTARTS") {
+            continue;
+        }
+        let mut out = String::with_capacity(s.len());
+        for line in s.lines() {
+            if line.to_ascii_uppercase().contains("MAX_RESTARTS") && line.contains('=') {
+                let indent: String = line.chars().take_while(|c| c.is_whitespace()).collect();
+                // 保留原有的 set 写法风格
+                if line.contains('"') {
+                    out.push_str(&format!("{indent}set \"MAX_RESTARTS={value}\""));
+                } else {
+                    out.push_str(&format!("{indent}set MAX_RESTARTS={value}"));
+                }
+            } else {
+                out.push_str(line);
+            }
+            out.push('\n');
+        }
+        std::fs::write(&p, out).map_err(|e| e.to_string())?;
+        return Ok(p.file_name().unwrap_or_default().to_string_lossy().to_string());
+    }
+    Err("未找到含 MAX_RESTARTS 的 .bat".to_string())
+}
+
 /// 在资源管理器中定位到某个文件/目录（文件则选中它）。
+///
+/// 注意：**不要**用 `raw_arg` 传带引号的整串，也不要给 explorer.exe 加 CREATE_NO_WINDOW ——
+/// 实测会弹出「explorer.exe 应用程序无法正常启动(0xc0000142)」错误框，而且资源管理器不打开。
+/// 这里用最标准的写法：`explorer /select,<path>` 两个参数分开传。
 fn reveal_in_explorer(p: &Path) {
-    use std::os::windows::process::CommandExt;
-    let _ = std::process::Command::new("explorer.exe")
-        .raw_arg(if p.is_dir() {
-            format!("\"{}\"", p.display())
-        } else {
-            format!("/select,\"{}\"", p.display())
-        })
-        .creation_flags(0x08000000)
-        .spawn();
+    let mut cmd = std::process::Command::new("explorer.exe");
+    if p.is_dir() {
+        cmd.arg(p);
+    } else {
+        cmd.arg("/select,").arg(p);
+    }
+    let _ = cmd.spawn();
 }
 
 /// 目录体积（人类可读，如 "1.2 GB"）；不存在返回 "—"。
@@ -6209,13 +6272,14 @@ impl eframe::App for App {
         // 超长 repaint 请求休眠，托盘恢复由全局回调 request_repaint 唤醒。
 
         // 顶部栏（无背景标题：XMST + 小版本号；右侧为工具内窗口按钮：最小化/最大化/关闭）
-        // 材质模式下用 window_fill（= 材质的近不透明版）而不是硬编码色，
-        // 否则顶栏会是一块与其余部分不同色系的实心块。
+        // ★ 颜色必须跟随调色板：此前 Default 分支写死了近黑色 (22,25,32)，
+        // 于是**日间模式下顶栏依旧全黑**（用户截图反馈）。现在一律取当前调色板的 panel，
+        // 材质模式下取 window_fill（= 材质的近不透明版），保证与内容区同色系。
         egui::TopBottomPanel::top("top")
             .frame(
                 egui::Frame::none()
                     .fill(match self.plugin_bg_style {
-                        plugins::BgStyle::Default => Color32::from_rgb(22, 25, 32),
+                        plugins::BgStyle::Default => self.theme_cur.panel,
                         _ => ctx.style().visuals.window_fill,
                     })
                     .inner_margin(egui::Margin::symmetric(12.0, 5.0)),
@@ -6341,14 +6405,14 @@ impl eframe::App for App {
                                         egui::pos2(m.x - 5.0, m.y - 5.0),
                                         egui::pos2(m.x + 5.0, m.y + 5.0),
                                     ],
-                                    egui::Stroke::new(1.8, Color32::from_rgb(235, 238, 245)),
+                                    egui::Stroke::new(1.8, self.theme_cur.text),
                                 );
                                 p.line_segment(
                                     [
                                         egui::pos2(m.x + 5.0, m.y - 5.0),
                                         egui::pos2(m.x - 5.0, m.y + 5.0),
                                     ],
-                                    egui::Stroke::new(1.8, Color32::from_rgb(235, 238, 245)),
+                                    egui::Stroke::new(1.8, self.theme_cur.text),
                                 );
                             },
                         );
@@ -6360,7 +6424,7 @@ impl eframe::App for App {
                         let max_btn = titlebar_button(
                             ui,
                             "title_max",
-                            Color32::from_rgba_unmultiplied(150, 160, 180, 80),
+                            Color32::from_rgba_unmultiplied(self.theme_target.accent.r(), self.theme_target.accent.g(), self.theme_target.accent.b(), 60),
                             |p, rect| {
                                 let r = egui::Rect::from_min_max(
                                     egui::pos2(rect.left() + 8.0, rect.top() + 8.0),
@@ -6369,7 +6433,7 @@ impl eframe::App for App {
                                 p.rect_stroke(
                                     r,
                                     0.0,
-                                    egui::Stroke::new(1.6, Color32::from_rgb(235, 238, 245)),
+                                    egui::Stroke::new(1.6, self.theme_cur.text),
                                 );
                             },
                         );
@@ -6380,14 +6444,14 @@ impl eframe::App for App {
                         let min_btn = titlebar_button(
                             ui,
                             "title_min",
-                            Color32::from_rgba_unmultiplied(150, 160, 180, 80),
+                            Color32::from_rgba_unmultiplied(self.theme_target.accent.r(), self.theme_target.accent.g(), self.theme_target.accent.b(), 60),
                             |p, rect| {
                                 p.line_segment(
                                     [
                                         egui::pos2(rect.left() + 8.0, rect.center().y),
                                         egui::pos2(rect.right() - 8.0, rect.center().y),
                                     ],
-                                    egui::Stroke::new(1.6, Color32::from_rgb(235, 238, 245)),
+                                    egui::Stroke::new(1.6, self.theme_cur.text),
                                 );
                             },
                         );
@@ -6401,10 +6465,10 @@ impl eframe::App for App {
                         let theme_btn = titlebar_button(
                             ui,
                             "title_theme",
-                            Color32::from_rgba_unmultiplied(150, 160, 180, 80),
+                            Color32::from_rgba_unmultiplied(self.theme_target.accent.r(), self.theme_target.accent.g(), self.theme_target.accent.b(), 60),
                             |p, rect| {
                                 let m = rect.center();
-                                let ic = Color32::from_rgb(235, 238, 245);
+                                let ic = self.theme_cur.text;
                                 if is_custom_theme {
                                     // 调色板：三个彩色圆点
                                     p.circle_filled(m + egui::vec2(-5.0, 2.6), 2.6, Color32::from_rgb(28, 150, 130));
@@ -6444,7 +6508,7 @@ impl eframe::App for App {
                         egui::pos2(top_rect.left(), top_rect.bottom()),
                         egui::pos2(top_rect.right(), top_rect.bottom()),
                     ],
-                    egui::Stroke::new(1.0, Color32::from_rgb(44, 48, 58)),
+                    egui::Stroke::new(1.0, self.theme_cur.stroke),
                 );
             });
 
@@ -10491,6 +10555,47 @@ impl App {
             self.save_config();
             self.set_toast("崩溃重启设置已保存".to_string());
         }
+        // ★ run.bat 自带的 MAX_RESTARTS 重启循环与工具自重启会**叠加**（用户反馈"一直重启很多次"）。
+        // 这里读出来、明确告警，并提供一键同步按钮把 bat 里的上限改成工具的上限。
+        if let Some((bat, cur_max)) = read_bat_max_restarts(&sc.dir) {
+            let tool_max = self.cfg.servers[idx].crash_restart.max_restarts as i32;
+            egui::Frame::none()
+                .fill(self.theme_cur.widget_bg)
+                .stroke(egui::Stroke::new(1.0, self.theme_cur.stroke))
+                .rounding(6.0)
+                .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!("⚠ 检测到 {bat} 自带重启循环：MAX_RESTARTS={cur_max}"))
+                            .color(Color32::from_rgb(240, 176, 96)),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "它与「崩溃自动重启」叠加时会导致反复重启：建议只保留一处。\
+                             可以把 bat 的上限同步为工具的上限（或把 bat 改成 1 等于只用工具重启）。",
+                        )
+                        .weak()
+                        .small(),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(format!("把 MAX_RESTARTS 同步为 {tool_max}"))
+                            .clicked()
+                        {
+                            match write_bat_max_restarts(&sc.dir, tool_max) {
+                                Ok(f) => self.set_toast(format!("已更新 {f} 的 MAX_RESTARTS={tool_max}")),
+                                Err(e) => self.set_toast(format!("写入失败：{e}")),
+                            }
+                        }
+                        if ui.button("设为 1（等于只用工具重启）").clicked() {
+                            match write_bat_max_restarts(&sc.dir, 1) {
+                                Ok(f) => self.set_toast(format!("已更新 {f} 的 MAX_RESTARTS=1")),
+                                Err(e) => self.set_toast(format!("写入失败：{e}")),
+                            }
+                        }
+                    });
+                });
+        }
         // 崩溃重启状态展�?
         let rt = self.runtimes.get(idx);
         if let Some(rt) = rt {
@@ -12012,53 +12117,28 @@ impl App {
         sections[idx].anim = anim;
 
         let open = sections[idx].open;
-        // 头部：折叠箭头（随 anim 旋转/切换）+ 标题。
-        // 说明：之前两个分支写的是同一个字形（"▶" / "▶"），箭头永远不变 —— 用户感觉
-        // "折叠没有反馈、不如隧道管理那种丝滑"。现在箭头随动画在 ▼/▶ 间切换，
-        // 并给整行加悬停底色，与隧道管理页的行反馈一致。
-        let header_rect = ui.available_rect_before_wrap();
-        let resp = ui.interact(
-            egui::Rect::from_min_size(
-                header_rect.min,
-                egui::vec2(header_rect.width(), 22.0),
-            ),
-            ui.id().with(("sec_head", id)),
-            egui::Sense::click(),
-        );
-        let hover_t = ui.ctx().animate_bool_with_time(
-            ui.id().with(("sec_hover", id)),
-            resp.hovered(),
-            0.12,
-        );
-        if hover_t > 0.01 {
-            ui.painter().rect_filled(
-                resp.rect.expand2(egui::vec2(4.0, 2.0)),
-                5.0,
-                {
-                    let acc = ui.visuals().selection.bg_fill;
-                    Color32::from_rgba_unmultiplied(
-                        acc.r(),
-                        acc.g(),
-                        acc.b(),
-                        (20.0 * hover_t) as u8,
-                    )
-                },
-            );
-        }
+        // 头部：与隧道管理页（egui 内建 CollapsingHeader）**同款**：
+        // 三角箭头 + 标题（无分隔线、无自绘悬停块）——用户反馈"按钮、竖线之类的还是有区别"。
         ui.horizontal(|ui| {
-            let arrow = if anim > 0.5 { "▼" } else { "▶" };
-            let arrow_resp = ui.selectable_label(false, arrow);
-            if arrow_resp.clicked() || resp.clicked() {
+            let arrow = if anim > 0.5 { "⏷" } else { "⏵" };
+            if ui
+                .selectable_label(false, arrow)
+                .on_hover_text("展开/折叠")
+                .clicked()
+            {
                 sections[idx].open = !open;
             }
-            ui.label(RichText::new(title).strong());
+            if ui
+                .selectable_label(false, RichText::new(title).strong())
+                .clicked()
+            {
+                sections[idx].open = !open;
+            }
+            if let Some(h) = hint {
+                ui.label(RichText::new(h).weak().small());
+            }
         });
-        if let Some(h) = hint {
-            ui.label(RichText::new(h).weak());
-        }
         if anim <= 0.02 {
-            ui.add_space(24.0);
-            ui.separator();
             return sections;
         }
         let last_h = sections[idx].last_h.max(8.0);
@@ -15553,6 +15633,22 @@ impl App {
     /// 社区搜索页（图2 主界面：搜索栏 + 两行筛选 + 卡片网格 + 返回顶部）
     fn ui_dl_community_search(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
+        // 首次进入本页做一次空关键词搜索：直接显示热门模组，而不是空白一片
+        // （Modrinth 支持空查询，按下载量排序即可）。
+        if !self
+            .dl
+            .as_ref()
+            .map(|d| d.mod_search_started)
+            .unwrap_or(true)
+        {
+            if let Some(d) = self.dl.as_mut() {
+                d.mod_search_started = true;
+                if d.mod_sort.is_empty() {
+                    d.mod_sort = "downloads".to_string();
+                }
+            }
+            self.dl_mod_search_start();
+        }
         // 过滤栏统一间距（控件间距 8px）
         ui.style_mut().spacing.item_spacing.y = 8.0;
         ui.style_mut().spacing.item_spacing.x = 8.0;
