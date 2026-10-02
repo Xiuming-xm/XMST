@@ -602,6 +602,8 @@ enum Nav {
     Dashboard,
     Servers,
     Tunnel,
+    /// 工具自身日志（XMST 日志库 + 相关设置；与服务器日志无关，不按服务器拆分）
+    Logs,
     Settings,
     Download,
     Plugins,
@@ -808,6 +810,7 @@ struct DlUiState {
     mod_search_pending: bool,
     /// 本页是否已做过首次自动搜索（进入搜索页时空关键词拉一批热门，避免空列表）
     mod_search_started: bool,
+
     mod_search_error: Option<String>,
     mod_download_name: String,
     mod_download_target: String,
@@ -924,6 +927,7 @@ impl Default for DlUiState {
             mod_search_busy: false,
             mod_search_pending: false,
             mod_search_started: false,
+
             mod_search_error: None,
             mod_download_name: String::new(),
             mod_download_target: String::new(),
@@ -1542,6 +1546,16 @@ struct App {
     tray_cleanup_done: bool,
     /// 崩溃分析结果：(服务器下标, 服务器名, 分析结论)；Some 时自动弹出小窗
     crash_report: Option<(usize, String, crashscan::CrashFinding)>,
+    /// 日志页：搜索关键字
+    log_query: String,
+    /// 日志页：级别筛选（全部/信息/警告/错误）
+    log_level: String,
+    /// 日志页：来源筛选（全部 / 服务器名 / 隧道:名）
+    log_src: String,
+    /// 日志页：是否跟随最新
+    log_follow: bool,
+    /// 日志页：行高（1.0 紧凑 / 1.6 舒适）
+    log_row_h: f32,
     /// 隐藏请求已受理但窗口尚未隐藏（延迟一帧隐藏：见 update 早退分支，避免隐藏窗口
     /// request_redraw 无效导致 eframe ControlFlow 滞留 Poll 空转 100% CPU）
     hide_requested: bool,
@@ -1883,6 +1897,11 @@ impl App {
             tray_restoring_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tray_cleanup_done: false,
             crash_report: None,
+            log_query: String::new(),
+            log_level: "全部".to_string(),
+            log_src: "全部".to_string(),
+            log_follow: true,
+            log_row_h: 1.0,
             hide_requested: false,
             hide_sent: false,
             tray_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -4540,6 +4559,17 @@ impl App {
         let h = 9.0f32; // 18×18 方框的半边长
         let st = egui::Stroke::new(1.5, color);
         match kind {
+            Nav::Logs => {
+                // 日志：三横线文档 + 右下角一点（区别于"设置"的推子）
+                for k in 0..3 {
+                    let y = c.y - 5.0 + k as f32 * 5.0;
+                    painter.line_segment(
+                        [egui::pos2(c.x - h + 2.0, y), egui::pos2(c.x + h - 4.0, y)],
+                        egui::Stroke::new(1.4, color),
+                    );
+                }
+                painter.circle_filled(egui::pos2(c.x + h - 3.0, c.y + 5.0), 2.0, color);
+            }
             Nav::Dashboard => {
                 // 柱状图：三根高低不同的柱子
                 let bw = 3.0;
@@ -6552,6 +6582,8 @@ impl eframe::App for App {
                 }
                 // 分组二：系统（内网穿透/设置 永远可用）
                 let sys_group_start = nav_items.len();
+                // 工具自身日志（独立页：日志库浏览 + 相关设置，从设置里搬出来）
+                nav_items.push(("📜", "日志", Nav::Logs));
                 nav_items.push(("🔗", "内网穿透", Nav::Tunnel));
                 nav_items.push(("⚙️", "设置", Nav::Settings));
                 let group_headers: std::collections::HashMap<usize, &str> =
@@ -6720,6 +6752,7 @@ impl eframe::App for App {
             Nav::Dashboard => self.ui_dashboard(ctx),
             Nav::Servers => self.ui_servers(ctx),
             Nav::Tunnel => self.ui_tunnel(ctx),
+            Nav::Logs => self.ui_logs_page(ctx),
             Nav::Settings => self.ui_settings(ctx),
             Nav::Download => self.ui_download(ctx),
             Nav::Plugins => self.ui_plugins(ctx),
@@ -13045,22 +13078,29 @@ impl App {
                                             )),
                                         }
                                     }
-                                    // 高风险操作：红色边框卡片包裹「完全禁用 Defender」
+                                    // 高风险操作：与其它按钮同一行、同一高度对齐；
+                                    // 只用红色文字表达风险，不再套一个突兀的红框（用户反馈）。
                                     let risk_red = self.fg(Color32::from_rgb(230, 120, 120));
-                                    egui::Frame::none()
-                                        .fill(Color32::from_rgba_unmultiplied(230, 120, 120, 12))
-                                        .stroke(egui::Stroke::new(1.2, risk_red))
-                                        .rounding(egui::Rounding::same(8.0))
-                                        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
-                                        .show(ui, |ui| {
-                                            ui.horizontal(|ui| {
-                                                if ui.button(RichText::new("⚠️ 完全禁用 Defender 实时保护（风险）").color(risk_red)).clicked() {
-                                                    self.confirm_defender_disable = true;
-                                                }
-                                            });
-                                        });
-                                    if ui.button("打开 Windows 安全中心").clicked() {
-                                        // explorer.exe 打开 URI �?cmd start windowsdefender: 更稳（修复弹错误框）
+                                    if ui
+                                        .add_sized(
+                                            [280.0, 26.0],
+                                            egui::Button::new(
+                                                RichText::new("⚠ 完全禁用 Defender 实时保护（风险）")
+                                                    .color(risk_red),
+                                            ),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.confirm_defender_disable = true;
+                                    }
+                                    if ui
+                                        .add_sized(
+                                            [220.0, 26.0],
+                                            egui::Button::new("打开 Windows 安全中心"),
+                                        )
+                                        .clicked()
+                                    {
+                                        // explorer.exe 打开 URI 比 cmd start windowsdefender: 更稳（修复弹错误框）
                                         let opened = std::process::Command::new("explorer.exe")
                                             .arg("windowsdefender:")
                                             .spawn()
@@ -13080,111 +13120,17 @@ impl App {
                             self.settings_sections = sections;
                         }
                         SettingsSide::Logs => {
+                            // 日志已独立成侧栏「📜 日志」页（工具自身日志 + 相关设置），
+                            // 这里只留一个跳转入口，避免同一功能两处维护。
                             let sections = std::mem::take(&mut self.settings_sections);
                             let sections = Self::setting_section(ctx, ui, sections, "log", "日志", None, true, use_anim, self.cfg.anim_speed, |ui| {
-                                let (db_count, db_rows) = match &self.logdb {
-                                    Some(db) => (db.count(), db.recent(5, None)),
-                                    None => (0, Vec::new()),
-                                };
-                                let card_fill = ui.visuals().extreme_bg_color;
-                                let card_stroke = egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(150, 160, 180, 45));
-                                // 等高卡片组：显示设置 + SQLite 日志库（用 horizontal_top 顶部对齐，
-                                // 避免等高拉伸把短卡片撑高）
-                                ui.horizontal_top(|ui| {
-                                    egui::Frame::none()
-                                        .fill(card_fill)
-                                        .stroke(card_stroke)
-                                        .rounding(egui::Rounding::same(8.0))
-                                        .inner_margin(egui::Margin::symmetric(12.0, 10.0))
-                                        .show(ui, |ui| {
-                                            // 紧凑化：不再 set_min_height(300)（卡片高度由内容决定），
-                                            // 只保证一个小的最小高度让两张卡片视觉一致。
-                                            ui.set_width(300.0);
-                                            ui.set_min_height(120.0);
-                                            ui.label(RichText::new("显示设置").strong());
-                                            ui.separator();
-                                            ui.label("最大显示行数");
-                                            ui.horizontal(|ui| {
-                                                ui.add(egui::DragValue::new(&mut self.cfg.max_log_lines).range(100..=20000));
-                                                ui.label("行");
-                                            });
-                                            ui.label(RichText::new("仅影响主界面日志显示条数，日志库仍按 50000 行轮转").weak().small());
-                                        });
-                                    egui::Frame::none()
-                                        .fill(card_fill)
-                                        .stroke(card_stroke)
-                                        .rounding(egui::Rounding::same(8.0))
-                                        .inner_margin(egui::Margin::symmetric(12.0, 10.0))
-                                        .show(ui, |ui| {
-                                            // 右卡自适应剩余宽度（不再写死 300px）；
-                                            // 内层滚动区已限高 150px，卡片高度稳定 —— 之前两侧都写死
-                                            // 300px 宽/高，日志内容会把卡片撑变形（"日志配置窗口大小异常"）。
-                                            let rest = (ui.available_width() - 12.0).clamp(320.0, 760.0);
-                                            ui.set_width(rest);
-                                            ui.set_min_height(120.0);
-                                            ui.label(RichText::new("SQLite 日志库").strong());
-                                            ui.separator();
-                                            ui.label(format!("已存 {db_count} 行（上限 50000，超限自动轮转）"));
-                                            ui.horizontal(|ui| {
-                                                if ui.button("🗑 清空日志库").clicked() {
-                                                    if let Some(dbm) = self.logdb.as_mut() {
-                                                        dbm.clear();
-                                                    }
-                                                    self.set_toast("已清空日志库".to_string());
-                                                }
-                                            });
-                                            ui.separator();
-                                            if let Some(db) = &self.logdb {
-                                                if db_rows.is_empty() {
-                                                    ui.label(RichText::new("（暂无日志记录，启动服务器或隧道后自动写入）").weak().small());
-                                                } else {
-                                                    ui.label(RichText::new("最近 5 条（来源标记：服务器名 / 隧道:名称）：").weak().small());
-                                                    egui::ScrollArea::vertical()
-                                                        .id_salt("settings_log_recent")
-                                                        .max_height(110.0)
-                                                        .auto_shrink([false, false])
-                                                        .show(ui, |ui| {
-                                                            for r in &db_rows {
-                                                                let line = if r.line.chars().count() > 80 {
-                                                                    let s: String = r.line.chars().take(80).collect();
-                                                                    format!("{s}…")
-                                                                } else {
-                                                                    r.line.clone()
-                                                                };
-                                                                ui.label(RichText::new(format!("[{}] {} | {}", r.ts, r.src, line)).monospace());
-                                                            }
-                                                        });
-                                                }
-                                            } else {
-                                                ui.label(RichText::new(format!("日志库不可用：{}", self.logdb_err)).weak());
-                                            }
-                                        });
-                                });
-                                ui.add_space(16.0);
-                                // 统计信息：三张小卡片横向排布
-                                let recent_ts = db_rows.first().map(|r| r.ts.clone()).unwrap_or_else(|| "暂无".to_string());
-                                ui.horizontal(|ui| {
-                                    for (t, v, c) in [
-                                        ("日志总条数", format!("{db_count}"), Color32::from_rgb(120, 200, 255)),
-                                        ("库上限（轮转）", "50000".to_string(), Color32::from_rgb(240, 200, 120)),
-                                        ("最近写入", recent_ts, Color32::from_rgb(120, 200, 160)),
-                                    ] {
-                                        egui::Frame::none()
-                                            .fill(card_fill)
-                                            .stroke(card_stroke)
-                                            .rounding(egui::Rounding::same(8.0))
-                                            .inner_margin(egui::Margin::symmetric(12.0, 8.0))
-                                            .show(ui, |ui| {
-                                                ui.set_min_width(140.0);
-                                                ui.label(RichText::new(t).weak().small());
-                                                ui.label(RichText::new(v).strong().color(c));
-                                            });
-                                    }
-                                });
+                                ui.label("日志浏览与相关设置已移至侧栏「📜 日志」页（工具自身日志，含来源/级别筛选与导出）。");
+                                if ui.button("前往「日志」页").clicked() {
+                                    self.nav = Nav::Logs;
+                                }
                             });
                             self.settings_sections = sections;
-                        }
-                        SettingsSide::Ui => {
+                        }                        SettingsSide::Ui => {
                             let sections = std::mem::take(&mut self.settings_sections);
                             let sections = Self::setting_section(ctx, ui, sections, "ui", "界面", None, true, use_anim, self.cfg.anim_speed, |ui| {
                                 ui.label("语言:");
@@ -16178,6 +16124,276 @@ impl App {
             });
         if close || !open {
             self.crash_report = None;
+        }
+    }
+
+    /// 工具自身日志页（📜 日志）：日志库浏览 + 过滤 + 相关设置。
+    ///
+    /// 这是 **XMST 工具自己的运行日志**（服务器输出也汇总进同一个库，以来源标记区分），
+    /// 因此不按服务器拆页签，筛选靠「来源」下拉完成。原「设置 → 日志」整段已并入本页。
+    fn ui_logs_page(&mut self, ctx: &egui::Context) {
+        let mut query = self.log_query.clone();
+        let mut level = self.log_level.clone();
+        let mut src_filter = self.log_src.clone();
+        let mut follow = self.log_follow;
+        let mut row_h = self.log_row_h;
+        let mut do_clear = false;
+        let mut do_export = false;
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(ctx.style().visuals.panel_fill))
+            .show(ctx, |ui| {
+                let avail = ui.available_rect_before_wrap();
+                let pad = 14.0f32;
+                let w = (avail.width() - pad).min(1100.0);
+                let mut inner = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(egui::Rect::from_min_size(
+                            egui::pos2(avail.left() + pad, avail.top()),
+                            egui::vec2(w, avail.height()),
+                        ))
+                        .layout(egui::Layout::top_down(egui::Align::Min))
+                        .id_salt("logs_page"),
+                );
+                let ui = &mut inner;
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.heading("日志");
+                    ui.label(
+                        RichText::new("XMST 工具自身的运行日志（含服务器输出汇总，按来源标记）")
+                            .weak()
+                            .small(),
+                    );
+                });
+                ui.separator();
+                // ---- 统计卡 ----
+                let (count, rows) = match &self.logdb {
+                    Some(db) => (db.count(), db.recent(800, None)),
+                    None => (0, Vec::new()),
+                };
+                let sources: Vec<String> = {
+                    let mut v: Vec<String> = rows.iter().map(|r| r.src.clone()).collect();
+                    v.sort();
+                    v.dedup();
+                    v
+                };
+                ui.horizontal_wrapped(|ui| {
+                    for (t, v) in [
+                        ("日志总条数", format!("{count}")),
+                        ("库上限（轮转）", "50000".to_string()),
+                        (
+                            "最近写入",
+                            rows.first().map(|r| r.ts.clone()).unwrap_or_else(|| "暂无".into()),
+                        ),
+                    ] {
+                        egui::Frame::none()
+                            .fill(self.theme_cur.widget_bg)
+                            .stroke(egui::Stroke::new(1.0, self.theme_cur.stroke))
+                            .rounding(8.0)
+                            .inner_margin(egui::Margin::symmetric(12.0, 6.0))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(t).weak().small());
+                                    ui.label(RichText::new(v).strong());
+                                });
+                            });
+                    }
+                });
+                ui.add_space(6.0);
+                // ---- 过滤栏 ----
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("🔍");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut query)
+                            .hint_text("搜索关键字（消息或来源）")
+                            .desired_width(240.0),
+                    );
+                    ui.label("级别");
+                    egui::ComboBox::from_id_salt("log_level")
+                        .selected_text(level.clone())
+                        .width(80.0)
+                        .show_ui(ui, |ui| {
+                            for l in ["全部", "信息", "警告", "错误"] {
+                                ui.selectable_value(&mut level, l.to_string(), l);
+                            }
+                        });
+                    ui.label("来源");
+                    egui::ComboBox::from_id_salt("log_src")
+                        .selected_text(src_filter.clone())
+                        .width(160.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut src_filter, "全部".to_string(), "全部");
+                            for s in &sources {
+                                ui.selectable_value(&mut src_filter, s.clone(), s);
+                            }
+                        });
+                    ui.checkbox(&mut follow, "跟随最新");
+                    ui.label("行高");
+                    egui::ComboBox::from_id_salt("log_rowh")
+                        .selected_text(if row_h < 1.5 { "紧凑" } else { "舒适" })
+                        .width(70.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut row_h, 1.0, "紧凑");
+                            ui.selectable_value(&mut row_h, 1.6, "舒适");
+                        });
+                    if ui.button("🗑 清空日志库").clicked() {
+                        do_clear = true;
+                    }
+                    if ui.button("💾 导出…").clicked() {
+                        do_export = true;
+                    }
+                });
+                ui.separator();
+                // ---- 主日志区（等宽、级别着色、点击复制）----
+                let q = query.trim().to_lowercase();
+                let lv = level.clone();
+                let mut shown = 0usize;
+                egui::ScrollArea::vertical()
+                    .id_salt("logs_scroll")
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(follow)
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        if rows.is_empty() {
+                            ui.add_space(10.0);
+                            ui.label(
+                                RichText::new(
+                                    "暂无日志。启动服务器 / 隧道后，输出会自动汇总到这里。",
+                                )
+                                .weak(),
+                            );
+                        }
+                        for r in rows.iter() {
+                            if src_filter != "全部" && r.src != src_filter {
+                                continue;
+                            }
+                            let lvl_ok = match lv.as_str() {
+                                "警告" => r.line.contains("WARN") || r.line.contains("警告"),
+                                "错误" => {
+                                    r.line.contains("ERROR")
+                                        || r.line.contains("FATAL")
+                                        || r.line.contains("Exception")
+                                        || r.line.contains("失败")
+                                        || r.line.contains("异常")
+                                }
+                                _ => true,
+                            };
+                            if !lvl_ok {
+                                continue;
+                            }
+                            if !q.is_empty()
+                                && !r.line.to_lowercase().contains(&q)
+                                && !r.src.to_lowercase().contains(&q)
+                            {
+                                continue;
+                            }
+                            if shown >= 500 {
+                                break;
+                            }
+                            shown += 1;
+                            let lvl_col = if r.line.contains("ERROR")
+                                || r.line.contains("FATAL")
+                                || r.line.contains("Exception")
+                            {
+                                Color32::from_rgb(235, 110, 110)
+                            } else if r.line.contains("WARN") {
+                                Color32::from_rgb(235, 190, 90)
+                            } else {
+                                self.theme_cur.text
+                            };
+                            let row_resp = ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                ui.label(
+                                    RichText::new(&r.ts)
+                                        .monospace()
+                                        .small()
+                                        .color(self.theme_cur.weak),
+                                );
+                                ui.label(
+                                    RichText::new(format!("[{}]", r.src))
+                                        .monospace()
+                                        .small()
+                                        .color(self.fg(Color32::from_rgb(120, 180, 255))),
+                                );
+                                ui.label(
+                                    RichText::new(&r.line)
+                                        .monospace()
+                                        .color(lvl_col),
+                                );
+                            });
+                            let rr = row_resp.response.interact(egui::Sense::click());
+                            if rr.clicked() {
+                                ui.ctx().copy_text(r.line.clone());
+                                self.set_toast("已复制该行日志".to_string());
+                            }
+                        }
+                        if shown == 0 && !rows.is_empty() {
+                            ui.add_space(8.0);
+                            ui.label(RichText::new("当前过滤条件下没有日志").weak());
+                        } else if shown >= 500 {
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new("仅显示最近 500 行（不影响库中已存数据）")
+                                    .weak()
+                                    .small(),
+                            );
+                        }
+                    });
+                ui.separator();
+                // ---- 相关设置（原「设置 → 日志」）----
+                ui.horizontal(|ui| {
+                    ui.label("最大显示行数");
+                    if ui
+                        .add(egui::DragValue::new(&mut self.cfg.max_log_lines).range(100..=20000))
+                        .changed()
+                    {
+                        self.save_config();
+                    }
+                    ui.label(
+                        RichText::new("行（仅影响显示条数；日志库按 50000 行轮转）")
+                            .weak()
+                            .small(),
+                    );
+                });
+            });
+        self.log_query = query;
+        self.log_level = level;
+        self.log_src = src_filter;
+        self.log_follow = follow;
+        self.log_row_h = row_h;
+        if do_clear {
+            if let Some(db) = self.logdb.as_mut() {
+                db.clear();
+            }
+            self.set_toast("已清空日志库".to_string());
+        }
+        if do_export {
+            self.export_logs();
+        }
+    }
+
+    /// 导出日志库为文本文件（写到 data\logs\export_<时间>.log）。
+    fn export_logs(&mut self) {
+        let Some(db) = self.logdb.as_ref() else {
+            self.set_toast("日志库不可用".to_string());
+            return;
+        };
+        let rows = db.recent(50000, None);
+        let dir = self.data_dir().join("logs");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!(
+            "export_{}.log",
+            chrono::Local::now().format("%Y%m%d_%H%M%S")
+        ));
+        let mut out = String::with_capacity(rows.len() * 80);
+        for r in &rows {
+            out.push_str(&format!("[{}] [{}] {}\n", r.ts, r.src, r.line));
+        }
+        match std::fs::write(&path, out) {
+            Ok(_) => {
+                self.set_toast(format!("已导出 {} 条到 {}", rows.len(), path.display()));
+                self.open_folder(&dir);
+            }
+            Err(e) => self.set_toast(format!("导出失败：{e}")),
         }
     }
 
