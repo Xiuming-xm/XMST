@@ -234,7 +234,77 @@ pub fn analyze(dir: &Path) -> Option<CrashFinding> {
 
     let mut finding = CrashFinding::default();
     for (name, text) in &sources {
-        let mut crashed = false;
+        // ---- 先用「崩溃报告」的整体结构做一次分析：Exception 行 + 堆栈归属模组 ----
+        // 这一步覆盖了大量"模组自身异常/配置损坏"类崩溃（依赖缺失只是其中一类）。
+        if text.contains("---- Minecraft Crash Report ----") || text.contains("Description:") {
+            if let Some((exc, suspects)) = first_exception(text, &map) {
+                finding.summary = exc.clone();
+                finding.crashed = true;
+                let low = exc.to_lowercase();
+                let (title, advice) = if low.contains("jsonsyntaxexception")
+                    || low.contains("jsonparseexception")
+                    || low.contains("expected begin_array")
+                    || low.contains("malformedjson")
+                {
+                    (
+                        "模组配置文件损坏（config 里的 json 格式不正确）".to_string(),
+                        "该模组读取自己的配置文件时解析失败。到服务器 config/ 目录把对应模组的\
+                         配置文件改名或删除（备份后），重启让它重新生成即可。"
+                            .to_string(),
+                    )
+                } else if low.contains("nosuchmethoderror")
+                    || low.contains("noclassdeffounderror")
+                    || low.contains("classnotfoundexception")
+                    || low.contains("nosuchfielderror")
+                {
+                    (
+                        "模组之间版本不匹配（缺少类/方法）".to_string(),
+                        "通常是同系列模组的版本不一致（如 API 与实现版本错开），或缺少前置库。\
+                         把这些模组统一升级到同一 MC 版本下的最新版。"
+                            .to_string(),
+                    )
+                } else if low.contains("stackoverflowerror") {
+                    (
+                        "栈溢出（模组递归或相互冲突）".to_string(),
+                        "逐个禁用最近新增/更新过的模组定位；常见于多个优化或兼容模组同时安装。"
+                            .to_string(),
+                    )
+                } else if low.contains("outofmemoryerror") {
+                    (
+                        "内存不足（堆溢出）".to_string(),
+                        "调大 -Xmx（服务器设置里改），或减少常驻大型模组/视距。".to_string(),
+                    )
+                } else {
+                    (
+                        format!("模组抛出异常：{}", truncate(&exc)),
+                        "按「涉及」里列出的模组检查其配置/版本；也可先禁用该模组确认。".to_string(),
+                    )
+                };
+                push_cause(
+                    &mut finding.causes,
+                    Cause {
+                        title,
+                        suspects: suspects.clone(),
+                        advice,
+                        evidence: vec![exc.clone()],
+                    },
+                );
+                if suspects.is_empty() {
+                    push_cause(
+                        &mut finding.causes,
+                        Cause {
+                            title: "无法确定具体模组（堆栈里没有匹配到 mods 目录中的模组）".to_string(),
+                            suspects: vec![],
+                            advice: "查看完整崩溃报告（下方按钮可打开 crash-reports 目录），\
+                                     或把报告发我帮你定位。"
+                                .to_string(),
+                            evidence: vec![],
+                        },
+                    );
+                }
+            }
+        }
+        let mut crashed = finding.crashed;
         for line in text.lines() {
             let l = line.trim();
             if l.is_empty() {
@@ -409,4 +479,98 @@ fn truncate(s: &str) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// 归一化：小写 + 去掉所有非字母数字（用于模糊匹配包名与模组 id）。
+fn norm(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// 把堆栈里的包名模糊匹配到 mods 目录里的某个模组。
+///
+/// 实机样本（D:\Desktop\Fabric1.21.11 的真实崩溃报告）：
+///   堆栈 `com.ayakacraft.carpetayakaaddition.commands.address.AddressManager...`
+///   模组 id `carpet-ayaka-addition` → 归一化后 "carpetayakaaddition" 命中包名片段 ✓
+fn match_mod_in_stack(line: &str, map: &HashMap<String, String>) -> Option<String> {
+    let l = line.trim();
+    if !l.starts_with("at ") {
+        return None;
+    }
+    // `at com.foo.bar.Baz.method(...)` → 取类名前的包路径
+    let path = l
+        .trim_start_matches("at ")
+        .split('(')
+        .next()
+        .unwrap_or("")
+        .trim();
+    // 跳过 JDK / Minecraft / 加载器自身的帧
+    const SKIP: [&str; 9] = [
+        "java.",
+        "jdk.",
+        "javax.",
+        "sun.",
+        "net.minecraft",
+        "com.mojang",
+        "net.fabricmc",
+        "org.spongepowered",
+        "org.objectweb",
+    ];
+    if SKIP.iter().any(|s| path.starts_with(s)) {
+        return None;
+    }
+    let np = norm(path);
+    // 与每个模组 id/名字做双向包含匹配（取最长的命中，避免误配到很短的 id）
+    let mut best: Option<(usize, String)> = None;
+    for (key, label) in map.iter() {
+        let nk = norm(key);
+        if nk.len() < 4 {
+            continue;
+        }
+        // 若 key 看起来像文件名（含 . 或 -）也一并归一化比较
+        if np.contains(&nk) || nk.contains(&np) {
+            let score = nk.len();
+            if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
+                best = Some((score, label.clone()));
+            }
+        }
+    }
+    best.map(|(_, l)| l)
+}
+
+/// 从一段文本里提取「异常类型 + 位置」以及涉及的模组（只看前若干帧，避免把整个堆栈翻一遍）。
+fn first_exception(text: &str, map: &HashMap<String, String>) -> Option<(String, Vec<String>)> {
+    let mut exc_line: Option<String> = None;
+    let mut suspects: Vec<String> = Vec::new();
+    let mut frames = 0;
+    for line in text.lines() {
+        let l = line.trim();
+        if exc_line.is_none() {
+            // 异常行：形如 `com.google.gson.JsonSyntaxException: ...`
+            if l.contains("Exception") || l.contains("Error:") || l.contains("Error(") {
+                if !l.starts_with("at ") && !l.starts_with("Description:") {
+                    exc_line = Some(truncate(l));
+                }
+            }
+            continue;
+        }
+        if l.starts_with("at ") {
+            frames += 1;
+            if frames > 60 {
+                break;
+            }
+            if suspects.len() < 3 {
+                if let Some(m) = match_mod_in_stack(l, map) {
+                    if !suspects.contains(&m) {
+                        suspects.push(m);
+                    }
+                }
+            }
+        } else if frames > 0 && !l.is_empty() {
+            break; // 堆栈结束
+        }
+    }
+    exc_line.map(|e| (e, suspects))
 }

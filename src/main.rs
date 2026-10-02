@@ -5247,6 +5247,27 @@ fn window_is_maximized_now(_hwnd: isize, _rect_px: (i32, i32, i32, i32)) -> bool
 }
 
 fn main() -> eframe::Result {
+    // 诊断入口：XMST_CRASHSCAN=<服务器目录> → 只跑崩溃分析并把结论打到控制台后退出。
+    // 用于验证分析规则（无需启动 GUI，也不依赖真实崩溃现场）。
+    if let Ok(dir) = std::env::var("XMST_CRASHSCAN") {
+        match crashscan::analyze(Path::new(&dir)) {
+            Some(f) => {
+                println!("[崩溃分析] 来源={} 摘要={}", f.source, f.summary);
+                for c in &f.causes {
+                    println!("- 结论：{}", c.title);
+                    if !c.suspects.is_empty() {
+                        println!("  涉及：{}", c.suspects.join("、"));
+                    }
+                    println!("  建议：{}", c.advice);
+                    for e in &c.evidence {
+                        println!("  证据：{}", e);
+                    }
+                }
+            }
+            None => println!("[崩溃分析] 未发现可识别的崩溃原因（dir={dir}）"),
+        }
+        std::process::exit(0);
+    }
     // 崩溃日志钩子：panic 时把信息+堆栈写入 data\crash.log 并弹窗提示（便于定位崩溃�?
     {
         let crash_path = std::env::current_exe()
