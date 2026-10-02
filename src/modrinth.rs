@@ -365,6 +365,134 @@ pub fn translate_text(text: &str) -> Result<String, String> {
     }
 }
 
+/// 单次 MyMemory 翻译（免费、无需 Key；实测在你的网络下 **1 秒**可用，
+/// 而 translate.googleapis.com 在国内网络是**不可达**的（12s 超时），所以主力走它）。
+/// 限制：单次请求文本不能太长（约 500 字节），因此长文本必须**分片**。
+fn mymemory_one(text: &str) -> Result<String, String> {
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(4))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("构建翻译客户端失败: {e}"))?;
+    let url = format!(
+        "https://api.mymemory.translated.net/get?langpair=en|zh-CN&q={}",
+        urlencode(text)
+    );
+    let resp = client
+        .get(&url)
+        .send()
+        .map_err(|e| format!("翻译请求失败: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("翻译 HTTP {}", resp.status()));
+    }
+    let v: Value = resp.json().map_err(|e| format!("翻译响应解析失败: {e}"))?;
+    let status = v["responseStatus"].as_i64().unwrap_or(0);
+    let out = v["responseData"]["translatedText"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    if status != 200 || out.trim().is_empty() {
+        return Err(format!("翻译服务返回异常（status={status}）"));
+    }
+    Ok(out)
+}
+
+/// 把长文本切成适合单次请求的分片：优先按换行切，其次按字符，且**不切断占位符**
+/// （术语表用 U+E000..U+E001 包裹，切断了就回填不上）。
+fn split_chunks(text: &str, max: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_ph = false;
+    for ch in text.chars() {
+        if ch == '\u{E000}' {
+            in_ph = true;
+        } else if ch == '\u{E001}' {
+            in_ph = false;
+        }
+        cur.push(ch);
+        let soft_break = ch == '\n' && cur.chars().count() >= max / 2;
+        let hard_break = cur.chars().count() >= max && !in_ph;
+        if soft_break || hard_break {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// 分片并发翻译（每片独立缓存）：长更新日志也能在几秒内完成。
+fn translate_chunked(text: &str) -> Result<String, String> {
+    let chunks = split_chunks(text, 450);
+    if chunks.is_empty() {
+        return Err("没有可翻译的内容".to_string());
+    }
+    let n = chunks.len();
+    // 先查缓存，剩余的并发请求（最多 4 并发，避免被限流）
+    let mut results: Vec<Option<String>> = vec![None; n];
+    let mut todo: Vec<(usize, String)> = Vec::new();
+    for (i, c) in chunks.iter().enumerate() {
+        let k = cache_key(c);
+        let hit = cache().lock().ok().and_then(|g| g.get(&k).cloned());
+        match hit {
+            Some(v) => results[i] = Some(v),
+            None => todo.push((i, c.clone())),
+        }
+    }
+    let done = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(usize, String, u64)>::new()));
+    let mut idx = 0usize;
+    while idx < todo.len() {
+        let batch: Vec<(usize, String)> = todo[idx..(idx + 4).min(todo.len())].to_vec();
+        idx += 4;
+        let mut handles = Vec::new();
+        for (i, c) in batch {
+            let done = done.clone();
+            handles.push(std::thread::spawn(move || {
+                let k = cache_key(&c);
+                if let Ok(r) = mymemory_one(&c) {
+                    if let Ok(mut g) = done.lock() {
+                        g.push((i, r, k));
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            let _ = h.join();
+        }
+    }
+    if let Ok(g) = done.lock() {
+        for (i, r, k) in g.iter() {
+            results[*i] = Some(r.clone());
+            if let Ok(mut c) = cache().lock() {
+                if c.len() > 800 {
+                    c.clear();
+                }
+                c.insert(*k, r.clone());
+            }
+        }
+    }
+    let mut out = String::new();
+    let mut missing = 0;
+    for r in results.iter() {
+        match r {
+            Some(s) => {
+                out.push_str(s);
+                if !s.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            None => missing += 1,
+        }
+    }
+    if out.trim().is_empty() {
+        return Err("翻译服务未返回结果（可能被限流或网络受限）".to_string());
+    }
+    if missing > 0 {
+        out.push_str(&format!("\n（有 {missing} 段未翻译成功，可稍后重试）"));
+    }
+    Ok(out)
+}
 /// 翻译进程内缓存：同一段文本（模组简介/更新日志）重复翻译时**瞬间返回**。
 /// key = 文本长度 + 哈希，value = 译文。
 fn cache() -> &'static std::sync::Mutex<std::collections::HashMap<u64, String>> {
@@ -391,45 +519,50 @@ fn cache_key(text: &str) -> u64 {
 /// 2. **同时**给 Google 与 MyMemory 发请求，谁先返回有效译文就用谁（单个 8s 超时兜底）；
 /// 3. 超长文本截断到 4500 字符，避免 URL 过长导致服务端慢/失败。
 pub fn translate_best(text: &str) -> Result<String, String> {
-    let trimmed: String = text.chars().take(4500).collect();
+    let trimmed: String = text.chars().take(20000).collect();
     let key = cache_key(&trimmed);
     if let Ok(g) = cache().lock() {
         if let Some(v) = g.get(&key) {
             return Ok(v.clone());
         }
     }
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
-    for f in [
-        translate_text as fn(&str) -> Result<String, String>,
-        translate_text_fallback,
-    ] {
-        let tx = tx.clone();
-        let t = trimmed.clone();
-        // 两个提供方各自独立线程：谁先成功谁先 send；另一个即使超时也只是自己结束
-        std::thread::spawn(move || {
-            if let Ok(r) = f(&t) {
-                if !r.trim().is_empty() {
-                    let _ = tx.send(r);
+    // 实测：本机网络下 Google 翻译**完全不可达**（12s 超时），MyMemory ~1s。
+    // 所以长文本直接走分片 MyMemory，不再白等 Google 的 8 秒。
+    let long = trimmed.chars().count() > 300;
+    let result = if long {
+        translate_chunked(&trimmed)
+    } else {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        for f in [
+            translate_text as fn(&str) -> Result<String, String>,
+            mymemory_one,
+        ] {
+            let tx = tx.clone();
+            let t = trimmed.clone();
+            std::thread::spawn(move || {
+                if let Ok(r) = f(&t) {
+                    if !r.trim().is_empty() {
+                        let _ = tx.send(r);
+                    }
                 }
-            }
-        });
-    }
-    drop(tx);
-    match rx.recv_timeout(std::time::Duration::from_secs(12)) {
-        Ok(out) => {
-            if let Ok(mut g) = cache().lock() {
-                // 简单上限，避免长时间运行无限增长
-                if g.len() > 400 {
-                    g.clear();
-                }
-                g.insert(key, out.clone());
-            }
-            Ok(out)
+            });
         }
-        Err(_) => Err("翻译超时（两个翻译服务都未在 12 秒内返回，可能是网络受限）".to_string()),
+        drop(tx);
+        match rx.recv_timeout(std::time::Duration::from_secs(12)) {
+            Ok(out) => Ok(out),
+            Err(_) => translate_chunked(&trimmed),
+        }
+    };
+    if let Ok(out) = &result {
+        if let Ok(mut g) = cache().lock() {
+            if g.len() > 800 {
+                g.clear();
+            }
+            g.insert(key, out.clone());
+        }
     }
+    result
 }
-
 /// 带**自定义术语表**的翻译。
 ///
 /// 做法（比"翻译后替换"准确得多）：先把用户词条替换成**私用区占位符**

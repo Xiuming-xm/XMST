@@ -4118,10 +4118,27 @@ impl App {
             set_open_error(format!("目录不存在：{}", path.display()));
             return;
         }
-        // 首选 ShellExecuteW("explore")：不创建新进程，交给已在运行的资源管理器
+        // ① 首选：`cmd /C start "" "<目录>"` —— 在新进程里让 shell 去解析，
+        //    实测 explorer.exe 直接 spawn 与进程内 ShellExecute 在你的机器上都可能失败，
+        //    而 `start` 走的是**全新 console 进程**的 shell 解析，最稳。
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/C", "start", "", &path.to_string_lossy()])
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if c.spawn().is_ok() {
+                return;
+            }
+        }
+        // ② 进程内 ShellExecute("explore")
         if shell_explore(path) {
             return;
         }
+        // ③ explorer.exe 直接打开
         let ok = std::process::Command::new("explorer.exe")
             .arg(path)
             .stdin(Stdio::null())
