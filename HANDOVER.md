@@ -16,6 +16,35 @@ AIGC:
 > **2026-09-29 发布策略变更**：构建产出由双 exe 改为单 exe，命名 `dist\XMST-<版本号>.exe`（版本号取 Cargo.toml version），不再产出双 exe。
 ## 最近变更记录
 
+- 2026-10-03（第十五轮：崩溃跳转 / 弹窗可缩放 / 快照过滤 / 页签动效 / 折叠卡顿根因 / 卡片与预览精简）：
+  1. **崩溃分析可跳转（用户要求）**：`crashscan::Cause` 新增 `path`（相对服务器目录）——JSON 配置损坏类结论会在 `config/`（含一层子目录）里按模组 id 模糊查找对应配置并给出相对路径，找不到则回退到 `config` 目录；EULA → `eula.txt`，端口占用 → `server.properties`。弹窗里显示 `📄 路径` + **「跳转到该位置」**（资源管理器定位/打开，新增 `reveal_in_explorer()`）。
+  2. **弹窗可缩放**：为 16 个 `egui::Window`（创建新服务器、删除/重命名、文件编辑、隧道配置、确认类弹窗等）统一加 `.resizable(true)`。
+  3. **创建新服务器：默认隐藏快照版**：`CreateServerState.show_snapshot`（默认 false）+ 搜索框旁「显示快照版」勾选框；`filtered_versions()` 过滤 `-pre/-rc/snapshot/experimental/24w45a` 形态（新增 `is_snapshot_version()`）；无正式版时给提示。
+  4. **内网穿透子页签动效**（用户反馈"内部切换无平滑"）：`tunnel_side` 的 5 个页签改为自绘行 + **滑块位置插值**（`tunnel_nav_anim`）+ 悬停底色过渡 + 左侧竖条，与主侧栏同款。
+  5. **设置折叠"卡一下"根因**：动画期间 `content_h` 取到的是**被 `max_height` 裁剪后**的高度，却被写回 `last_h` → 动画目标逐帧缩水 → 一顿一顿。改为**只在完全展开（anim≥0.99）或首次未知时**记录真实内容高度。
+  6. **概览卡片高度自适应**：去掉 `set_min_height(84)`，改为按内容高度（此前三张卡片都固定 84pt，显得过高）。
+  7. **字号预览精简**：只保留「正文示例」四字（删除次要/小字/标题三行），预览框宽度 320→220。
+  8. **删除两处文本**：文件浏览 mods 页的「已识别：…」行、插件页标题右侧的「测试功能：rhai 脚本插件…」说明。
+  9. **产物**：`dist\XMST-0.1.0-alpha.exe` SHA256 `A52BC5216745649025F4788372E54311E7200AFE7B4D236CFA13844F22C0225F`（15,389,184 B；cargo check 0 error；release 3m08s）。还原点 `git 2bfd6bf` 之前均为本轮改造前状态。
+  10. **ExplorerBlurMica 调研结论**：它是 `regsvr32` 注册的 **shell 扩展 DLL + minhook 注入 explorer.exe**（清背景 + 画模糊/亚克力/Mica），只对资源管理器生效；作者另一个项目 **DWMBlurGlass** 才是"全局窗口模糊"（hook dwm.exe）。**两者都是系统级注入，不能给我们的 GL 窗口提供可用 API**；唯一可借鉴的是架构方向——若将来要真·系统模糊，需把呈现改成 DirectComposition + `IDCompositionBackdropBrush`（`WS_EX_NOREDIRECTIONBITMAP`），让内容不再覆盖效果层。
+
+- 2026-10-02（第十四轮：托盘黑屏再修 / 双击唤出托盘实例 / 崩溃根因分析 / 概览卡片化）：
+  > **还原点**：`git 3858ab2`（本轮改造前基线）、`git 1fb4b72`、`git 2bfd6bf`；源码整份备份 `F:\XMST\backup\20261002_234713\`（含改造前 exe）。可按文件回退：`git checkout 3858ab2 -- src/main.rs`。
+  1. **托盘黑屏（第二轮定位，两处真因）**：
+     * ① **清理时序错**：上一版在**关闭帧**就丢纹理/清 egui 缓存，而那一帧的交换缓冲可能还是黑的，且 winit 的 `Visible(false)` 尚未生效 → 桌面上留一个黑窗口。现改为：关闭帧只发 `Visible(false)`（该帧正常合成），**等窗口确实隐藏后**再做清理——清理里先 `ShowWindow(SW_HIDE)` 兜底真正隐藏，再丢弃纹理句柄 + 清缓存；清理每次隐藏只做一次（`tray_cleanup_done`）。
+     * ② **winit 状态不一致**：托盘恢复只调了 Win32 `show_main_window()`，winit 仍以为窗口隐藏 → **不渲染 = 恢复后黑屏**。现在恢复帧先 `ViewportCommand::Visible(true)` + `Focus`，再重建字体/壁纸/材质/圆角区域。
+     * ③ 保留上一轮的防御：纹理缺失时 `material=None`（回落不透明面板），结构上不可能黑屏。
+  2. **双击 exe 自动唤出托盘实例**：新增命名事件 `Local\XMST_ShowMainWindow`。运行实例里起一条线程阻塞在 `WaitForSingleObject`（零 CPU），第二个实例 `OpenEvent+SetEvent` 后静默退出 → 托盘里的窗口自动弹到前台。比 FindWindow+ShowWindow 可靠（后者绕过程序内部状态，正是黑屏成因）。
+  3. **崩溃根因分析（新模块 `src/crashscan.rs`）+ 自动弹窗**：服务端异常退出时自动分析 `crash-reports/*.txt` 与 `logs/latest.log`，弹出「⚠ 崩溃原因分析」小窗（结论 / 涉及模组 / 处理建议 / 原始证据行，可折叠），并提供打开日志与崩溃报告目录、重新分析。
+     * 规则：依赖缺失、Java 版本过低、内存不足、端口占用、Mixin 冲突、EULA、重复模组、仅客户端模组、世界版本不兼容，以及**通用「异常 + 堆栈归属模组」**。
+     * **堆栈→模组模糊匹配**：归一化（去非字母数字、小写）后与 mods 目录里的 mod id 双向包含匹配，跳过 JDK/Minecraft/加载器帧。
+     * **实机验证（真实崩溃报告）**：`D:\Desktop\Fabric1.21.11\crash-reports\crash-2026-09-20_10.29.50-server.txt` 输出：
+       `结论=模组配置文件损坏（config 里的 json 格式不正确）`、`涉及=Carpet Ayaka Addition（carpet-ayaka-addition）、Carpet Mod（carpet）`（从包名 `com.ayakacraft.carpetayakaaddition` 正确匹配）、并给出"改名/删除该模组配置让其重新生成"的建议 ✓
+     * 诊断入口：`set XMST_CRASHSCAN=<服务器目录>` 直接跑分析并打印结论（无需 GUI，便于回归验证）。
+  4. **概览卡片化（UI 改造第 1 项）**：名称 + 五个文件夹快捷入口一行；下面三张卡片——**状态**（运行中/已停止/正在停止 + 最后消息 + 目录存在性）、**服务端平台**（类型·MC 版本·加载器版本·模组/插件数，悬停看识别依据）、**目录**（world/mods 体积、eula.txt 是否存在，新增 `dir_size_mb()` 目录体积统计）。
+  5. **产物**：`dist\XMST-0.1.0-alpha.exe` SHA256 `B9537F6F95296213A8AF974B96913589221E9092C589CDA20B752DBCFA0EBA68`（15,377,408 B；cargo check 0 error；release 3m07s）。
+  6. **UI 改造剩余项（下一步）**：② 服务器列表行内操作（悬停出现 ▶/⏹/📂）；③ 强停/回退/删除统一确认弹层组件；④ 日志面板过滤/高亮/跟随；⑤ 设置页搜索。
+
 - 2026-10-02（第十三轮：托盘黑屏根因 / 启动"警告"根因 / 清理与实测收尾）：
   1. **托盘 → 恢复 → 再关闭 出现黑屏窗口（根因）**：进入托盘态 3s 后为了把工作集压到 ~2MB，会 `mem.caches = 默认` + `set_fonts(默认)` + `EmptyWorkingSet`。这会**让背景材质纹理句柄失效**；而材质模式下内容面板填充 alpha = 0（靠纹理透出桌面）→ 纹理一没，整窗只剩 clear 色 = **黑屏**。**三层修法**：① 隐藏帧显式 `backdrop.forget_texture()` + 丢弃噪点/壁纸纹理句柄（避免往失效句柄 `set()`）；② 新增 `tray_restoring_flag`（托盘回调置位、update 消费）：恢复首帧重置 `cjk_loading`（重载 CJK 字体）、重载壁纸、强制立即重抓材质、失效并重设窗口圆角区域、连发 3 帧重绘；③ **防御**：纹理缺失时 `material = None` → 主题回落常规不透明面板，**任何情况下都不会黑屏**（首帧抓取完成后材质自动出现）。
   2. **每次启动的"打开文件警告"（根因）**：不是 SmartScreen —— 实测 exe **无 Zone.Identifier（无 MOTW）**、`SmartScreenEnabled=off`、清单 `asInvoker`（无 UAC）。真正来源是**我们自己的单实例检查**：`close_behavior=tray` 时关闭窗口只是隐藏，进程仍在，于是**每次双击 exe 都会命中"已在运行"的模态 MessageBox**。改为**静默退出**（并尽力把已可见的旧窗口带到前台），不再打断用户；托盘图标本来就在，点一下即可恢复。

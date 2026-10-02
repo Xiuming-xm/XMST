@@ -978,6 +978,8 @@ struct CreateServerState {
     version_error: Option<String>,
     /// 版本搜索过滤词
     version_filter: String,
+    /// 是否显示快照版（默认隐藏：快照版不适合长期开服）
+    show_snapshot: bool,
     /// 已选版本（显示名）
     selected_version: String,
     /// 服务器文件夹名（data/servers/<folder_name>）
@@ -1004,6 +1006,7 @@ impl CreateServerState {
             version_busy: false,
             version_error: None,
             version_filter: String::new(),
+            show_snapshot: false,
             selected_version: String::new(),
             folder_name: String::new(),
             downloading: false,
@@ -1016,18 +1019,32 @@ impl CreateServerState {
         }
     }
 
-    /// 过滤后的版本列表（搜索框）
+    /// 过滤后的版本列表（搜索框 + 快照开关）
     fn filtered_versions(&self) -> Vec<String> {
         let f = self.version_filter.trim();
-        if f.is_empty() {
-            return self.versions.clone();
-        }
         self.versions
             .iter()
-            .filter(|v| v.contains(f))
+            .filter(|v| self.show_snapshot || !is_snapshot_version(v))
+            .filter(|v| f.is_empty() || v.contains(f))
             .cloned()
             .collect()
     }
+}
+
+/// 判断版本号是否为快照/预发布版（Mojang 版本清单里快照形如 `24w45a`、预发布形如 `1.21.4-pre1`/`-rc1`）。
+fn is_snapshot_version(v: &str) -> bool {
+    let l = v.to_ascii_lowercase();
+    if l.contains("-pre") || l.contains("-rc") || l.contains("snapshot") || l.contains("experimental") {
+        return true;
+    }
+    // 快照周版本：24w45a / 1.21.2-pre1 之外还有 25w03a 这种
+    let b = l.as_bytes();
+    b.len() >= 5
+        && b[0].is_ascii_digit()
+        && b[1].is_ascii_digit()
+        && b[2] == b'w'
+        && b[3].is_ascii_digit()
+        && b[4].is_ascii_digit()
 }
 
 /// 服务器页子页
@@ -1551,6 +1568,8 @@ struct App {
     server_props_drag_start: Option<(f32, f32)>,
     /// 内网穿透页左侧栏当前分页
     tunnel_side: TunnelSide,
+    /// 内网穿透子页签切换的滑块位置（动画插值）
+    tunnel_nav_anim: f32,
     /// 设置页左侧栏当前分组
     settings_side: SettingsSide,
     /// 待确认启用的测试功能 ID（弹警告确认窗）
@@ -1903,6 +1922,7 @@ impl App {
             server_props_h: 160.0,
             server_props_drag_start: None,
             tunnel_side: TunnelSide::Dashboard,
+            tunnel_nav_anim: 0.0,
             settings_side: SettingsSide::General,
             beta_confirm: None,
             confirm_delete_server: None,
@@ -2294,6 +2314,7 @@ impl App {
         let mut do_kill = false;
         let mut do_cancel = false;
         egui::Window::new("强制结束二次确认")
+                .resizable(true)
             .id(egui::Id::new("force_stop_confirm_window"))
             .collapsible(false)
             .resizable(false)
@@ -5138,6 +5159,19 @@ fn single_instance_check() -> bool {
     }
 }
 
+/// 在资源管理器中定位到某个文件/目录（文件则选中它）。
+fn reveal_in_explorer(p: &Path) {
+    use std::os::windows::process::CommandExt;
+    let _ = std::process::Command::new("explorer.exe")
+        .raw_arg(if p.is_dir() {
+            format!("\"{}\"", p.display())
+        } else {
+            format!("/select,\"{}\"", p.display())
+        })
+        .creation_flags(0x08000000)
+        .spawn();
+}
+
 /// 目录体积（人类可读，如 "1.2 GB"）；不存在返回 "—"。
 fn dir_size_mb(p: &Path) -> String {
     if !p.exists() {
@@ -6630,6 +6664,7 @@ impl eframe::App for App {
         if self.confirm_restore.is_some() {
             let mut do_it = false;
             egui::Window::new("确认回退")
+                .resizable(true)
                 .collapsible(false)
                 .resizable(false)
                 .show(ctx, |ui| {
@@ -6656,6 +6691,7 @@ impl eframe::App for App {
         if self.confirm_delete_backup.is_some() {
             let mut do_it = false;
             egui::Window::new("确认删除备份")
+                .resizable(true)
                 .collapsible(false)
                 .resizable(false)
                 .show(ctx, |ui| {
@@ -6682,6 +6718,7 @@ impl eframe::App for App {
         if self.confirm_close.is_some() {
             let n = self.confirm_close.unwrap_or(0);
             egui::Window::new("确认关闭")
+                .resizable(true)
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -6722,6 +6759,7 @@ impl eframe::App for App {
             let mut do_it = false;
             let mut cancel = false;
             egui::Window::new("重命名服务器")
+                .resizable(true)
                 .collapsible(false)
                 .resizable(false)
                 .show(ctx, |ui| {
@@ -6755,6 +6793,7 @@ impl eframe::App for App {
             let mut do_it = false;
             let mut cancel = false;
             egui::Window::new("发现 frpc 新版本")
+                .resizable(true)
                 .collapsible(false)
                 .resizable(false)
                 .show(ctx, |ui| {
@@ -7296,6 +7335,7 @@ impl App {
             let mut close = false;
             let mut do_delete = false;
             egui::Window::new("删除服务器")
+                .resizable(true)
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -8183,7 +8223,6 @@ impl App {
                 .inner_margin(egui::Margin::symmetric(12.0, 9.0))
                 .show(ui, |ui| {
                     ui.set_width(230.0);
-                    ui.set_min_height(84.0);
                     ui.label(RichText::new(title).weak().small());
                     ui.add_space(2.0);
                     add(ui);
@@ -9569,26 +9608,6 @@ impl App {
                         self.set_toast("下载功能未启用".to_string());
                     }
                 }
-                match pinfo.kind.modrinth_loader() {
-                    Some(l) => {
-                        ui.label(
-                            RichText::new(format!(
-                                "已识别：{}（加载器 {l}，版本 {}）",
-                                pinfo.summary(),
-                                pinfo.mc_version.clone().unwrap_or_else(|| "未识别".into())
-                            ))
-                            .small()
-                            .color(self.fg(Color32::from_rgb(120, 200, 255))),
-                        );
-                    }
-                    None => {
-                        ui.label(
-                            RichText::new(format!("已识别：{}", pinfo.kind.label()))
-                                .small()
-                                .color(Color32::from_rgb(240, 176, 96)),
-                        );
-                    }
-                }
                 if ui
                     .button("🔍 排查客户端模组")
                     .on_hover_text("静态解析 mods 下 .jar 的 fabric.mod.json / mods.toml，标出仅客户端模组（启发式，仅供参考）")
@@ -10056,6 +10075,7 @@ impl App {
             let mut save = false;
             let mut close = false;
             egui::Window::new("文件编辑")
+                .resizable(true)
                 .collapsible(false)
                 .default_size([720.0, 480.0])
                 .show(ui.ctx(), |ui| {
@@ -10098,6 +10118,7 @@ impl App {
             let mut close = false;
             let mut err: Option<String> = None;
             egui::Window::new("重命名文件")
+                .resizable(true)
                 .collapsible(false)
                 .resizable(false)
                 .show(ui.ctx(), |ui| {
@@ -10163,6 +10184,7 @@ impl App {
             let mut close = false;
             let mut do_scan = false;
             egui::Window::new("排查客户端模组")
+                .resizable(true)
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -10212,6 +10234,7 @@ impl App {
             let mut close = false;
             let mut do_delete = false;
             egui::Window::new("删除文件")
+                .resizable(true)
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -10563,11 +10586,96 @@ impl App {
                             ("📜 隧道日志", TunnelSide::Logs),
                             ("📖 教程", TunnelSide::Tutorial),
                         ];
-                        for (label, side) in items {
-                            let resp = ui.selectable_label(self.tunnel_side == side, label);
-                            if resp.clicked() {
-                                self.tunnel_side = side;
+                        // 子页签切换动效：与主侧栏同款（滑块位置插值 + 悬停底色过渡），
+                        // 此前是 selectable_label 硬切换，用户反馈"内网穿透内部切换没有平滑动效"。
+                        let idx_of = |s: TunnelSide| items.iter().position(|(_, x)| *x == s).unwrap_or(0);
+                        let target = idx_of(self.tunnel_side) as f32;
+                        if self.cfg.ui_animations {
+                            self.tunnel_nav_anim += (target - self.tunnel_nav_anim) * 0.25;
+                            if (self.tunnel_nav_anim - target).abs() < 0.02 {
+                                self.tunnel_nav_anim = target;
+                            } else {
+                                ctx.request_repaint_after(std::time::Duration::from_millis(16));
                             }
+                        } else {
+                            self.tunnel_nav_anim = target;
+                        }
+                        let row_h = 24.0f32;
+                        let mut rects: Vec<egui::Rect> = Vec::with_capacity(items.len());
+                        let mut clicked: Option<TunnelSide> = None;
+                        for (label, side) in items {
+                            let active = self.tunnel_side == side;
+                            let btn = egui::Button::new("")
+                                .frame(false)
+                                .min_size(egui::vec2(ui.available_width(), row_h));
+                            let resp = ui.add(btn);
+                            let hover_t = ctx.animate_bool_with_time(
+                                resp.id.with("tunnel_nav_hover"),
+                                resp.hovered(),
+                                if self.cfg.ui_animations { 0.12 } else { 0.0 },
+                            );
+                            if !active && hover_t > 0.01 {
+                                let acc = self.theme_target.accent;
+                                ui.painter().rect_filled(
+                                    resp.rect,
+                                    5.0,
+                                    Color32::from_rgba_unmultiplied(
+                                        acc.r(),
+                                        acc.g(),
+                                        acc.b(),
+                                        (18.0 * hover_t) as u8,
+                                    ),
+                                );
+                            }
+                            let col = if active {
+                                let a = self.theme_cur.accent;
+                                self.fg(Color32::from_rgb(a.r(), a.g(), a.b()))
+                            } else {
+                                self.theme_cur.weak
+                            };
+                            ui.painter().text(
+                                egui::pos2(resp.rect.min.x + 8.0, resp.rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                label,
+                                egui::FontId::proportional(13.5),
+                                col,
+                            );
+                            rects.push(resp.rect);
+                            if resp.clicked() {
+                                clicked = Some(side);
+                            }
+                            ui.add_space(2.0);
+                        }
+                        // 选中滑块：在相邻两项之间插值，切换时滑动过去
+                        let i0 = self.tunnel_nav_anim.floor().clamp(0.0, (rects.len() - 1) as f32) as usize;
+                        let i1 = (i0 + 1).min(rects.len() - 1);
+                        let tt = self.tunnel_nav_anim - i0 as f32;
+                        if rects.len() > 1 {
+                            let a = rects[i0];
+                            let b = rects[i1];
+                            let y = a.min.y + (b.min.y - a.min.y) * tt;
+                            let h = a.height();
+                            let sl = egui::Rect::from_min_size(
+                                egui::pos2(a.min.x + 2.0, y + 2.0),
+                                egui::vec2(a.width() - 4.0, h - 4.0),
+                            );
+                            let acc = self.theme_target.accent;
+                            ui.painter().rect_filled(
+                                sl,
+                                5.0,
+                                Color32::from_rgba_unmultiplied(acc.r(), acc.g(), acc.b(), 30),
+                            );
+                            ui.painter().rect_filled(
+                                egui::Rect::from_min_size(
+                                    egui::pos2(sl.min.x, sl.min.y + 2.0),
+                                    egui::vec2(2.5, sl.height() - 4.0),
+                                ),
+                                1.2,
+                                acc,
+                            );
+                        }
+                        if let Some(s) = clicked {
+                            self.tunnel_side = s;
                         }
                     });
             });
@@ -11818,6 +11926,7 @@ impl App {
         let mut close = false;
         let mut do_delete = false;
         egui::Window::new("删除隧道")
+                .resizable(true)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -11960,7 +12069,12 @@ impl App {
                 add(ui);
                 content_h = ui.min_rect().height();
             });
-        sections[idx].last_h = content_h;
+        // ★ 折叠"卡一下"的根因：动画期间 `content_h` 取到的是**被 max_height 裁剪后**的高度，
+        // 若把它写回 last_h，下一帧的动画目标就变小，于是目标逐帧缩水 → 展开过程一顿一顿。
+        // 只在"完全展开"时记录真实内容高度（或首次未知时取一次）。
+        if anim >= 0.99 || sections[idx].last_h <= 0.0 {
+            sections[idx].last_h = content_h;
+        }
         ui.add_space(24.0);
         ui.separator();
         sections
@@ -12485,20 +12599,9 @@ impl App {
                 .rounding(6.0)
                 .inner_margin(egui::Margin::symmetric(10.0, 8.0))
                 .show(ui, |ui| {
-                    ui.set_min_width(320.0);
+                    ui.set_min_width(220.0);
                     let base = 14.0 * k;
                     ui.label(RichText::new("正文示例").size(theme::scaled_font(base, 14.0)));
-                    ui.label(
-                        RichText::new("次要文字示例：已停止 / 端口 25565")
-                            .size(theme::scaled_font(base, 14.0))
-                            .weak(),
-                    );
-                    ui.label(
-                        RichText::new("小字示例：内存 1.2G / 2G · 在线 3 人")
-                            .size(theme::scaled_font(11.0 * k, 14.0))
-                            .weak(),
-                    );
-                    ui.label(RichText::new("标题示例 服务器列表").size(theme::scaled_font(20.0 * k, 14.0)).strong());
                 });
         });
         ui.separator();
@@ -12600,6 +12703,7 @@ impl App {
         // while the contents closure needs `&mut self` (E0500).
         let mut open = self.bg_edit_open;
         egui::Window::new("编辑背景图")
+                .resizable(true)
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -13159,6 +13263,7 @@ impl App {
         if self.confirm_defender_disable {
             let mut open = true;
             egui::Window::new("确认完全禁用 Defender")
+                .resizable(true)
                 .collapsible(false)
                 .resizable(false)
                 .open(&mut open)
@@ -13247,6 +13352,7 @@ impl App {
                 .unwrap_or_else(|| id.clone());
             let mut open = true;
             egui::Window::new("启用测试功能确认")
+                .resizable(true)
                 .collapsible(false)
                 .resizable(false)
                 .open(&mut open)
@@ -13776,12 +13882,6 @@ const MATERIAL_OWNER_FALLBACK: &str = "xmst-frosted-glass-demo";
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             ui.heading("插件系统");
-                            ui.label(
-                                RichText::new(
-                                    "测试功能：rhai 脚本插件，zip 热加载，事件钩子驱动；默认关闭，开启后本页可用。",
-                                )
-                                .color(self.fg(Color32::from_rgb(180, 180, 180))),
-                            );
                         });
                         ui.label(
                             RichText::new("插件目录：")
@@ -14567,6 +14667,7 @@ impl App {
                     let fg = |c: egui::Color32| if is_light { theme::light_adapt(c) } else { c };
         if let Some(cs) = self.create_server.as_mut() {
             egui::Window::new("创建新服务器")
+                .resizable(true)
                 .collapsible(false)
                 .resizable(false)
                 .default_width(460.0)
@@ -14605,6 +14706,9 @@ impl App {
                         ui.horizontal(|ui| {
                             ui.label("搜索：");
                             ui.add(egui::TextEdit::singleline(&mut cs.version_filter).hint_text("输入版本号过滤").desired_width(220.0));
+                            // 默认隐藏快照版（快照不适合长期开服），可一键显示
+                            ui.checkbox(&mut cs.show_snapshot, "显示快照版")
+                                .on_hover_text("默认只列出正式版；勾选后显示 snapshot/预发布版");
                         });
                         let filtered = cs.filtered_versions();
                         egui::ComboBox::from_id_salt("cs_version")
@@ -14621,6 +14725,13 @@ impl App {
                                     }
                                 }
                             });
+                        if filtered.is_empty() {
+                            ui.label(
+                                RichText::new("（当前过滤条件下没有正式版；可勾选「显示快照版」）")
+                                    .weak()
+                                    .small(),
+                            );
+                        }
                     }
                     // 文件夹名
                     ui.add_space(6.0);
@@ -15859,6 +15970,25 @@ impl App {
                                     );
                                 }
                                 ui.label(RichText::new(format!("建议：{}", c.advice)).small());
+                                // 一键跳转到需要修改的文件/目录（文件在资源管理器中选中，目录直接打开）
+                                if let Some(rel) = &c.path {
+                                    let full = self
+                                        .cfg
+                                        .servers
+                                        .get(idx)
+                                        .map(|s| s.dir.join(rel))
+                                        .unwrap_or_default();
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(format!("📄 {rel}"))
+                                                .small()
+                                                .color(self.fg(Color32::from_rgb(120, 200, 255))),
+                                        );
+                                        if ui.button("跳转到该位置").clicked() {
+                                            reveal_in_explorer(&full);
+                                        }
+                                    });
+                                }
                                 if !c.evidence.is_empty() {
                                     ui.collapsing("原始日志行", |ui| {
                                         for e in &c.evidence {

@@ -28,6 +28,8 @@ pub struct Cause {
     pub advice: String,
     /// 支撑该结论的原始日志行（截断）
     pub evidence: Vec<String>,
+    /// 建议查看/修改的文件或目录（相对服务器目录）；Some 时弹窗给出跳转按钮
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -287,6 +289,7 @@ pub fn analyze(dir: &Path) -> Option<CrashFinding> {
                         suspects: suspects.clone(),
                         advice,
                         evidence: vec![exc.clone()],
+                    path: None,
                     },
                 );
                 if suspects.is_empty() {
@@ -299,6 +302,7 @@ pub fn analyze(dir: &Path) -> Option<CrashFinding> {
                                      或把报告发我帮你定位。"
                                 .to_string(),
                             evidence: vec![],
+                            path: None,
                         },
                     );
                 }
@@ -335,6 +339,7 @@ pub fn analyze(dir: &Path) -> Option<CrashFinding> {
                                  用「下载」页按 MC 版本+加载器搜索该前置即可。"
                             .to_string(),
                         evidence: vec![truncate(l)],
+                        path: None,
                     },
                 );
             }
@@ -351,6 +356,7 @@ pub fn analyze(dir: &Path) -> Option<CrashFinding> {
                                  在「设置 → Java 和 JVM」里指定正确的 java.exe。"
                             .to_string(),
                         evidence: vec![truncate(l)],
+                        path: None,
                     },
                 );
             }
@@ -365,6 +371,7 @@ pub fn analyze(dir: &Path) -> Option<CrashFinding> {
                                  并检查是否装了过多大型模组。"
                             .to_string(),
                         evidence: vec![truncate(l)],
+                        path: None,
                     },
                 );
             }
@@ -379,6 +386,7 @@ pub fn analyze(dir: &Path) -> Option<CrashFinding> {
                                  占用该端口的进程（也可能是上一个实例没退干净）。"
                             .to_string(),
                         evidence: vec![truncate(l)],
+                        path: Some("server.properties".to_string()),
                     },
                 );
             }
@@ -396,6 +404,7 @@ pub fn analyze(dir: &Path) -> Option<CrashFinding> {
                                  逐个禁用最近新增的模组定位。"
                             .to_string(),
                         evidence: vec![truncate(l)],
+                        path: None,
                     },
                 );
             }
@@ -408,6 +417,7 @@ pub fn analyze(dir: &Path) -> Option<CrashFinding> {
                         advice: "把 eula.txt 里的 eula=false 改成 true（本工具启动前可一键同意）。"
                             .to_string(),
                         evidence: vec![truncate(l)],
+                        path: Some("eula.txt".to_string()),
                     },
                 );
             }
@@ -420,6 +430,7 @@ pub fn analyze(dir: &Path) -> Option<CrashFinding> {
                         suspects: suspects_in(l, &map),
                         advice: "删除 mods 下多余的旧版本 jar（`.mcsrv_trash` 里可找回）。".to_string(),
                         evidence: vec![truncate(l)],
+                        path: None,
                     },
                 );
             }
@@ -436,6 +447,7 @@ pub fn analyze(dir: &Path) -> Option<CrashFinding> {
                         advice: "把仅客户端模组从服务端 mods 目录移除（文件浏览页有「排查客户端模组」）。"
                             .to_string(),
                         evidence: vec![truncate(l)],
+                        path: None,
                     },
                 );
             }
@@ -447,6 +459,7 @@ pub fn analyze(dir: &Path) -> Option<CrashFinding> {
                         suspects: vec![],
                         advice: "换回原来的服务端版本，或从备份恢复 world（.mcsrv_backups）。".to_string(),
                         evidence: vec![truncate(l)],
+                        path: None,
                     },
                 );
             }
@@ -464,11 +477,74 @@ pub fn analyze(dir: &Path) -> Option<CrashFinding> {
             break; // 只用最相关的一份来源
         }
     }
+    // 为每条结论补充"建议查看的文件/目录"（用户可直接跳过去改）：
+    // 有 suspects 时在 config/ 下按模组 id 模糊找同名文件或目录。
+    if !finding.causes.is_empty() {
+        for c in finding.causes.iter_mut() {
+            if c.path.is_some() {
+                continue;
+            }
+            for s in &c.suspects {
+                // 友好名形如 "Carpet Ayaka Addition（carpet-ayaka-addition）"，取括号里的 id
+                let id = s
+                    .rsplit_once('（')
+                    .map(|(_, r)| r.trim_end_matches('）').to_string())
+                    .unwrap_or_else(|| s.clone());
+                if let Some(p) = find_config_for(dir, &id) {
+                    c.path = Some(p);
+                    break;
+                }
+            }
+            // 一个都没匹配到：至少指向 config/ 目录
+            if c.path.is_none() && dir.join("config").is_dir() {
+                c.path = Some("config".to_string());
+            }
+        }
+    }
     if finding.is_empty() {
         None
     } else {
         Some(finding)
     }
+}
+
+/// 在 `config/`（含一层子目录）里按模组 id 模糊查找配置文件/目录，返回相对路径。
+fn find_config_for(dir: &Path, mod_id: &str) -> Option<String> {
+    let key = norm(mod_id);
+    if key.len() < 4 {
+        return None;
+    }
+    let cfg = dir.join("config");
+    let mut best: Option<(usize, String)> = None;
+    let mut scan = |p: &Path| {
+        let name = p.file_name()?.to_string_lossy().to_string();
+        let n = norm(&name);
+        if n.contains(&key) || key.contains(&n) {
+            let score = n.len();
+            if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
+                let rel = p
+                    .strip_prefix(dir)
+                    .map(|r| r.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| name.clone());
+                best = Some((score, rel));
+            }
+        }
+        Some(())
+    };
+    if let Ok(rd) = std::fs::read_dir(&cfg) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let _ = scan(&p);
+            if p.is_dir() {
+                if let Ok(rd2) = std::fs::read_dir(&p) {
+                    for e2 in rd2.flatten() {
+                        let _ = scan(&e2.path());
+                    }
+                }
+            }
+        }
+    }
+    best.map(|(_, p)| p)
 }
 
 fn truncate(s: &str) -> String {
