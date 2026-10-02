@@ -74,9 +74,6 @@ pub struct GlobalConfig {
     /// Color preset: "default" / "sealantern" / "dawn" / "twilight" / "forest"
     #[serde(default = "default_theme_preset")]
     pub theme_preset: String,
-    /// 界面基础字号（11.0..=20.0，默认 14.0 px）
-    #[serde(default = "default_ui_font_scale")]
-    pub ui_font_scale: f32,
     /// Whether custom colors override the preset's accent/background
     #[serde(default)]
     pub custom_colors: bool,
@@ -95,18 +92,12 @@ pub struct GlobalConfig {
     /// Background image opacity 0.0-1.0 (1.0 = fully opaque)
     #[serde(default = "default_bg_alpha")]
     pub bg_alpha: f32,
-    /// Corner radius toggle for widgets (false = sharp corners)
+    /// Corner radius toggle (false = sharp corners)
     #[serde(default = "default_round_corners")]
     pub round_corners: bool,
-    /// Window outer-corner radius toggle (applied via Win32 SetWindowRgn region)
-    #[serde(default = "default_round_corners")]
-    pub window_round_corners: bool,
     /// Corner radius scale (1.0 = default rounding)
     #[serde(default = "default_corner_scale")]
     pub corner_scale: f32,
-    /// Window corner radius scale, independent from widget corners
-    #[serde(default = "default_window_corner_scale")]
-    pub window_corner_scale: f32,
     /// 通知弹出方式: slide(右下角侧滑) / fade(淡入淡出)
     #[serde(default = "default_toast_style")]
     pub toast_style: String,
@@ -125,36 +116,6 @@ pub struct GlobalConfig {
     /// 插件启用状态（插件系统内每个插件名 -> 是否启用；缺省未登记视为禁用）
     #[serde(default)]
     pub plugin_states: HashMap<String, bool>,
-    /// 插件单独配置（插件名 -> 键值对；rhai 通过 xmst_config_get/set 读写）
-    #[serde(default)]
-    pub plugin_configs: HashMap<String, HashMap<String, String>>,
-    /// 插件毛玻璃/半透明背景的暗色浓度（0.0-1.0，1.0=最不透明）
-    #[serde(default = "default_plugin_bg_alpha")]
-    pub plugin_bg_alpha: f32,
-    /// 背景效果开启时，是否把本工具窗口排除在系统抓屏之外。
-    /// 桌面捕获式背景需要它来避免「抓到自己的窗口」形成反馈；代价是本工具会从
-    /// 用户的截屏/录屏/共享屏幕中消失（可关闭，关闭后效果退化为面板半透明）。
-    #[serde(default = "default_true")]
-    pub bg_capture_exclusion: bool,
-    /// 界面配色是否跟随材质明暗自动切换深浅（默认开）。
-    /// 关闭后界面固定用主题配色，此时材质浓度会被抬到 0.60 下限以保证可读性
-    /// （否则明亮桌面上会出现「浅字 + 亮底」看不清）。
-    #[serde(default = "default_true")]
-    pub bg_material_auto_contrast: bool,
-    /// 内容衬底浓度（0.0-0.6）：在材质之上、内容面板之下再铺一层主题底色的
-    /// 半透明衬底（类似 Fluent 的 in-app acrylic）。桌面画面仍可见，
-    /// 但文字有了稳定的底色，小字可读性显著提升。
-    #[serde(default = "default_content_scrim")]
-    pub bg_content_scrim: f32,
-    /// F1 窗口位置记忆（逻辑坐标；[0,0] = 未保存，使用系统默认位置）
-    #[serde(default)]
-    pub window_pos: [f32; 2],
-    /// F1 窗口大小记忆（逻辑坐标；低于下限则用默认 1180×760）
-    #[serde(default)]
-    pub window_size: [f32; 2],
-    /// 左侧栏折叠为纯图标（左下的 ◀/▶ 按钮切换）
-    #[serde(default)]
-    pub nav_collapsed: bool,
     /// 模组社区收藏（Modrinth project_id 列表，图2 收藏夹导航）
     #[serde(default)]
     pub mod_favorites: Vec<String>,
@@ -184,12 +145,8 @@ fn default_theme_preset() -> String {
     "default".to_string()
 }
 
-fn default_ui_font_scale() -> f32 {
-    14.0
-}
-
 fn default_custom_accent() -> (u8, u8, u8) {
-    (28, 150, 130)
+    (0, 150, 136)
 }
 
 fn default_custom_highlight() -> (u8, u8, u8) {
@@ -212,14 +169,6 @@ fn default_corner_scale() -> f32 {
     1.0
 }
 
-fn default_window_corner_scale() -> f32 {
-    1.0
-}
-
-fn default_plugin_bg_alpha() -> f32 {
-    0.8
-}
-
 fn default_toast_style() -> String {
     "slide".to_string()
 }
@@ -234,14 +183,6 @@ fn default_sys_notify() -> bool {
 
 fn default_true() -> bool {
     true
-}
-
-/// 内容衬底默认 0.5：材质之上再压一层半透明底色，保证内容区文字/控件稳定可读
-/// （Fluent 的 in-app acrylic 同样是「材质之上再压衬底」的思路）。
-/// 0.25 为历史默认，实测桌面细节仍直穿 UI（用户「半透明不够清晰」反馈的根因之一），
-/// 故上调为 0.5——透明感保留一半，清晰度显著提升。
-fn default_content_scrim() -> f32 {
-    0.5
 }
 
 fn default_lang() -> String {
@@ -273,31 +214,20 @@ impl Default for GlobalConfig {
             anim_speed: 1.0,
             theme_mode: "dark".to_string(),
             theme_preset: "default".to_string(),
-            ui_font_scale: 14.0,
             custom_colors: false,
-            custom_accent: (28, 150, 130),
+            custom_accent: (0, 150, 136),
             custom_highlight: (120, 230, 160),
             custom_bg: (22, 22, 26),
             bg_image: String::new(),
             bg_alpha: 0.35,
             round_corners: true,
-            window_round_corners: true,
             corner_scale: 1.0,
-            window_corner_scale: 1.0,
             toast_style: "slide".to_string(),
             toast_duration_secs: 5.0,
             sys_notify: true,
             close_behavior: "exit".to_string(),
             features: HashMap::new(),
             plugin_states: HashMap::new(),
-            plugin_configs: HashMap::new(),
-            plugin_bg_alpha: 0.8,
-            bg_capture_exclusion: true,
-            bg_material_auto_contrast: true,
-            bg_content_scrim: 0.5,
-            window_pos: [0.0, 0.0],
-            window_size: [0.0, 0.0],
-            nav_collapsed: false,
             mod_favorites: Vec::new(),
         }
     }

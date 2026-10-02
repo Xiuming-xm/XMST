@@ -495,26 +495,6 @@ fn pct_fmt(v: f64) -> f64 {
     }
 }
 
-/// 图表刻度/数值统一格式化：按量级缩写（1000→1.0K、1000000→1.0M），负数保留符号，小数保留合适精度
-fn format_tick(v: f64) -> String {
-    let neg = v < 0.0;
-    let a = v.abs();
-    let s = if a >= 1_000_000.0 {
-        format!("{:.1}M", a / 1_000_000.0)
-    } else if a >= 1_000.0 {
-        format!("{:.1}K", a / 1_000.0)
-    } else if a.fract().abs() < 1e-9 {
-        format!("{}", a as i64)
-    } else {
-        format!("{:.1}", a)
-    };
-    if neg {
-        format!("-{s}")
-    } else {
-        s
-    }
-}
-
 /// 维度 ID → 萌新友好名；未知维度原样显示（适配任意模组维度）
 fn dim_friendly_name(id: &str) -> String {
     match id.trim().to_lowercase().as_str() {
@@ -1028,17 +1008,9 @@ fn ui_mods(
             ui.end_row();
             for m in &s.mod_top {
                 ui.label(RichText::new(&m.name).small());
-                if m.pct <= 0.0 {
-                    // 0% 条目不绘制条身与百分比文本，弱化占位，避免空条视觉噪音
-                    ui.label(RichText::new("—").weak().small());
-                } else {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        ui.add(egui::ProgressBar::new((m.pct / 100.0) as f32)
-                            .desired_width(120.0));
-                        ui.label(RichText::new(format!("{:.1}%", m.pct)).small());
-                    });
-                }
+                ui.add(egui::ProgressBar::new((m.pct / 100.0) as f32)
+                    .desired_width(120.0)
+                    .text(format!("{:.1}%", m.pct)));
                 ui.label(RichText::new(format!("{:.1}", m.self_time)).small());
                 ui.horizontal(|ui| {
                     locate_btn(ui, &m.name, jar_index, locate);
@@ -1131,17 +1103,9 @@ fn ui_mods(
                 for h in &hits {
                     ui.label(RichText::new(format!("{}.{}", h.class, h.method)).small());
                     ui.label(RichText::new(format!("{:.1}", h.self_time)).small());
-                    if h.pct <= 0.0 {
-                        // 0% 条目不绘制条身与百分比文本，弱化占位
-                        ui.label(RichText::new("—").weak().small());
-                    } else {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 4.0;
-                            ui.add(egui::ProgressBar::new((h.pct / 100.0) as f32)
-                                .desired_width(90.0));
-                            ui.label(RichText::new(format!("{:.1}%", h.pct)).small());
-                        });
-                    }
+                    ui.add(egui::ProgressBar::new((h.pct / 100.0) as f32)
+                        .desired_width(90.0)
+                        .text(format!("{:.1}%", h.pct)));
                     if h.tag.is_empty() {
                         ui.label("");
                     } else {
@@ -1203,17 +1167,9 @@ fn ui_hotspots(
             ui.end_row();
             for h in &s.hot_top {
                 ui.label(RichText::new(format!("{}.{}", h.class, h.method)).small());
-                if h.pct <= 0.0 {
-                    // 0% 条目不绘制条身与百分比文本，弱化占位
-                    ui.label(RichText::new("—").weak().small());
-                } else {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        ui.add(egui::ProgressBar::new((h.pct / 100.0) as f32)
-                            .desired_width(90.0));
-                        ui.label(RichText::new(format!("{:.1}%", h.pct)).small());
-                    });
-                }
+                ui.add(egui::ProgressBar::new((h.pct / 100.0) as f32)
+                    .desired_width(90.0)
+                    .text(format!("{:.1}%", h.pct)));
                 ui.label(RichText::new(format!("{:.1}", h.self_time)).small());
                 ui.label(RichText::new(&h.source).weak().small());
                 if h.tag.is_empty() {
@@ -1444,8 +1400,12 @@ fn ui_metric_collapse(
             for l in detail {
                 ui.label(RichText::new(l).small());
             }
-            draw_series(ui, "系统占用 (%)", series_secondary, None, Color32::from_rgb(255, 200, 120), unit);
-            draw_series(ui, curve_title, series, threshold, curve_color, unit);
+            if !series_secondary.is_empty() {
+                draw_series(ui, "系统占用 (%)", series_secondary, None, Color32::from_rgb(255, 200, 120), unit);
+            }
+            if !series.is_empty() {
+                draw_series(ui, curve_title, series, threshold, curve_color, unit);
+            }
             ui.label(RichText::new(format!("提示：{tip}")).weak().small());
         });
 }
@@ -1489,25 +1449,7 @@ fn draw_series(
     unit: &str,
 ) {
     if series.is_empty() {
-        // 空图占位：底框 + 空心圆 + 居中弱化文字（不再空白/仅顶部一行小字）
-        let width = ui.available_width().max(200.0);
-        let height = 130.0;
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
-        let painter = ui.painter();
-        painter.rect_filled(rect, 4.0, Color32::from_gray(26));
-        let center = rect.center();
-        painter.circle_stroke(
-            center,
-            20.0,
-            egui::Stroke::new(1.5_f32, Color32::from_gray(90)),
-        );
-        painter.text(
-            center + egui::vec2(0.0, 42.0),
-            egui::Align2::CENTER_CENTER,
-            "暂无数据",
-            egui::FontId::proportional(12.0),
-            Color32::from_gray(110),
-        );
+        ui.label(RichText::new(format!("{title}：无数据")).weak());
         return;
     }
     let width = ui.available_width().max(200.0);
@@ -1552,7 +1494,7 @@ fn draw_series(
         painter.text(
             egui::pos2(rect.left() + 4.0, (y - 13.0).max(rect.top())),
             egui::Align2::LEFT_TOP,
-            format!("阈值 {}", format_tick(th)),
+            format!("阈值 {th}"),
             egui::FontId::proportional(10.0),
             Color32::from_rgb(200, 90, 90),
         );
@@ -1610,7 +1552,7 @@ fn draw_series(
     painter.text(
         egui::pos2(rect.left() + 6.0, rect.top() + 4.0),
         egui::Align2::LEFT_TOP,
-        format!("{title} · {n} 点（{}~{} {unit}）峰值 {}", format_tick(start as f64), format_tick(end as f64), format_tick(peak)),
+        format!("{title} · {n} 点（{start}~{end} {unit}）峰值 {peak:.1}"),
         egui::FontId::proportional(11.0),
         Color32::from_gray(200),
     );

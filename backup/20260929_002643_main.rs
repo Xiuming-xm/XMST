@@ -1,7 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod backup;
-mod backdrop;
 mod config;
 mod download;
 mod logdb;
@@ -12,7 +11,6 @@ mod perf;
 mod plugins;
 mod process;
 mod server_download;
-mod serverinfo;
 mod spark_analysis;
 mod theme;
 
@@ -1043,7 +1041,7 @@ enum ServerTab {
     Status,
     /// 玩家管理页（B1 四 Tab：在线/白名单/封禁/OP，BETA_PLAYERS 启用时显示）
     Players,
-    /// 特殊功能页（Spark 性能分析：总开关 BETA_SPECIAL + Spark 子开关 FEATURE_SPARK，2026-10-02 回归测试功能，默认禁用）
+    /// 特殊功能页（Spark 性能分析：总开关 BETA_SPECIAL + Spark 子开关 FEATURE_SPARK，均已转正式功能）
     Special,
 }
 
@@ -1468,8 +1466,6 @@ struct App {
     add_java_path: String,
     /// 插件管理页当前选中插件名（文件浏览式右侧预览）
     plugin_sel: Option<String>,
-    /// 插件页「添加配置项」的新 key 输入框
-    plugin_cfg_new_key: String,
     /// B7 创建服务器弹窗（None=关闭）
     create_server: Option<CreateServerState>,
     /// B3 强停二次确认请求（显示 pid + 影响，带一次性 token，30s 过期）
@@ -1479,19 +1475,8 @@ struct App {
     /// 插件系统（BETA_PLUGINS 启用时 Some：rhai 宿主 + 事件总线 + zip 热加载；
     /// 默认 None，关闭时零加载零轮询零内存）
     plugins: Option<plugins::PluginManager>,
-    /// 插件请求的窗口背景模式（Default=不透明；Translucent/Frosted/Acrylic 见 plugins::BgStyle）
-    plugin_bg_style: plugins::BgStyle,
-    /// 当前背景模式的不透明度/着色浓度 0.0-1.0
-    /// （半透明=中央覆盖层 alpha；毛玻璃/亚克力=DWM accent 的 GradientColor alpha）
-    plugin_bg_opacity: f32,
-    /// 一次性：本次运行是否已按插件保存的 bg_style 恢复过背景效果
-    plugin_bg_restored: bool,
-    /// 当前生效背景效果的**归属插件**（D2）：禁用/卸载该插件时自动回收效果，
-    /// 避免「插件已禁用但窗口还是半透明」的残留
-    plugin_bg_owner: Option<String>,
-    /// 诊断（只取一次）：GL 默认帧缓冲的 (红位数, alpha 位数)；None = 取不到 GL 上下文。
-    /// alpha=0 说明像素格式根本没有 alpha 通道 —— 逐像素窗口透明不可能生效。
-    gl_fb_bits: Option<(i32, i32)>,
+    /// 插件请求的毛玻璃/半透明背景是否已生效（用于 UI 半透明覆盖与展示）
+    plugin_bg_active: bool,
     confirm_restore: Option<(usize, PathBuf, String)>, // (server_idx, zip, name)
     confirm_delete_backup: Option<(usize, PathBuf, String)>, // (server_idx, zip, name)
     /// 右键重命名弹窗： (server_idx, 当前�?
@@ -1515,8 +1500,6 @@ struct App {
     tray_quit_id: Option<tray_icon::menu::MenuId>,
     /// 当前是否已隐藏到托盘（Arc 供托盘事件回调线程读写）
     tray_hidden: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// 刚从托盘恢复窗口（托盘回调置位；update 消费后做纹理/字体/圆角全量重建）
-    tray_restoring_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// 隐藏请求已受理但窗口尚未隐藏（延迟一帧隐藏：见 update 早退分支，避免隐藏窗口
     /// request_redraw 无效导致 eframe ControlFlow 滞留 Poll 空转 100% CPU）
     hide_requested: bool,
@@ -1666,78 +1649,17 @@ struct App {
     bg_tex: Option<egui::TextureHandle>,
     /// Background image editor window visibility (ESC exits)
     bg_edit_open: bool,
+    /// 跟随系统深浅色：最近一次注册表轮询时刻（2-3 秒节流）
+    last_sys_theme_check: std::time::Instant,
     /// 界面字号基线：启动时系统 DPI 的 pixels_per_point（ui_font_scale 以此为基准缩放）
     base_ppp: f32,
-    /// 设置页字号滑杆的待应用值：拖动不生效，点「应用」才写入 cfg
-    pending_font_scale: f32,
-    /// 窗口区域圆角缓存 (r_px, win_w, win_h)：仅在值变化时重设 SetWindowRgn
-    last_win_rgn: (i32, i32, i32),
-    /// 最近一次 theme::apply 返回的窗口圆角半径（点）：apply_bg 在应用 DWM accent 后
-    /// 需要用它在同一步内重设 SetWindowRgn（accent 会重置窗口区域，导致圆角变尖锐直角）
-    win_r_points: f32,
-    /// 桌面捕获式窗口背景：本机环境下唯一可用的半透明/毛玻璃实现（详见 backdrop.rs）
-    backdrop: backdrop::BackdropCapture,
-    /// 最近一次已知的窗口屏幕矩形（物理像素 x,y,w,h），供桌面捕获使用
-    win_rect_px: (i32, i32, i32, i32),
-    /// 主窗口 HWND 缓存（避免每帧 EnumWindows；见 resolve_main_hwnd）
-    hwnd_cache: Option<isize>,
-    /// 自绘缩放状态：(方向, 起始鼠标物理坐标, 起始窗口物理矩形)。
-    /// 无边框窗口不做系统 BeginResize，改为按住边缘时 GetCursorPos + SetWindowPos 自绘，
-    /// 得到与普通窗口一致的自由缩放（可任意拖到任意尺寸，非仅最大化/最小化）。
-    resize_drag: Option<(
-        egui::viewport::ResizeDirection,
-        (i32, i32),
-        Option<(i32, i32, i32, i32)>,
-    )>,
-    /// 亚克力材质的噪点纹理（96×96 重复寻址，懒创建）
-    noise_tex: Option<egui::TextureHandle>,
-    /// 拖动/缩放期间冻结底图：最近一次「窗口矩形发生变化」的时间
-    /// （判据是「本帧 vs 上一帧」，不是「本帧 vs 上次抓取」，详见 paint_bg 注释）
-    bg_last_move_at: Option<std::time::Instant>,
-    /// 拖动结束后需要立刻补抓一帧真实底图
-    bg_needs_refresh: bool,
-    /// 启动/脚本自动恢复背景效果时抑制提示条（避免开机弹一条像告警的提示）
-    bg_suppress_toast: bool,
-    /// 底图当前的自适应抓取间隔（ms）：内容静止时逐步放宽，内容变化时收紧
-    bg_cap_interval_ms: f32,
-    /// 上一次抓取到的画面均值（用于判断桌面内容是否在变化）
-    bg_prev_mean: (u8, u8, u8),
-    /// 左侧栏是否折叠为纯图标（持久化到配置）
-    nav_collapsed: bool,
-    /// 左侧栏宽度动画值（56 = 折叠，170 = 展开）
-    nav_w_anim: f32,
-    /// 背景配置落盘去抖（拖动不透明度滑杆时不要把每帧都写盘）
-    bg_save_at: Option<std::time::Instant>,
-    /// 上一帧的窗口屏幕矩形（用于判断是否正在移动）
-    bg_prev_rect: (i32, i32, i32, i32),
-    /// 窗口位置/大小记忆：最近一次保存的矩形与时间（避免每帧写配置）
-    win_saved_rect: (i32, i32, i32, i32),
-    win_save_at: Option<std::time::Instant>,
-    /// 调试/自测截图（`XMST_SHOT=<png路径>`）：效果开启时窗口会被系统排除在截屏之外，
-    /// 这个内置截图从自己的帧缓冲取图，是唯一能看清实际渲染结果的手段。
-    shot_path: Option<std::path::PathBuf>,
-    shot_frames: u32,
-    shot_done: bool,
 }
 
 impl App {
-    /// 当前界面**实际生效**的深浅（用于强调色/前景派生）。
-    ///
-    /// 判据必须取自「当前调色板的正文色」而不是配置里的 `theme_mode`：
-    /// 材质模式下 `theme::auto_contrast` 会按材质明暗整体翻转深浅（明亮桌面 → 浅色界面），
-    /// 此时配置里可能还是 dark/custom，若这里读配置就会出现
-    /// 「界面已经变浅、但导航文字仍是给深色底设计的浅灰」→ 看不清、且“部分字体不跟随变色”。
-    /// 约定：正文色偏暗 = 浅色界面（auto_contrast 浅色分支把 text 设为近黑）。
-    fn theme_is_light(&self) -> bool {
-        let t = self.theme_cur.text;
-        let luma = 0.299 * t.r() as f32 + 0.587 * t.g() as f32 + 0.114 * t.b() as f32;
-        luma < 128.0
-    }
-
     /// 亮色模式前景适配：为深色背景设计的浅灰/浅彩文字在亮色背景上几乎不可见，
     /// 统一压暗使其达到 WCAG AA 正文 4.5:1；深色模式原样返回。
     fn fg(&self, c: egui::Color32) -> egui::Color32 {
-        if self.theme_is_light() {
+        if self.cfg.theme_mode == "light" {
             theme::light_adapt(c)
         } else {
             c
@@ -1755,7 +1677,6 @@ impl App {
             let _ = std::fs::create_dir_all(parent);
         }
         let mut cfg = load_config(&config_path);
-        let nav_collapsed_init = cfg.nav_collapsed;
         // 老配置兼容：admin_port 缺失时统一为 7400，重新编号避免端口冲突
         {
             let mut used: HashSet<u16> = HashSet::new();
@@ -1779,15 +1700,13 @@ impl App {
         let plugins_init = Self::init_plugins(&cfg);
         let theme_cur = theme::target_colors(
             &cfg.theme_mode,
-            cfg.theme_mode == "custom",
+            cfg.custom_colors,
             cfg.custom_accent,
             cfg.custom_bg,
             cfg.custom_highlight,
         );
         // 字号基线需在 egui_ctx: ctx 移动前读取
         let base_ppp = ctx.pixels_per_point();
-        // 待应用字号初始跟随配置（cfg 随后被整体移入 self.cfg）
-        let initial_font_scale = cfg.ui_font_scale;
         let mut app = Self {
             cfg,
             nav: Nav::Servers,
@@ -1836,11 +1755,7 @@ impl App {
                 None
             },
             plugins: plugins_init,
-            plugin_bg_style: plugins::BgStyle::Default,
-            plugin_bg_opacity: 0.8,
-            plugin_bg_restored: false,
-            plugin_bg_owner: None,
-            gl_fb_bits: None,
+            plugin_bg_active: false,
             confirm_restore: None,
             confirm_delete_backup: None,
             rename_server: None,
@@ -1853,7 +1768,6 @@ impl App {
             tray_show_id: None,
             tray_quit_id: None,
             tray_hidden: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            tray_restoring_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hide_requested: false,
             hide_sent: false,
             tray_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1863,31 +1777,9 @@ impl App {
             theme_cur,
             theme_target: theme_cur,
             bg_tex: None,
-            plugin_cfg_new_key: String::new(),
             bg_edit_open: false,
+            last_sys_theme_check: std::time::Instant::now() - std::time::Duration::from_secs(10),
             base_ppp,
-            pending_font_scale: initial_font_scale,
-            last_win_rgn: (0, 0, 0),
-            win_r_points: 0.0,
-            backdrop: backdrop::BackdropCapture::default(),
-            win_rect_px: (0, 0, 0, 0),
-            hwnd_cache: None,
-            resize_drag: None,
-            noise_tex: None,
-            bg_last_move_at: None,
-            bg_needs_refresh: false,
-            bg_suppress_toast: false,
-            bg_cap_interval_ms: 150.0,
-            bg_prev_mean: (0, 0, 0),
-            nav_collapsed: nav_collapsed_init,
-            nav_w_anim: if nav_collapsed_init { 56.0 } else { 170.0 },
-            bg_save_at: None,
-            bg_prev_rect: (0, 0, 0, 0),
-            win_saved_rect: (0, 0, 0, 0),
-            win_save_at: None,
-            shot_path: std::env::var("XMST_SHOT").ok().map(std::path::PathBuf::from),
-            shot_frames: 0,
-            shot_done: false,
             tray_quit: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tray_quit_requested: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tray_handlers_set: false,
@@ -2154,10 +2046,6 @@ impl App {
                 rt.log_buf.clear();
                 rt.startup_notified = false;
                 rt.startup_warned = false;
-                // ★ 复位插件一次性门控：以前只在 ServerRuntime::default() 里初始化 false，
-                // 而 runtimes 每个服务器只建一次，导致 server_started 每个服务器每次程序运行
-                // 最多只发一次（第二次开服插件再也不触发，毛玻璃"只生效过一次"）。
-                rt.plugin_start_emitted = false;
                 rt.started_at = Some(std::time::Instant::now());
                 // 重建日志文件尾随器：优先�?logs/latest.log 增量读日志（绕开 stdout 缓冲卡死�?
                 // 关键：seek_end 跳过文件已有内容，只读本次启动新增日志，避免旧日志回�?
@@ -2375,7 +2263,6 @@ impl App {
         // 托盘图标左键单击：恢复窗口（右键由系统弹出菜单，无需处理）
         {
             let hidden = self.tray_hidden.clone();
-            let restoring = self.tray_restoring_flag.clone();
             let version = self.tray_version.clone();
             let ctx = self.egui_ctx.clone();
             let _ = tray_icon::TrayIconEvent::set_event_handler(Some(move |ev| {
@@ -2387,7 +2274,6 @@ impl App {
                 {
                     hidden.store(false, std::sync::atomic::Ordering::Relaxed);
                     version.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    restoring.store(true, std::sync::atomic::Ordering::Relaxed);
                     show_main_window();
                     // 唤醒休眠的事件循环：请求立即重绘（否则 WaitUntil 长眠不响应）
                     ctx.request_repaint();
@@ -2397,7 +2283,6 @@ impl App {
         // 菜单事件：显示主窗口 / 退出
         {
             let hidden = self.tray_hidden.clone();
-            let restoring = self.tray_restoring_flag.clone();
             let version = self.tray_version.clone();
             let ctx = self.egui_ctx.clone();
             let quit_requested = self.tray_quit_requested.clone();
@@ -2408,7 +2293,6 @@ impl App {
                 if Some(&ev.id) == show_id.as_ref() {
                     hidden.store(false, std::sync::atomic::Ordering::Relaxed);
                     version.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    restoring.store(true, std::sync::atomic::Ordering::Relaxed);
                     show_main_window();
                     ctx.request_repaint();
                 } else if Some(&ev.id) == quit_id.as_ref() {
@@ -2488,10 +2372,6 @@ impl App {
             self.tray_hidden.store(true, std::sync::atomic::Ordering::Relaxed);
             self.tray_version
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            // 纹理句柄在托盘态清缓存/重置字体后会失效：显式丢弃，恢复时重建（否则 set() 到失效句柄）
-            self.backdrop.forget_texture();
-            self.noise_tex = None;
-            self.bg_tex = None;
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             self.hide_requested = true;
             self.hide_sent = false;
@@ -4355,29 +4235,8 @@ fn load_config(path: &Path) -> GlobalConfig {
             Err(_) => GlobalConfig::default(),
         }
     };
-    // 旧配置兼容：跟随系统/自动化配色已移除，历史 theme_mode="auto" 一律迁移为夜间。
-    if cfg.theme_mode == "auto" {
-        cfg.theme_mode = "dark".to_string();
-    }
-    // 旧配置兼容：自定义配色升级为独立第三模式（theme_mode="custom"），
-    // 历史 custom_colors=true（覆盖开关）迁移为新模式，避免旧自定义配色丢失。
-    if cfg.custom_colors && cfg.theme_mode != "custom" {
-        cfg.theme_mode = "custom".to_string();
-    }
     // Bug5：启动时修复历史脏配置（GBK 字节被按 UTF-8 读出的乱码隧道名/备注），并回写磁盘
     if config::repair_cfg_mojibake(&mut cfg) {
-        if let Ok(json) = serde_json::to_string_pretty(&cfg) {
-            if let Some(data_dir) = path.parent() {
-                let _ = std::fs::create_dir_all(data_dir);
-            }
-            let _ = std::fs::write(path, json);
-        }
-    }
-    // 内容衬底脏值自愈：旧版本滑杆曾把 bg_content_scrim 钳制成 0（第四轮复位 0.25 后又复发），
-    // 0 意味着内容面板完全无衬底、桌面细节直穿 UI（「半透明不够清晰」反馈的根因之一）。
-    // <0.35 一律视为被误钳制的脏值，抬到新默认 0.5 并回写磁盘；用户显式调高的值保留。
-    if cfg.bg_content_scrim < 0.35 {
-        cfg.bg_content_scrim = 0.5;
         if let Ok(json) = serde_json::to_string_pretty(&cfg) {
             if let Some(data_dir) = path.parent() {
                 let _ = std::fs::create_dir_all(data_dir);
@@ -4391,284 +4250,6 @@ fn load_config(path: &Path) -> GlobalConfig {
 // ---------- Windows 辅助：右下角通知与开机自�?----------
 
 impl App {
-    /// Feedback #7: frameless window — explicit edge/corner resize handles.
-    /// A 6px hit margin around the window issues `ViewportCommand::BeginResize` on press
-    /// so the whole tool can be resized by dragging its borders/corners. The top edge is
-    /// intentionally excluded (the custom title bar owns it for moving the window).
-    /// 最大化窗口不再直接 return：拖边缘时先还原再进入自绘缩放（行为对齐普通窗口——
-    /// 普通窗口最大化后拖边框会先还原再缩放；无边框若直接禁用则边缘拖动完全无反应）。
-    fn handle_edge_resize(&mut self, ctx: &egui::Context) {
-        let hwnd = resolve_main_hwnd(&mut self.hwnd_cache);
-        let maximized = window_is_maximized_now(hwnd, self.win_rect_px);
-        let rect = ctx.screen_rect();
-        // 无边框窗口的缩放热区：太窄会「感觉没法缩放」。
-        // 左右下用 9pt，上边用 5pt（上边还要留给标题栏拖动）。
-        let r = 9.0f32;
-        let rt = 5.0f32;
-        let pressed = ctx.input(|i| i.pointer.primary_pressed());
-        let Some(p) = ctx.pointer_hover_pos() else { return };
-        let on_right = rect.right() - p.x < r;
-        let on_left = p.x - rect.left() < r;
-        let on_top = p.y - rect.top() < rt;
-        let on_bottom = rect.bottom() - p.y < r;
-        use egui::viewport::ResizeDirection as D;
-        let dir = if on_right && on_bottom {
-            Some(D::SouthEast)
-        } else if on_left && on_bottom {
-            Some(D::SouthWest)
-        } else if on_right && on_top {
-            Some(D::NorthEast)
-        } else if on_left && on_top {
-            Some(D::NorthWest)
-        } else if on_right {
-            Some(D::East)
-        } else if on_left {
-            Some(D::West)
-        } else if on_top {
-            Some(D::North)
-        } else if on_bottom {
-            Some(D::South)
-        } else {
-            None
-        };
-        if let Some(dir) = dir {
-            let icon = match dir {
-                D::East | D::West => egui::CursorIcon::ResizeHorizontal,
-                D::South | D::North => egui::CursorIcon::ResizeVertical,
-                D::NorthEast | D::SouthWest => egui::CursorIcon::ResizeNeSw,
-                _ => egui::CursorIcon::ResizeNwSe,
-            };
-            ctx.set_cursor_icon(icon);
-            // 按下：普通状态交给**系统**缩放（BeginResize）—— 与普通窗口完全一致，
-            // 命中测试/最小尺寸/拖拽跟手都由系统负责，最不容易"感觉缩放没反应"。
-            // 仅最大化时走自绘路径：先还原、再以还原后的矩形为基准逐帧 SetWindowPos，
-            // 因为系统 BeginResize 不会自动从最大化还原（那需要拖标题栏）。
-            if pressed {
-                use winapi::shared::windef::POINT;
-                use winapi::um::winuser::{GetCursorPos, SetCapture};
-                if maximized {
-                    let mut pt: POINT = unsafe { std::mem::zeroed() };
-                    if unsafe { GetCursorPos(&mut pt) } != 0 {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
-                        self.resize_drag = Some((dir, (pt.x, pt.y), None));
-                        unsafe {
-                            SetCapture(hwnd);
-                        }
-                    }
-                } else {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
-                }
-            }
-        }
-    }
-
-    /// 窗口是否处于最大化（状态位 + 矩形比对工作区，见 `window_is_maximized_now`）。
-    fn window_is_maximized(&mut self) -> bool {
-        if self.egui_ctx.input(|i| i.viewport().maximized == Some(true)) {
-            return true;
-        }
-        let hwnd = resolve_main_hwnd(&mut self.hwnd_cache);
-        window_is_maximized_now(hwnd, self.win_rect_px)
-    }
-
-    /// 侧栏导航图标：**全部用矢量图元绘制**，不再用 emoji。
-    ///
-    /// 为什么不再用 emoji：📊 / 🗂 / ⬇️ / 🧩 / 🔗 / ⚙️ 来自不同字体（彩色 emoji 字体 vs
-    /// 符号字体），字形宽度、基线、视觉重量都不同；即使按 CENTER_CENTER 居中，
-    /// 实际墨迹位置依然参差 —— 用户连续两轮反馈"图标错位"就是这个原因。
-    /// 矢量图标统一画在 18×18 方框内居中，天生像素级对齐。
-    fn nav_icon(&self, painter: &egui::Painter, center: egui::Pos2, kind: Nav, color: Color32) {
-        let c = center;
-        let h = 9.0f32; // 18×18 方框的半边长
-        let st = egui::Stroke::new(1.5, color);
-        match kind {
-            Nav::Dashboard => {
-                // 柱状图：三根高低不同的柱子
-                let bw = 3.0;
-                for (i, hh) in [0.45f32, 0.9, 0.62].iter().enumerate() {
-                    let x = c.x - h + 2.0 + i as f32 * (bw + 2.0);
-                    let y0 = c.y + h - 1.0;
-                    let y1 = y0 - 18.0 * hh;
-                    painter.rect_filled(
-                        egui::Rect::from_min_max(egui::pos2(x, y1), egui::pos2(x + bw, y0)),
-                        1.0,
-                        color,
-                    );
-                }
-            }
-            Nav::Servers => {
-                // 机架：两个叠放的圆角矩形，各带一个指示点
-                for k in 0..2 {
-                    let y = c.y - h + 2.0 + k as f32 * (h + 1.0);
-                    let rect = egui::Rect::from_min_max(
-                        egui::pos2(c.x - h + 1.0, y),
-                        egui::pos2(c.x + h - 1.0, y + h - 2.0),
-                    );
-                    painter.rect_stroke(rect, 1.0, st);
-                    painter.circle_filled(egui::pos2(rect.left() + 3.0, rect.center().y), 1.2, color);
-                }
-            }
-            Nav::Download => {
-                // 下载：向下箭头 + 底部托盘
-                painter.line_segment([egui::pos2(c.x, c.y - h + 2.0), egui::pos2(c.x, c.y + 2.0)], st);
-                painter.line_segment([egui::pos2(c.x - 5.0, c.y - 3.0), egui::pos2(c.x, c.y + 2.5)], st);
-                painter.line_segment([egui::pos2(c.x + 5.0, c.y - 3.0), egui::pos2(c.x, c.y + 2.5)], st);
-                painter.line_segment(
-                    [egui::pos2(c.x - h + 2.0, c.y + h - 3.0), egui::pos2(c.x + h - 2.0, c.y + h - 3.0)],
-                    st,
-                );
-            }
-            Nav::Plugins => {
-                // 插件：插头（圆角矩形 + 两个触点 + 引线）
-                let rect = egui::Rect::from_min_max(
-                    egui::pos2(c.x - 5.0, c.y - 2.0),
-                    egui::pos2(c.x + 5.0, c.y + h - 1.0),
-                );
-                painter.rect_stroke(rect, 2.0, st);
-                painter.line_segment([egui::pos2(c.x - 3.0, c.y - h + 2.0), egui::pos2(c.x - 3.0, c.y - 2.0)], st);
-                painter.line_segment([egui::pos2(c.x + 3.0, c.y - h + 2.0), egui::pos2(c.x + 3.0, c.y - 2.0)], st);
-                painter.line_segment([egui::pos2(c.x, c.y + h - 1.0), egui::pos2(c.x, c.y + h + 1.0)], st);
-            }
-            Nav::Tunnel => {
-                // 内网穿透：链条（两个斜向交叠的圆角矩形）
-                let a = egui::Rect::from_min_max(
-                    egui::pos2(c.x - h + 1.0, c.y - 4.0),
-                    egui::pos2(c.x + 2.0, c.y + 4.0),
-                );
-                let b = egui::Rect::from_min_max(
-                    egui::pos2(c.x - 2.0, c.y - 4.0),
-                    egui::pos2(c.x + h - 1.0, c.y + 4.0),
-                );
-                painter.rect_stroke(a, 4.0, st);
-                painter.rect_stroke(b, 4.0, st);
-            }
-            Nav::Settings => {
-                // 设置：三条带滑块旋钮的推子（最易识别）
-                for (i, off) in [-5.0f32, 0.0, 5.0].iter().enumerate() {
-                    let y = c.y + off;
-                    painter.line_segment(
-                        [egui::pos2(c.x - h + 1.0, y), egui::pos2(c.x + h - 1.0, y)],
-                        egui::Stroke::new(1.2, color),
-                    );
-                    let kx = match i {
-                        0 => c.x - 2.0,
-                        1 => c.x + 3.0,
-                        _ => c.x - 4.0,
-                    };
-                    painter.circle_filled(egui::pos2(kx, y), 2.0, color);
-                }
-            }
-        }
-    }
-
-    /// 每帧轮询自绘缩放：左键按住期间按鼠标位移 SetWindowPos 调整窗口
-    fn poll_resize_drag(&mut self, ctx: &egui::Context) {
-        let Some((dir, start_cur, start_rect_opt)) = self.resize_drag else {
-            return;
-        };
-        let hwnd = resolve_main_hwnd(&mut self.hwnd_cache);
-        if hwnd.is_null() {
-            self.resize_drag = None;
-            return;
-        }
-        use winapi::shared::windef::POINT;
-        use winapi::um::winuser::{
-            GetAsyncKeyState, GetCursorPos, ReleaseCapture, SetWindowPos, SWP_NOACTIVATE,
-            SWP_NOZORDER, VK_LBUTTON,
-        };
-        // 左键已松开 → 结束缩放（GetAsyncKeyState 返回 i16，先升 i32 再按位与 0x8000）
-        let held = (unsafe { GetAsyncKeyState(VK_LBUTTON as i32) } as i32) & 0x8000 != 0;
-        if !held {
-            self.resize_drag = None;
-            unsafe {
-                ReleaseCapture();
-            }
-            return;
-        }
-        // 最大化窗口按下时 start_rect 为 None：等还原命令生效（窗口矩形退出最大化）
-        // 后再取还原后的矩形作缩放基准，避免拿最大化屏幕矩形当基准导致尺寸跳变。
-        let start_rect = match start_rect_opt {
-            Some(r) => r,
-            None => {
-                if window_is_maximized_now(hwnd, self.win_rect_px) {
-                    return; // 还原尚未生效，跳过本帧
-                }
-                let r = self.win_rect_px;
-                self.resize_drag = Some((dir, start_cur, Some(r)));
-                r
-            }
-        };
-        let mut pt: POINT = unsafe { std::mem::zeroed() };
-        if unsafe { GetCursorPos(&mut pt) } == 0 {
-            return;
-        }
-        // 最小尺寸：逻辑 960x600，按当前 DPI 换算成物理像素
-        let ppp = ctx.pixels_per_point().max(0.1);
-        let min_w = (960.0 * ppp) as i32;
-        let min_h = (600.0 * ppp) as i32;
-        let (sx, sy, sw, sh) = start_rect;
-        let dx = pt.x - start_cur.0;
-        let dy = pt.y - start_cur.1;
-        use egui::viewport::ResizeDirection as D;
-        let (mut x, mut y, mut w, mut h) = (sx, sy, sw, sh);
-        match dir {
-            D::East => w = sw + dx,
-            D::South => h = sh + dy,
-            D::SouthEast => {
-                w = sw + dx;
-                h = sh + dy;
-            }
-            D::West => {
-                w = sw - dx;
-                x = sx + dx;
-            }
-            D::North => {
-                h = sh - dy;
-                y = sy + dy;
-            }
-            D::SouthWest => {
-                w = sw - dx;
-                x = sx + dx;
-                h = sh + dy;
-            }
-            D::NorthEast => {
-                w = sw + dx;
-                h = sh - dy;
-                y = sy + dy;
-            }
-            D::NorthWest => {
-                w = sw - dx;
-                x = sx + dx;
-                h = sh - dy;
-                y = sy + dy;
-            }
-            _ => {}
-        }
-        if w < min_w {
-            if x != sx {
-                x = sx + sw - min_w;
-            }
-            w = min_w;
-        }
-        if h < min_h {
-            if y != sy {
-                y = sy + sh - min_h;
-            }
-            h = min_h;
-        }
-        unsafe {
-            SetWindowPos(
-                hwnd,
-                std::ptr::null_mut(),
-                x,
-                y,
-                w,
-                h,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-        }
-    }
-
     /// 右下角自绘通知（替代系统气泡）：按配置的弹出方式与滞留时间渲染
     fn push_toast(&mut self, title: &str, body: &str) {
         self.next_toast_id += 1;
@@ -5067,6 +4648,7 @@ fn single_instance_check() -> bool {
         use winapi::shared::winerror::ERROR_ALREADY_EXISTS;
         use winapi::um::errhandlingapi::GetLastError;
         use winapi::um::synchapi::CreateMutexW;
+        use winapi::um::winuser::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
         let name: Vec<u16> = "Local\\XMST_SingleInstance"
             .encode_utf16()
             .chain(std::iter::once(0))
@@ -5076,107 +4658,20 @@ fn single_instance_check() -> bool {
             return false;
         }
         if GetLastError() == ERROR_ALREADY_EXISTS {
-            // 已有实例（多数情况是上一个实例正停留在托盘里）。
-            //
-            // 旧行为：弹一个模态 MessageBox「已在运行，请先关闭已有实例」——
-            // 因为关闭窗口 = 最小化到托盘、进程仍在，所以**每次双击 exe 都会弹一次**，
-            // 用户把它当成了"打开文件警告"。这里改为**静默退出**：
-            // 托盘图标本来就在，点一下即可恢复窗口，不需要再打断用户。
-            // 顺带尽力把已有窗口带到前台（若它当前可见）。
-            use winapi::um::winuser::{
-                FindWindowW, IsWindowVisible, SetForegroundWindow, ShowWindow, SW_RESTORE,
-            };
-            let title: Vec<u16> = "XMST - 修暝的服务器工具\0".encode_utf16().collect();
-            let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
-            if !hwnd.is_null() && IsWindowVisible(hwnd) != 0 {
-                ShowWindow(hwnd, SW_RESTORE);
-                SetForegroundWindow(hwnd);
-            }
+            let msg: Vec<u16> = "XMST（修暝的服务器工具）已在运行，请先关闭已有实例。\0"
+                .encode_utf16()
+                .collect();
+            let title: Vec<u16> = "XMST\0".encode_utf16().collect();
+            MessageBoxW(
+                std::ptr::null_mut(),
+                msg.as_ptr(),
+                title.as_ptr(),
+                MB_OK | MB_ICONINFORMATION,
+            );
             return false;
         }
         true
     }
-}
-
-/// 整个虚拟桌面尺寸（物理像素，含所有显示器）。用于 F1 的尺寸/位置越界校验。
-fn primary_screen_size() -> Option<(f32, f32)> {
-    #[cfg(windows)]
-    unsafe {
-        use winapi::um::winuser::{GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN};
-        let w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-        let h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-        if w > 0 && h > 0 {
-            return Some((w as f32, h as f32));
-        }
-    }
-    None
-}
-
-/// 主屏逻辑尺寸（物理像素 ÷ DPI scale）。
-///
-/// 窗口恢复的尺寸上限/位置校验**必须**用它，而不是 `primary_screen_size()`：
-/// 虚拟屏 = 多显示器物理像素总和，且未除 DPI scale——直接当逻辑上限用，会在
-/// 副屏/低 DPI 机器上把记忆的窗口尺寸原样还原（巨大窗口、拖不到缩放边缘的根因）。
-#[cfg(windows)]
-fn primary_screen_logical() -> Option<(f32, f32)> {
-    unsafe {
-        use winapi::um::winuser::{GetDpiForSystem, GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
-        let w = GetSystemMetrics(SM_CXSCREEN);
-        let h = GetSystemMetrics(SM_CYSCREEN);
-        if w <= 0 || h <= 0 {
-            return None;
-        }
-        // GetDpiForSystem 自 Win10 1607 起可用；失败按 96 DPI（scale=1.0）兜底。
-        let dpi = GetDpiForSystem();
-        let scale = (dpi as f32 / 96.0).max(1.0);
-        Some((w as f32 / scale, h as f32 / scale))
-    }
-}
-
-#[cfg(not(windows))]
-fn primary_screen_logical() -> Option<(f32, f32)> {
-    None
-}
-
-/// 窗口是否最大化：状态位之外，再用「矩形 vs 显示器工作区」兜底判断。
-///
-/// 兜底是必需的：Aero Snap（拖到屏幕顶端）/双击标题栏/系统热键最大化时，
-/// winit 的状态位可能不反映，而按矩形比对不会漏 —— 上一版正是漏了，
-/// 把「最大化后的整屏尺寸」写进配置，导致下次启动开出巨大窗口。
-#[cfg(windows)]
-fn window_is_maximized_now(
-    hwnd: winapi::shared::windef::HWND,
-    rect_px: (i32, i32, i32, i32),
-) -> bool {
-    use winapi::um::winuser::{
-        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-    };
-    if hwnd.is_null() {
-        return false;
-    }
-    let (_, _, w, h) = rect_px;
-    if w <= 0 || h <= 0 {
-        return false;
-    }
-    unsafe {
-        let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-        if mon.is_null() {
-            return false;
-        }
-        let mut mi: MONITORINFO = std::mem::zeroed();
-        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-        if GetMonitorInfoW(mon, &mut mi) == 0 {
-            return false;
-        }
-        let work_w = mi.rcWork.right - mi.rcWork.left;
-        let work_h = mi.rcWork.bottom - mi.rcWork.top;
-        w * 100 >= work_w * 97 && h * 100 >= work_h * 97
-    }
-}
-
-#[cfg(not(windows))]
-fn window_is_maximized_now(_hwnd: isize, _rect_px: (i32, i32, i32, i32)) -> bool {
-    false
 }
 
 fn main() -> eframe::Result {
@@ -5198,13 +4693,6 @@ fn main() -> eframe::Result {
             );
             if let Some(parent) = crash_path.parent() {
                 let _ = std::fs::create_dir_all(parent);
-            }
-            // D7：崩溃日志轮转——超过 1MB 就滚成 crash.log.1（保留上一次），
-            // 避免反复崩溃/长 backtrace 把文件撑到几十 MB
-            if let Ok(meta) = std::fs::metadata(&crash_path) {
-                if meta.len() > 1024 * 1024 {
-                    let _ = std::fs::rename(&crash_path, crash_path.with_extension("log.1"));
-                }
             }
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
@@ -5236,50 +4724,15 @@ fn main() -> eframe::Result {
     if !single_instance_check() {
         std::process::exit(0);
     }
-    // F1：窗口位置/大小记忆（读取启动前即可用的配置；data 目录与 App::new 同源）
-    let startup_cfg = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.join("data").join(config::CONFIG_FILE)))
-        .map(|p| load_config(&p));
-    let (win_pos, win_size) = startup_cfg
-        .as_ref()
-        .map(|c| (c.window_pos, c.window_size))
-        .unwrap_or(([0.0, 0.0], [0.0, 0.0]));
-    // 主屏逻辑尺寸（物理 ÷ DPI）：同时用于「尺寸上限」「最小尺寸」与「位置越界」校验。
-    // 注意不要用 primary_screen_size()（虚拟屏物理像素）——多显示器/低 DPI 下会把
-    // 记忆尺寸原样还原，导致巨大窗口且拖不到缩放边缘（本问题修复的核心）。
-    let screen = primary_screen_logical().unwrap_or((1920.0, 1080.0));
-    let want_size = if win_size[0] >= 400.0 && win_size[1] >= 300.0 {
-        [
-            win_size[0].clamp(400.0, screen.0),
-            win_size[1].clamp(300.0, screen.1),
-        ]
-    } else {
-        [1180.0_f32.min(screen.0), 760.0_f32.min(screen.1)]
-    };
-    let mut vp = egui::ViewportBuilder::default()
-        .with_inner_size(want_size)
-        .with_min_inner_size([960.0_f32.min(screen.0), 600.0_f32.min(screen.1)]);
-    // 位置：0,0 视为未保存；还原前做越界校验（窗口**整体**须在屏内 ±64 容差），
-    // 避免记忆到已拔掉的显示器导致窗口出现在屏幕外、且边缘拖不到无法缩放。
-    if win_pos[0] != 0.0 || win_pos[1] != 0.0 {
-        if win_pos[0] >= -64.0
-            && win_pos[1] >= -64.0
-            && win_pos[0] + want_size[0] <= screen.0 + 64.0
-            && win_pos[1] + want_size[1] <= screen.1 + 64.0
-        {
-            vp = vp.with_position([win_pos[0], win_pos[1]]);
-        }
-    }
     let options = eframe::NativeOptions {
-        viewport: vp
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1180.0, 760.0])
+            .with_min_inner_size([960.0, 600.0])
             .with_title("XMST - 修暝的服务器工具")
             .with_icon(make_app_icon())
             .with_resizable(true)
             // 去除系统标题栏：最小化/最大化/关闭按钮由工具内自绘标题栏提�?
-            .with_decorations(false)
-            // 透明窗口底座：egui surface 带 alpha，供 DWM 亚克力/磨砂透出；default 由 clear_color 不透明兜底
-            .with_transparent(true),
+            .with_decorations(false),
         // P0 阶段 0：显式关闭 MSAA / 深度缓冲，垂直同步开启（托盘瘦身 + 低占用）
         multisampling: 0,
         depth_buffer: 0,
@@ -5426,58 +4879,6 @@ fn main_hwnd() -> winapi::shared::windef::HWND {
     found
 }
 
-/// 写 32bpp BMP（自写文件头，避免为诊断截图链入 PNG 编码器让 exe 增大约 3.5MB）。
-fn write_bmp32(
-    path: &std::path::Path,
-    w: usize,
-    h: usize,
-    rgba: &[u8],
-) -> std::io::Result<()> {
-    use std::io::Write;
-    let data_size = w * 4 * h;
-    let mut f = std::fs::File::create(path)?;
-    f.write_all(b"BM")?;
-    f.write_all(&((54 + data_size) as u32).to_le_bytes())?;
-    f.write_all(&0u32.to_le_bytes())?; // reserved
-    f.write_all(&54u32.to_le_bytes())?; // pixel data offset
-    f.write_all(&40u32.to_le_bytes())?; // BITMAPINFOHEADER size
-    f.write_all(&(w as i32).to_le_bytes())?;
-    f.write_all(&(h as i32).to_le_bytes())?; // 正高度 = 自下而上
-    f.write_all(&1u16.to_le_bytes())?; // planes
-    f.write_all(&32u16.to_le_bytes())?; // bpp
-    f.write_all(&0u32.to_le_bytes())?; // BI_RGB
-    f.write_all(&(data_size as u32).to_le_bytes())?;
-    f.write_all(&2835u32.to_le_bytes())?; // 96 DPI
-    f.write_all(&2835u32.to_le_bytes())?;
-    f.write_all(&0u32.to_le_bytes())?;
-    f.write_all(&0u32.to_le_bytes())?;
-    for y in (0..h).rev() {
-        for x in 0..w {
-            let i = (y * w + x) * 4;
-            if i + 2 < rgba.len() {
-                f.write_all(&[rgba[i + 2], rgba[i + 1], rgba[i], 255])?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// 主窗口 HWND 的缓存版本：`main_hwnd()` 每次都要 `EnumWindows` 枚举全部顶层窗口，/// 而 `apply_window_round_region` / 背景捕获等每帧路径都会用到它（纯浪费 + 标题变动时脆弱）。
-/// 这里缓存一次，仅在 `IsWindow` 失效（窗口被重建）时重新解析。
-fn resolve_main_hwnd(cache: &mut Option<isize>) -> winapi::shared::windef::HWND {
-    use winapi::shared::windef::HWND;
-    use winapi::um::winuser::IsWindow;
-    if let Some(v) = *cache {
-        let h = v as HWND;
-        if !h.is_null() && unsafe { IsWindow(h) } != 0 {
-            return h;
-        }
-    }
-    let h = main_hwnd();
-    *cache = if h.is_null() { None } else { Some(h as isize) };
-    h
-}
-
 /// 恢复主窗口到前台（托盘「显示」/ 左键单击）。
 fn show_main_window() {
     use winapi::um::winuser::{SetForegroundWindow, ShowWindow, SW_SHOW};
@@ -5488,6 +4889,55 @@ fn show_main_window() {
             SetForegroundWindow(hwnd);
         }
     }
+}
+
+/// 读取 Windows 注册表 HKCU\...\Themes\Personalize\AppsUseLightTheme（0=深色 / 1=浅色）。
+/// 返回 None 表示读取失败（调用方保持当前 theme_mode 不变）。
+fn system_light_theme() -> Option<bool> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+    use winapi::shared::minwindef::DWORD;
+    use winapi::um::winnt::{KEY_READ, REG_DWORD};
+    use winapi::um::winreg::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_CURRENT_USER,
+    };
+    let subkey = OsStr::new(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<u16>>();
+    let mut hkey = ptr::null_mut();
+    // RegOpenKeyExW 返回 LONG(i32)，ERROR_SUCCESS 常量是 DWORD(u32)，统一与 0 比较
+    if unsafe {
+        RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_READ, &mut hkey)
+    } != 0
+    {
+        return None;
+    }
+    let mut value: DWORD = 0;
+    let mut value_len: DWORD = std::mem::size_of::<DWORD>() as DWORD;
+    let mut value_type: DWORD = 0;
+    let name: Vec<u16> = "AppsUseLightTheme"
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let res = unsafe {
+        RegQueryValueExW(
+            hkey,
+            name.as_ptr(),
+            ptr::null_mut(),
+            &mut value_type,
+            &mut value as *mut DWORD as *mut u8,
+            &mut value_len,
+        )
+    };
+    unsafe {
+        RegCloseKey(hkey);
+    }
+    if res != 0 {
+        return None;
+    }
+    Some(value == 1)
 }
 
 fn titlebar_button(
@@ -5508,17 +4958,7 @@ fn titlebar_button(
 }
 
 impl eframe::App for App {
-    /// 清屏颜色：任一非默认背景模式都清为全透明，让 DWM 模糊/亚克力或半透明覆盖层之外
-    /// 的像素真的透出桌面；默认模式清为不透明底色，避免透明窗口在面板未覆盖处露出桌面。
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        if self.plugin_bg_style.needs_transparency() {
-            [0.0, 0.0, 0.0, 0.0]
-        } else {
-            egui::Color32::from_rgb(12, 12, 12).to_normalized_gamma_f32()
-        }
-    }
-
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // P0 阶段0 A1：托盘态 0 重绘——隐藏时立即返回，不渲染、不注册心跳。
         // 事件循环进入休眠（延迟隐藏帧已把 ControlFlow 拉回 Wait 后长眠，无任何重绘请求）；
         // 托盘事件由全局回调（set_event_handler）经 Arc 版本号 + request_repaint 唤醒一次。
@@ -5531,99 +4971,8 @@ impl eframe::App for App {
             }
             return;
         }
-        // ★ 恢复窗口（托盘 → 显示）后的第一帧：全量重建渲染状态。
-        //
-        // 黑屏窗口的根因：进入托盘态后会清空 egui 缓存 + 重置字体 + EmptyWorkingSet（为了把
-        // 工作集压到 ~2MB），这会让**背景材质纹理/壁纸纹理句柄失效**；而材质模式下内容面板
-        // 的填充 alpha 是 0（靠纹理透出桌面），纹理一旦没了 → 整窗只剩 clear 色 = 黑屏。
-        // 这里在恢复帧把一切都重建：字体重新懒加载、壁纸重载、材质强制重抓、
-        // 窗口圆角区域重设（隐藏会丢 SetWindowRgn）、并连续请求几帧重绘保证刷出来。
-        if self
-            .tray_restoring_flag
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
-        {
-            self.cjk_loading = false; // 触发 CJK/emoji 字体重新加载（托盘态被释放过）
-            if !self.cfg.bg_image.is_empty() {
-                self.refresh_bg();
-            }
-            self.bg_needs_refresh = true; // 强制立刻重抓一帧材质
-            self.last_win_rgn = (-1, -1, -1); // 隐藏会丢掉 SetWindowRgn 的圆角区域
-            self.apply_window_round_region(ctx, self.win_r_points);
-            for _ in 0..3 {
-                ctx.request_repaint();
-            }
-        }
         // 恢复窗口后的首次 update：消费托盘版本号，强制全量同步
         // （隐藏期间日志/玩家/流量均未拉取，本帧 tick 已全量补拉，再请求一帧确保 UI 全刷新）
-        // Feedback #7: frameless window needs explicit edge resize handles. The top edge
-        // is left to the custom title-bar drag (move); all other edges + corners enter a
-        // custom SetWindowPos resize loop when pressed within the 9px hit margin
-        // (system BeginResize replaced by custom loop for frameless consistency).
-        self.handle_edge_resize(ctx);
-        // 无边框窗口自绘缩放：边缘按住拖动逐帧 SetWindowPos（与系统窗口一致的自由缩放）
-        self.poll_resize_drag(ctx);
-        // F12：把当前窗口画面存成 BMP（背景效果开启时窗口会被系统排除在截屏之外，
-        // 外部截屏/录屏都拍不到本窗口，因此提供内置截图作为唯一可靠手段）。
-        if !self.shot_done
-            && self.shot_path.is_none()
-            && !ctx.wants_keyboard_input()
-            && ctx.input(|i| i.key_pressed(egui::Key::F12))
-        {
-            let name = format!(
-                "screenshot_{}.bmp",
-                chrono::Local::now().format("%Y%m%d_%H%M%S")
-            );
-            self.shot_path = Some(self.data_dir().join(name));
-            self.shot_frames = 0;
-        }
-        // 内置自测截图（XMST_SHOT=<路径> 或 F12）：等材质稳定后拍一帧并存盘。
-        if let Some(path) = self.shot_path.clone() {
-            if !self.shot_done {
-                self.shot_frames += 1;
-                if self.shot_frames == 45 {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
-                }                let img = ctx.input(|i| {
-                    i.events.iter().find_map(|e| match e {
-                        egui::Event::Screenshot { image, .. } => Some(image.clone()),
-                        _ => None,
-                    })
-                });
-                if let Some(img) = img {
-                    let (w, h) = (img.size[0], img.size[1]);
-                    let mut bytes = Vec::with_capacity(w * h * 4);
-                    for p in &img.pixels {
-                        bytes.extend_from_slice(&[p.r(), p.g(), p.b(), p.a()]);
-                    }
-                    // 写 BMP（自己写头，避免为诊断功能链入 PNG 编码器让 exe 大一截）
-                    match write_bmp32(&path, w, h, &bytes) {
-                        Ok(()) => {
-                            eprintln!("XMST_SHOT saved: {} ({w}x{h})", path.display());
-                            self.set_toast(format!("已保存窗口截图：{}", path.display()));
-                        }
-                        Err(e) => eprintln!("XMST_SHOT failed: {e}"),
-                    }
-                    self.shot_done = true;
-                    if std::env::var("XMST_SHOT_EXIT").is_ok() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                }
-            }
-        }
-        // 诊断（只取一次）：GL 帧缓冲 (红, alpha) 位数。注意 update 阶段 GL 上下文不一定当前，
-        // red<=0 视为「测不到」，不伪造数值；结果写入 data\bg_debug.log（见 App::bg_debug_log）。
-        if self.gl_fb_bits.is_none() {
-            use eframe::glow::HasContext as _;
-            // GL_RED_BITS / GL_ALPHA_BITS 的数值（不同 glow 版本导出名不一致，写字面量最稳）
-            const GL_RED_BITS: u32 = 0x0D52;
-            const GL_ALPHA_BITS: u32 = 0x0D55;
-            if let Some(gl) = frame.gl() {
-                let red = unsafe { gl.get_parameter_i32(GL_RED_BITS) };
-                if red > 0 {
-                    let alpha = unsafe { gl.get_parameter_i32(GL_ALPHA_BITS) };
-                    self.gl_fb_bits = Some((red, alpha));
-                }
-            }
-        }
         let tray_ver = self.tray_version.load(std::sync::atomic::Ordering::Relaxed);
         if self.last_tray_version != tray_ver {
             self.last_tray_version = tray_ver;
@@ -5651,10 +5000,6 @@ impl eframe::App for App {
         ctx.style_mut(|s| s.animation_time = target_anim);
         // Stage 6 主题系统：目标色板 → 帧率无关插值 → 应用（深浅/预设/自定义/圆角/背景透明度）
         self.tick_theme(ctx);
-        // 背景底图 / 背景材质：必须在**面板之前**绘制。egui 的 CentralPanel 内容就画在
-        // background 层，而同一层内按插入顺序绘制；帧末追加底图会盖住中央内容
-        // （本轮「材质盖住整个 UI、按钮全不可见」的根因，也是历史「壁纸盖住按钮」的同源问题）。
-        self.paint_bg(ctx);
         // 窗口隐藏到托盘后 egui 事件循环会休眠，托盘点击/菜单事件由全局回调（set_event_handler）处理；
         // 首次 update 注册回调（此时才持有有效 ctx），注册后不依赖事件循环也能响应托盘
         if !self.tray_handlers_set {
@@ -5798,9 +5143,8 @@ impl eframe::App for App {
                     // 文件通道尚未生效（启动初�?�?MC 服务器）：stdout 管道兜底
                     added += process::drain_logs(p, &mut buf, max);
                 }
-                // MC 服务器启动完成标志（"Done (x.xxxs)! For help, type ..."）→ 更新就绪状态 + 通知（防重复）
-                // D5：判定放宽到「Done (」+「s)」同时出现，兼容不同版本/包装端的小差异。
-                if !rt.startup_notified && buf.contains("Done (") && buf.contains("s)") {
+                // MC 服务器启动完成标志（"Done (x.xxx)! For help, type ..."）→ 更新就绪状�?+ 通知（防重复�?
+                if !rt.startup_notified && buf.contains("Done (") {
                     rt.startup_notified = true;
                     rt.last_msg = "✅ 启动完成，服务端已就绪".to_string();
                     // 成功运行：重置崩溃重启计数与熔断窗口
@@ -5810,20 +5154,13 @@ impl eframe::App for App {
                     let name = self.cfg.servers.get(idx).map(|s| s.name.clone()).unwrap_or_default();
                     notify_queue.push(("XMST - 服务器启动完成".to_string(), format!("{name} 已就绪，可以连接")));
                 }
-                // 就绪超时提示：长时间未出现 Done（非标准 MC 服务端或启动异常），给出可见状态
+                // 就绪超时提示：长时间未出�?Done（非标准 MC 服务端或启动异常），给出可见状�?
                 if !rt.startup_notified
                     && !rt.startup_warned
                     && rt.started_at.map(|t| t.elapsed().as_secs() > 180).unwrap_or(false)
                 {
                     rt.startup_warned = true;
                     rt.last_msg = "已运行，但未检测到服务端就绪标志（可能不是标准 MC 服务端），请查看日志确认".to_string();
-                    // D5 兜底：非标准/代理端/被改过本地化的服务端可能永远不输出 "Done ("
-                    // → 插件事件永远不触发。超时后仍按「已启动」补发一次 server_started。
-                    if plugins_active && !rt.plugin_start_emitted {
-                        rt.plugin_start_emitted = true;
-                        let name = self.cfg.servers.get(idx).map(|s| s.name.clone()).unwrap_or_default();
-                        plugin_evts.push(PluginEvt::ServerStarted(name));
-                    }
                 }
                 // 非用户主动停止时进程消失：视为异常退出（崩溃/强杀/断电�?
                 if !rt.stopping && !process::is_running(p) {
@@ -6036,16 +5373,11 @@ impl eframe::App for App {
         // 本块旧版"1000ms 低频心跳"随早退成为死代码，已删除；事件循环靠隐藏帧注册的
         // 超长 repaint 请求休眠，托盘恢复由全局回调 request_repaint 唤醒。
 
-        // 顶部栏（无背景标题：XMST + 小版本号；右侧为工具内窗口按钮：最小化/最大化/关闭）
-        // 材质模式下用 window_fill（= 材质的近不透明版）而不是硬编码色，
-        // 否则顶栏会是一块与其余部分不同色系的实心块。
+        // 顶部栏（无背景标题：XMST + 小版本号；右侧为工具内窗口按钮：最小化/最大化/关闭�?
         egui::TopBottomPanel::top("top")
             .frame(
                 egui::Frame::none()
-                    .fill(match self.plugin_bg_style {
-                        plugins::BgStyle::Default => Color32::from_rgb(22, 25, 32),
-                        _ => ctx.style().visuals.window_fill,
-                    })
+                    .fill(Color32::from_rgb(22, 25, 32))
                     .inner_margin(egui::Margin::symmetric(12.0, 5.0)),
             )
             .show(ctx, |ui| {
@@ -6061,56 +5393,19 @@ impl eframe::App for App {
                     if bar_resp.drag_started() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                     }
-                    // 双击标题栏 = 最大化/还原（与普通 Windows 窗口一致；用户反馈"窗口无法缩放"
-                    // 时往往正是窗口处于最大化状态，需要一条明显的退路）。
-                    if bar_resp.double_clicked() {
-                        let is_max = self.window_is_maximized();
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
-                    }
-                    // 左上角品牌区：**全部用 painter 绘制**（不用 Label/富文本）。
-                    // 原因（用户反馈）：Label 是可选中文本，在标题栏左上角会吃掉鼠标按下事件
-                    // —— 想拖左上角缩放时变成"框选文字"，缩放失效。绘制出来的图形没有任何
-                    // 交互命中，事件全都归标题栏拖拽/边缘缩放。
-                    {
-                        let logo_h = 20.0f32;
-                        let logo_w = 20.0f32;
-                        let avail = ui.available_rect_before_wrap();
-                        let logo_rect = egui::Rect::from_min_size(
-                            egui::pos2(avail.left() + 2.0, avail.center().y - logo_h * 0.5),
-                            egui::vec2(logo_w, logo_h),
-                        );
-                        let accent = self.theme_cur.accent;
-                        // 圆角徽标 + 字母 X
-                        ui.painter().rect_filled(
-                            logo_rect,
-                            egui::Rounding::same(5.0),
-                            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 210),
-                        );
-                        ui.painter().text(
-                            logo_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "X",
-                            egui::FontId::proportional(13.0),
-                            Color32::from_rgb(250, 250, 253),
-                        );
-                        // 品牌名 + 版本号（同一行绘制，不是可复制文本）
-                        ui.painter().text(
-                            egui::pos2(logo_rect.right() + 7.0, logo_rect.center().y),
-                            egui::Align2::LEFT_CENTER,
-                            "XMST",
-                            egui::FontId::proportional(15.0),
-                            self.theme_cur.text,
-                        );
-                        ui.painter().text(
-                            egui::pos2(logo_rect.right() + 7.0 + 44.0, logo_rect.center().y + 1.0),
-                            egui::Align2::LEFT_CENTER,
-                            "v0.1alpha",
-                            egui::FontId::proportional(10.0),
-                            self.theme_cur.weak,
-                        );
-                        // 占位：把后续内容推到品牌区右侧（不产生任何可交互控件）
-                        ui.add_space(logo_w + 7.0 + 44.0 + 46.0);
-                    }
+                    // 版本号紧�?XMST
+                    ui.label(
+                        RichText::new("XMST")
+                            .size(16.0)
+                            .strong()
+                            .color(Color32::from_rgb(235, 238, 245)),
+                    );
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new("v0.1alpha")
+                            .size(10.0)
+                            .color(Color32::from_rgb(130, 138, 152)),
+                    );
                     // 中区：状态区（toast 优先；否则显示当前服务器/就绪），预留右侧按钮区 132px
                     let mid_w = ui.available_width() - 132.0;
                     if mid_w > 40.0 {
@@ -6120,14 +5415,10 @@ impl eframe::App for App {
                                 |ui| {
                                     ui.add_space(4.0);
                                     if !self.toast.is_empty() {
-                                        // truncate：toast 过长时截断加省略号，避免溢出覆盖右侧窗口按钮
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(&self.toast)
-                                                    .size(12.0)
-                                                    .color(Color32::from_rgb(255, 200, 80)),
-                                            )
-                                            .truncate(),
+                                        ui.label(
+                                            RichText::new(&self.toast)
+                                                .size(12.0)
+                                                .color(Color32::from_rgb(255, 200, 80)),
                                         );
                                     } else {
                                         let cur = self
@@ -6141,14 +5432,10 @@ impl eframe::App for App {
                                                 .color(Color32::from_rgb(150, 160, 175)),
                                         );
                                         ui.add_space(5.0);
-                                        // truncate：服务器名过长时同样截断，防止溢出覆盖右侧窗口按钮
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(cur)
-                                                    .size(12.0)
-                                                    .color(Color32::from_rgb(170, 170, 178)),
-                                            )
-                                            .truncate(),
+                                        ui.label(
+                                            RichText::new(cur)
+                                                .size(12.0)
+                                                .color(Color32::from_rgb(170, 170, 178)),
                                         );
                                     }
                                 },
@@ -6222,10 +5509,9 @@ impl eframe::App for App {
                         if min_btn.clicked() {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                         }
-                        // 主题切换（日/夜/自定义配色三态轮转）：按当前 mode 显示对应图标；
-                        // 点击依次切换 light -> dark -> custom -> light。
+                        // 主题切换（日/夜）：当前亮色显示太阳，点击切到深色；
+                        // 当前深色显示月亮，点击切到亮色。手动切换即关闭"跟随系统"。
                         let is_light_theme = self.cfg.theme_mode == "light";
-                        let is_custom_theme = self.cfg.theme_mode == "custom";
                         let theme_btn = titlebar_button(
                             ui,
                             "title_theme",
@@ -6233,12 +5519,7 @@ impl eframe::App for App {
                             |p, rect| {
                                 let m = rect.center();
                                 let ic = Color32::from_rgb(235, 238, 245);
-                                if is_custom_theme {
-                                    // 调色板：三个彩色圆点
-                                    p.circle_filled(m + egui::vec2(-5.0, 2.6), 2.6, Color32::from_rgb(28, 150, 130));
-                                    p.circle_filled(m, 2.6, Color32::from_rgb(235, 120, 60));
-                                    p.circle_filled(m + egui::vec2(5.0, 2.6), 2.6, Color32::from_rgb(90, 140, 235));
-                                } else if is_light_theme {
+                                if is_light_theme {
                                     // 太阳：实心圆 + 八条光线
                                     p.circle_filled(m, 3.6, ic);
                                     for ang in [0.0f32, 0.7854, 1.5708, 2.3562, 3.1416, 3.9270, 4.7124, 5.4978] {
@@ -6256,11 +5537,9 @@ impl eframe::App for App {
                             },
                         );
                         if theme_btn.clicked() {
-                            self.cfg.theme_mode = match self.cfg.theme_mode.as_str() {
-                                "light" => "dark".to_string(),
-                                "dark" => "custom".to_string(),
-                                _ => "light".to_string(),
-                            };
+                            self.cfg.theme_follow_system = false;
+                            self.cfg.theme_mode =
+                                if is_light_theme { "dark".to_string() } else { "light".to_string() };
                             self.save_config();
                         }
                     });
@@ -6276,28 +5555,10 @@ impl eframe::App for App {
                 );
             });
 
-        // 左侧导航（带平滑滑块动画，可在设置中关闭；支持折叠成纯图标）
-        // 折叠/展开宽度做**动画插值**（此前是硬跳变，用户反馈"没有平滑效果"）。
-        let target_w = if self.nav_collapsed { 56.0 } else { 170.0 };
-        if self.cfg.ui_animations {
-            let sp = (0.25 * self.cfg.anim_speed.clamp(0.1, 2.0)).clamp(0.06, 0.6);
-            self.nav_w_anim += (target_w - self.nav_w_anim) * sp;
-            if (self.nav_w_anim - target_w).abs() < 0.4 {
-                self.nav_w_anim = target_w;
-            } else {
-                ctx.request_repaint();
-            }
-        } else {
-            self.nav_w_anim = target_w;
-        }
-        let nav_w = self.nav_w_anim;
-        // t: 1.0 = 完全展开，0.0 = 完全折叠（文字/标题按它淡出）
-        let t = ((nav_w - 56.0) / (170.0 - 56.0)).clamp(0.0, 1.0);
+        // 左侧导航（带平滑滑块动画，可在设置中关闭�?
         egui::SidePanel::left("nav")
             .resizable(false)
-            .default_width(nav_w)
-            .exact_width(nav_w)
-            .frame(egui::Frame::side_top_panel(&ctx.style()).fill(ctx.style().visuals.window_fill))
+            .default_width(170.0)
             .show(ctx, |ui| {
                 ui.add_space(8.0);
                 ui.spacing_mut().item_spacing.y = 2.0;
@@ -6341,78 +5602,51 @@ impl eframe::App for App {
                 // 避免不同 emoji 字形宽度差异导致文字右偏/参差
                 let mut nav_rects = vec![egui::Rect::NOTHING; nav_items.len()];
                 let mut clicked_nav: Option<Nav> = None;
-                for (i, (_emoji, text, val)) in nav_items.iter().enumerate() {
-                    // Stage 6：分组小标题（不参与按钮与滑块）；折叠时随 t 淡出
+                for (i, (emoji, text, val)) in nav_items.iter().enumerate() {
+                    // Stage 6：分组小标题（不参与按钮与滑块）
                     if let Some(h) = group_headers.get(&i) {
-                        if t > 0.25 {
-                            ui.add_space(6.0 * t);
-                            ui.label(
-                                RichText::new(*h)
-                                    .small()
-                                    .weak()
-                                    .color(self.theme_cur.weak.gamma_multiply(t)),
-                            );
-                            ui.add_space(2.0);
-                        }
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(*h).small().weak());
+                        ui.add_space(2.0);
                     }
                     let active = *val == self.nav;
-                    // 颜色一律取自**当前调色板**（已含材质自动对比度的结果），
-                    // 不再用写死的浅灰/浅青 —— 否则亮色（含明亮材质导致的浅色界面）
-                    // 下会出现「仪表盘等文字不跟随变色、且对比度不足」。
                     let color = if active {
-                        let a = self.theme_cur.accent;
-                        self.fg(Color32::from_rgb(a.r(), a.g(), a.b()))
+                        self.fg(Color32::from_rgb(140, 225, 245))
                     } else {
-                        self.theme_cur.weak
+                        self.fg(Color32::from_rgb(170, 170, 178))
                     };
                     // 透明整行按钮：负责点击与滑块定位
                     let btn = egui::Button::new("")
                         .frame(false)
                         .min_size(egui::vec2(ui.available_width(), item_h));
                     let resp = ui.add(btn);
-                    if !active {
-                        // 悬停底色做平滑过渡（此前是"一碰就亮/一走就灭"的硬切换）
-                        let hover_t = ui.ctx().animate_bool_with_time(
-                            resp.id.with("nav_hover"),
-                            resp.hovered(),
-                            if self.cfg.ui_animations { 0.12 } else { 0.0 },
+                    if resp.hovered() && !active {
+                        ui.painter().rect_filled(
+                            resp.rect,
+                            6.0,
+                            Color32::from_rgba_unmultiplied(34, 211, 238, 18),
                         );
-                        if hover_t > 0.01 {
-                            ui.painter().rect_filled(
-                                resp.rect,
-                                6.0,
-                                Color32::from_rgba_unmultiplied(
-                                    self.theme_target.accent.r(),
-                                    self.theme_target.accent.g(),
-                                    self.theme_target.accent.b(),
-                                    (18.0 * hover_t) as u8,
-                                ),
-                            );
-                        }
                     }
                     nav_rects[i] = resp.rect;
                     if resp.clicked() {
                         clicked_nav = Some(*val);
                     }
-                    // 图标固定画在 30px 宽**单元格的中心**（矢量图元，见 nav_icon）。
-                    // 折叠/展开过程中图标中心在「面板中心 ↔ 单元格中心」之间插值。
-                    let expanded_cx = resp.rect.min.x + 23.0;
-                    let cell_cx = expanded_cx * t + resp.rect.center().x * (1.0 - t);
-                    self.nav_icon(
-                        ui.painter(),
-                        egui::pos2(cell_cx, resp.rect.center().y),
-                        *val,
+                    // 固定宽度图标区（30px）+ 固定间距文字，起点与 emoji 实际宽度无关
+                    let icon_x = resp.rect.min.x + 14.0;
+                    ui.painter().text(
+                        egui::pos2(icon_x, resp.rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        *emoji,
+                        egui::FontId::proportional(14.0),
                         color,
                     );
-                    if t > 0.2 {
-                        ui.painter().text(
-                            egui::pos2(resp.rect.min.x + 44.0, resp.rect.center().y),
-                            egui::Align2::LEFT_CENTER,
-                            *text,
-                            egui::FontId::proportional(14.0),
-                            color.gamma_multiply(t),
-                        );
-                    }
+                    ui.painter().text(
+                        egui::pos2(icon_x + 30.0, resp.rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        *text,
+                        egui::FontId::proportional(14.0),
+                        color,
+                    );
                     ui.add_space(2.0);
                 }
                 if let Some(v) = clicked_nav {
@@ -6429,55 +5663,18 @@ impl eframe::App for App {
                     egui::pos2(r0.max.x - 3.0, r0.max.y - 3.0 + (r1.max.y - r0.max.y) * t),
                 );
                 ui.painter()
-                    .rect_filled(slider_rect, 6.0, Color32::from_rgba_unmultiplied(
-                        self.theme_target.accent.r(),
-                        self.theme_target.accent.g(),
-                        self.theme_target.accent.b(),
-                        30,
-                    ));
-                // 选中态：左侧 3px 圆角竖条（当前强调色），沿 nav_anim 插值；
-                // 随折叠动画淡出（完全折叠时不画：贴边竖条会让居中图标产生"偏左"错觉）
-                if t > 0.02 {
-                    let bar_rect = egui::Rect::from_min_max(
-                        egui::pos2(r0.min.x + 1.0, r0.min.y + 3.0 + (r1.min.y - r0.min.y) * t),
-                        egui::pos2(r0.min.x + 4.0, r0.max.y - 3.0 + (r1.max.y - r0.max.y) * t),
-                    );
-                    ui.painter().rect_filled(
-                        bar_rect,
-                        1.5,
-                        self.theme_target.accent.gamma_multiply(t),
-                    );
-                }
+                    .rect_filled(slider_rect, 6.0, Color32::from_rgba_unmultiplied(34, 211, 238, 30));
+                // 选中态：左侧 3px 圆角竖条（强调色 #22D3EE），沿 nav_anim 插值
+                let bar_rect = egui::Rect::from_min_max(
+                    egui::pos2(r0.min.x + 1.0, r0.min.y + 3.0 + (r1.min.y - r0.min.y) * t),
+                    egui::pos2(r0.min.x + 4.0, r0.max.y - 3.0 + (r1.max.y - r0.max.y) * t),
+                );
+                ui.painter().rect_filled(bar_rect, 1.5, Color32::from_rgb(34, 211, 238));
                 ui.separator();
-                // 折叠/展开按钮固定在左下角（用 <> 箭头表示），折叠后侧栏只剩图标。
-                // 采用 bottom_up 布局把它压在面板底部，不随导航项数量浮动。
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                    ui.add_space(6.0);
-                    let arrow = if self.nav_collapsed { "▶" } else { "◀" };
-                    let hint = if self.nav_collapsed {
-                        "展开侧栏"
-                    } else {
-                        "折叠侧栏（只显示图标）"
-                    };
-                    let btn = egui::Button::new(
-                        RichText::new(arrow)
-                            .size(14.0)
-                            .color(self.theme_cur.weak),
-                    )
-                    .frame(false);
-                    if ui.add(btn).on_hover_text(hint).clicked() {
-                        self.nav_collapsed = !self.nav_collapsed;
-                        self.cfg.nav_collapsed = self.nav_collapsed;
-                        self.save_config();
-                    }
-                    ui.separator();
-                    if !self.nav_collapsed {
-                        if ui.button("💾 保存配置").clicked() {
-                            self.save_config();
-                            self.set_toast("配置已保存".to_string());
-                        }
-                    }
-                });
+                if ui.button("💾 保存配置").clicked() {
+                    self.save_config();
+                    self.set_toast("配置已保存".to_string());
+                }
             });
 
         match self.nav {
@@ -6759,10 +5956,8 @@ impl eframe::App for App {
             let period_ms = if animating { 16 } else { 200 };
             ctx.request_repaint_after(std::time::Duration::from_millis(period_ms));
         }
-        // Stage 6：背景编辑弹窗（ESC 退出）
-        // 注意：背景底图/材质必须在**画任何面板之前**绘制（见 update 开头 tick_theme 之后的
-        // paint_bg 调用）——egui 的 CentralPanel 内容本身就画在 background 层，若在帧末再往
-        // 该层追加底图，底图会盖在中央内容之上（历史上「壁纸盖住按钮」同源）。
+        // Stage 6：背景图绘制（background layer 垫底）+ 背景编辑弹窗（ESC 退出）
+        self.paint_bg(ctx);
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.bg_edit_open = false;
         }
@@ -6773,11 +5968,11 @@ impl eframe::App for App {
 impl App {
     fn ui_dashboard(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            // 第二批：全页面 max-width 1100 左对齐（字号小时内容贴合左侧）
+            // 第二批：全页面 max-width 1100 水平居中（仅限宽布局，不动内部结构）
             let _avail = ui.available_rect_before_wrap();
             let _w = _avail.width().min(1100.0);
             let _centered = egui::Rect::from_min_size(
-                egui::pos2(_avail.left(), _avail.top()),
+                egui::pos2(_avail.center().x - _w * 0.5, _avail.top()),
                 egui::vec2(_w, _avail.height()),
             );
             let mut _inner = ui.new_child(
@@ -6909,9 +6104,7 @@ impl App {
         let mut switch_server: Option<usize> = None;
         let mut want_toggle = false;
 
-        let mut panel = egui::SidePanel::left("server_list").frame(
-            egui::Frame::side_top_panel(&ctx.style()).fill(ctx.style().visuals.window_fill),
-        );
+        let mut panel = egui::SidePanel::left("server_list");
         panel = if expanded {
             // 展开完成：恢复可拖拽调宽
             panel
@@ -6925,7 +6118,7 @@ impl App {
         panel.show(ctx, |ui| {
             if !icon_only {
                 // ================= 展开态：标题 + 列表 =================
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.add_space(4.0);
@@ -6998,7 +6191,7 @@ impl App {
                 }
             } else {
                 // ================= 折叠态：仅图标 =================
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         for &i in &order {
@@ -7015,66 +6208,34 @@ impl App {
                                 .map(|p| process::is_running(p))
                                 .unwrap_or(false);
                             let ch = name.chars().next().unwrap_or('?');
-                            // 折叠态行：整行透明按钮承载点击/右键，星标 + 首字符图标 + 状态点
-                            // 按固定坐标绘制，不随星标字形宽度偏移（☆ 与 ★ 宽度不同会造成图标列左右错位）
-                            let (row_rect, row_resp) = ui.allocate_exact_size(
-                                egui::vec2(ui.available_width(), 26.0),
-                                egui::Sense::click(),
-                            );
-                            let cy = row_rect.center().y;
-                            let icon_x = row_rect.center().x;
-                            let star_x = row_rect.min.x + 6.0;
-                            let star = if sc.favorited { "★" } else { "☆" };
-                            let star_color = if sc.favorited {
-                                self.fg(Color32::from_rgb(230, 180, 60))
-                            } else {
-                                self.theme_cur.weak
-                            };
-                            ui.painter().text(
-                                egui::pos2(star_x, cy),
-                                egui::Align2::CENTER_CENTER,
-                                star,
-                                egui::FontId::proportional(12.0),
-                                star_color,
-                            );
-                            ui.painter().text(
-                                egui::pos2(icon_x, cy),
-                                egui::Align2::CENTER_CENTER,
-                                ch.to_string(),
-                                egui::FontId::proportional(15.0),
-                                self.fg(Color32::from_rgb(235, 235, 240)),
-                            );
-                            // 运行状态点：图标右上角
-                            let dot = if running {
-                                self.fg(Color32::from_rgb(90, 200, 110))
-                            } else {
-                                Color32::from_gray(90)
-                            };
-                            ui.painter().circle_filled(
-                                egui::pos2(icon_x + 9.0, row_rect.top() + 3.0),
-                                3.0,
-                                dot,
-                            );
-                            if row_resp.hovered() {
-                                ui.painter().rect_filled(
-                                    row_rect,
-                                    6.0,
-                                    Color32::from_rgba_unmultiplied(255, 255, 255, 10),
-                                );
-                            }
-                            if row_resp.clicked() {
-                                // 按点击横坐标区分：左 14px 为星标区（收藏切换），其余为选中服务器
-                                let px = ui.ctx().pointer_interact_pos().map(|p| p.x);
-                                if let Some(px) = px {
-                                    if px < row_rect.min.x + 14.0 {
-                                        toggle_fav = Some(i);
-                                    } else {
-                                        switch_server = Some(i);
-                                    }
+                            ui.horizontal(|ui| {
+                                let star = if sc.favorited { "★" } else { "☆" };
+                                if ui
+                                    .add(egui::Button::new(star).frame(false).small())
+                                    .on_hover_text("收藏 / 取消收藏（收藏的服务器置顶）")
+                                    .clicked()
+                                {
+                                    toggle_fav = Some(i);
                                 }
-                            }
-                            let row_resp = row_resp.on_hover_text(name.clone());
-                            row_resp.context_menu(|ui| {
+                                // 服务器首字符图标 + 运行状态点
+                                let btn = egui::Button::new(RichText::new(ch.to_string()).size(15.0))
+                                    .frame(false)
+                                    .min_size(egui::vec2(24.0, 24.0));
+                                let resp = ui.add(btn).on_hover_text(name.clone());
+                                if resp.clicked() {
+                                    switch_server = Some(i);
+                                }
+                                let dot = if running {
+                                    self.fg(Color32::from_rgb(90, 200, 110))
+                                } else {
+                                    Color32::from_gray(90)
+                                };
+                                ui.painter().circle_filled(
+                                    egui::pos2(resp.rect.right() - 4.0, resp.rect.top() + 4.0),
+                                    3.0,
+                                    dot,
+                                );
+                                resp.context_menu(|ui| {
                                     if ui.button("✏️ 重命名").clicked() {
                                         to_rename = Some((i, sc.name.clone()));
                                         ui.close_menu();
@@ -7090,9 +6251,10 @@ impl App {
                                         ui.close_menu();
                                     }
                                 });
+                            });
                         }
                         ui.separator();
-                        ui.horizontal_centered(|ui| {
+                        ui.horizontal(|ui| {
                             if ui
                                 .add(egui::Button::new("＋").frame(false).small())
                                 .on_hover_text("创建新服务器")
@@ -7112,11 +6274,9 @@ impl App {
                         });
                     });
                 ui.separator();
-                ui.vertical_centered(|ui| {
-                    if ui.button("▶").on_hover_text("展开侧栏").clicked() {
-                        want_toggle = true;
-                    }
-                });
+                if ui.button("▶").on_hover_text("展开侧栏").clicked() {
+                    want_toggle = true;
+                }
             }
         });
 
@@ -7191,11 +6351,11 @@ impl App {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            // 第二批：max-width 1100 左对齐（服务器详情页；空态/early-return 在容器内）
+            // 第二批：max-width 1100 水平居中（服务器详情页；空态/early-return 在容器内）
             let _avail = ui.available_rect_before_wrap();
             let _w = _avail.width().min(1100.0);
             let _centered = egui::Rect::from_min_size(
-                egui::pos2(_avail.left(), _avail.top()),
+                egui::pos2(_avail.center().x - _w * 0.5, _avail.top()),
                 egui::vec2(_w, _avail.height()),
             );
             let mut _inner = ui.new_child(
@@ -7237,7 +6397,7 @@ impl App {
         if features::is_enabled(&self.cfg.features, features::BETA_PLAYERS) {
             tabs.insert(4, ("玩家管理", ServerTab::Players));
         }
-        // 特殊功能页在总开关 BETA_SPECIAL 启用时出现（2026-10-02 起属测试功能，默认禁用；可在设置-测试中的功能开关）
+        // 特殊功能页在总开关 BETA_SPECIAL 启用时出现（已转正式功能，默认启用；可在设置-服务器关闭）
         if features::is_enabled(&self.cfg.features, features::BETA_SPECIAL) {
             tabs.push(("特殊功能", ServerTab::Special));
         }
@@ -7327,7 +6487,7 @@ impl App {
 
     /// 独立性能页：服务器运行中显示实时采样图表，未运行提示无数�?
     fn ui_perf(&mut self, ui: &mut egui::Ui, idx: usize) {
-        egui::ScrollArea::vertical()
+        egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
             .auto_shrink([false, false])
             .show(ui, |ui| {
         let running = self
@@ -7391,7 +6551,7 @@ impl App {
 
     /// 状态页：玩家列表（日志解析）+ 性能 + 网络
     fn ui_status(&mut self, ui: &mut egui::Ui, idx: usize) {
-        egui::ScrollArea::vertical()
+        egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
             .auto_shrink([false, false])
             .show(ui, |ui| {
         let running = self
@@ -7451,7 +6611,7 @@ impl App {
             let sources = self.runtimes[idx].crash_list.clone();
             if !sources.is_empty() {
                 ui.label(RichText::new("可选分析对象：").strong());
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .id_salt(("crash_sources_scroll", idx))
                     .max_height(140.0)
                     .auto_shrink([false, false])
@@ -7481,7 +6641,7 @@ impl App {
             }
             if let Some(text) = &self.runtimes[idx].crash_analysis {
                 let text = text.clone();
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .id_salt(("crash_analysis_scroll", idx))
                     .max_height(280.0)
                     .auto_shrink([false, false])
@@ -7510,7 +6670,7 @@ impl App {
 
     /// 特殊功能页：Spark 性能分析（问题2 重构：总折叠 + 子折叠，左侧分析控制 + 右侧输出/预览）
     fn ui_special(&mut self, ui: &mut egui::Ui, idx: usize) {
-        egui::ScrollArea::vertical()
+        egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 // 总折叠：整页可折叠，标题「Spark 性能分析」
@@ -7710,7 +6870,7 @@ impl App {
                 }
                 let files = self.runtimes[idx].spark_files.clone();
                 if !files.is_empty() {
-                    egui::ScrollArea::vertical()
+                    egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                         .id_salt(("spark_files_scroll", idx))
                         .max_height(260.0)
                         .auto_shrink([false, false])
@@ -8000,7 +7160,7 @@ impl App {
     }
 
     fn ui_overview(&mut self, ui: &mut egui::Ui, idx: usize) {
-        egui::ScrollArea::vertical()
+        egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
             .auto_shrink([false, false])
             .show(ui, |ui| {
         let sc = self.cfg.servers[idx].clone();
@@ -8038,32 +7198,6 @@ impl App {
         });
         if sc.dir.exists() {
             ui.label(RichText::new("📁 目录存在").color(self.fg(Color32::from_rgb(80, 200, 120))));
-            // 功能优化：显示识别到的服务端平台（加载器 / MC 版本 / 判据），
-            // 用于确认"这个服到底是什么端"，也直接决定下载页能装什么。
-            let pinfo = serverinfo::detect(&sc.dir);
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("🧩 服务端平台:").strong());
-                let color = if pinfo.kind.is_modded() {
-                    self.fg(Color32::from_rgb(120, 200, 255))
-                } else if pinfo.kind == serverinfo::PlatformKind::Vanilla {
-                    Color32::from_rgb(240, 176, 96)
-                } else {
-                    self.fg(Color32::from_rgb(160, 220, 180))
-                };
-                ui.label(RichText::new(pinfo.summary()).color(color));
-                if let Some(lv) = &pinfo.loader_version {
-                    ui.label(RichText::new(format!("加载器版本 {lv}")).weak().small());
-                }
-                ui.label(
-                    RichText::new(format!("模组 {} · 插件 {}", pinfo.mod_count, pinfo.plugin_count))
-                        .weak()
-                        .small(),
-                );
-                if !pinfo.evidence.is_empty() {
-                    ui.label(RichText::new("（悬停查看识别依据）").weak().small())
-                        .on_hover_text(pinfo.evidence.join("\n"));
-                }
-            });
         } else {
             ui.label(RichText::new("📁 目录不存在").color(Color32::RED));
         }
@@ -8235,7 +7369,7 @@ impl App {
         let jvm_args = dir.join("user_jvm_args.txt");
 
         // 整页滚动：内容超出一屏时保证下方保存按钮可见可点
-        egui::ScrollArea::vertical()
+        egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
             .auto_shrink([false, false])
             .show(ui, |ui| {
         ui.add_space(6.0);
@@ -8300,7 +7434,7 @@ impl App {
                 self.runtimes[idx].server_props_advanced = adv;
                 let mut save_props = false;
                 // 编辑区（高度由下方分隔条拖动调整，展开互不冲突，允许拉倒最大）
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .id_salt("server_props_edit")
                     .max_height(self.server_props_h)
                     .auto_shrink([false, true])
@@ -8349,7 +7483,7 @@ impl App {
             .show(ui, |ui| {
                 let mut bat_content = self.runtimes[idx].run_bat_edit.clone().unwrap_or_default();
                 // 预览区（高度由下方分隔条拖动调整，允许拉倒最大显示全部脚本）
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .id_salt("run_bat_preview")
                     .max_height(self.run_bat_h)
                     .auto_shrink([false, true])
@@ -9037,7 +8171,7 @@ impl App {
         };
         ui.label(RichText::new(st).weak().small());
         ui.separator();
-        egui::ScrollArea::vertical()
+        egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
             .id_salt(("players_scroll", idx))
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -9046,39 +8180,8 @@ impl App {
                     PlayerTab::Whitelist => self.ui_players_wl(ui, idx),
                     PlayerTab::Banned => self.ui_players_banned(ui, idx),
                     PlayerTab::Ops => self.ui_players_ops(ui, idx),
-                    // 玩家属性功能暂时禁用（用户要求）：入口保留但只显示说明，
-                    // 不再渲染任何可操作控件（原实现 ui_players_props 仍保留在代码里备用）。
-                    PlayerTab::Props => self.ui_players_props_disabled(ui, idx),
+                    PlayerTab::Props => self.ui_players_props(ui, idx),
                 }
-            });
-    }
-
-    /// 玩家属性（阶段C）——**暂时禁用**（用户要求）。
-    ///
-    /// 保留标签页入口与说明，但不渲染任何控件，避免误导用户以为可用。
-    /// 恢复时把下面的提示替换回原实现即可（原实现见 git 历史 / 备份分支）。
-    fn ui_players_props_disabled(&mut self, ui: &mut egui::Ui, idx: usize) {
-        let _ = idx;
-        ui.add_space(8.0);
-        egui::Frame::none()
-            .fill(self.theme_cur.widget_bg)
-            .stroke(egui::Stroke::new(1.0, self.theme_cur.stroke))
-            .rounding(6.0)
-            .inner_margin(egui::Margin::symmetric(12.0, 10.0))
-            .show(ui, |ui| {
-                ui.label(
-                    RichText::new("玩家属性功能暂时禁用")
-                        .strong()
-                        .color(self.theme_cur.text),
-                );
-                ui.label(
-                    RichText::new(
-                        "该功能通过服务器控制台下发 gamemode / op 指令，目前存在稳定性问题，已临时下线。\n\
-                         可以改用「在线玩家」页查看列表，或在「OP」页管理 OP 权限。",
-                    )
-                    .weak()
-                    .small(),
-                );
             });
     }
 
@@ -9356,60 +8459,14 @@ impl App {
                 }
             }
             if self.runtimes[idx].file_tab == "mods" {
-                // 功能优化：进入模组页即识别该服务端平台 ——
-                // 原版/纯插件端不支持模组，直接把「下载模组」按钮置灰并说明原因；
-                // 模组端则把识别到的加载器/版本记下来，点下载时自动套用。
-                let pinfo = serverinfo::detect(&self.cfg.servers[idx].dir);
-                let can_mod = pinfo.kind.is_modded();
-                let btn = ui.add_enabled(
-                    can_mod,
-                    egui::Button::new("⬇️ 下载模组").min_size(egui::vec2(96.0, 24.0)),
-                );
-                let btn = if can_mod {
-                    btn.on_hover_text(format!(
-                        "将按 {} 自动选择加载器与 MC 版本",
-                        pinfo.summary()
-                    ))
-                } else {
-                    btn.on_disabled_hover_text(format!(
-                        "当前服务端识别为「{}」，不支持模组（原版/纯插件端）。\n如需模组请改装 Fabric/Forge/NeoForge 服务端。",
-                        pinfo.kind.label()
-                    ))
-                };
-                if btn.clicked() {
+                if ui.button("⬇️ 下载模组").clicked() {
                     if let Some(dl) = self.dl.as_mut() {
                         dl.mod_project_type = "mod".to_string();
                         dl.mod_target_use_server = true;
                         dl.mod_target_dir = self.cfg.servers[idx].dir.display().to_string();
-                        if let Some(loader) = pinfo.kind.modrinth_loader() {
-                            dl.mod_loader = loader.to_string();
-                        }
-                        if let Some(v) = &pinfo.mc_version {
-                            dl.mod_mc_version = v.clone();
-                        }
                         self.nav = Nav::Download;
                     } else {
                         self.set_toast("下载功能未启用".to_string());
-                    }
-                }
-                match pinfo.kind.modrinth_loader() {
-                    Some(l) => {
-                        ui.label(
-                            RichText::new(format!(
-                                "已识别：{}（加载器 {l}，版本 {}）",
-                                pinfo.summary(),
-                                pinfo.mc_version.clone().unwrap_or_else(|| "未识别".into())
-                            ))
-                            .small()
-                            .color(self.fg(Color32::from_rgb(120, 200, 255))),
-                        );
-                    }
-                    None => {
-                        ui.label(
-                            RichText::new(format!("已识别：{}", pinfo.kind.label()))
-                                .small()
-                                .color(Color32::from_rgb(240, 176, 96)),
-                        );
                     }
                 }
                 if ui
@@ -9473,7 +8530,7 @@ impl App {
                 egui::vec2(left_w, avail_h),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
-                    egui::ScrollArea::vertical()
+                    egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                         .id_salt(("file_list_scroll", idx))
                         .auto_shrink([false, false])
                         .max_height(avail_h)
@@ -9850,7 +8907,7 @@ impl App {
                         if lines.len() > 40 {
                             lines.truncate(40);
                         }
-                        egui::ScrollArea::vertical()
+                        egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                             .id_salt(("file_preview_scroll", idx))
                             .auto_shrink([false, false])
                             .max_height(320.0)
@@ -9882,13 +8939,12 @@ impl App {
                 .collapsible(false)
                 .default_size([720.0, 480.0])
                 .show(ui.ctx(), |ui| {
-                    let is_light = self.theme_is_light();
-                    let fg = |c: egui::Color32| if is_light { theme::light_adapt(c) } else { c };
+                    let fg = |c: egui::Color32| if self.cfg.theme_mode == "light" { theme::light_adapt(c) } else { c };
                     let Some((path, content)) = self.runtimes[idx].file_content_edit.as_mut() else {
                         return;
                     };
                     ui.label(RichText::new(path.clone()).color(fg(Color32::from_rgb(120, 180, 255))));
-                    egui::ScrollArea::vertical()
+                    egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                         .id_salt(("file_edit_scroll", idx))
                         .auto_shrink([false, false])
                         .max_height(420.0)
@@ -10093,7 +9149,7 @@ impl App {
     fn ui_backup(&mut self, ui: &mut egui::Ui, idx: usize) {
         let sc = self.cfg.servers[idx].clone();
         // 整页滚动：自动功能选项较多，页面内容超出一屏时可滚动
-        egui::ScrollArea::vertical()
+        egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
             .auto_shrink([false, false])
             .show(ui, |ui| {
         ui.add_space(6.0);
@@ -10329,7 +9385,7 @@ impl App {
                     None => groups.push((key, vec![b])),
                 }
             }
-            egui::ScrollArea::vertical().auto_shrink([false, false]).max_height(320.0).show(ui, |ui| {
+            egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible).auto_shrink([false, false]).max_height(320.0).show(ui, |ui| {
                 for (key, items) in groups {
                     egui::CollapsingHeader::new(
                         RichText::new(format!("{key}（{} 个备份）", items.len())).strong(),
@@ -10371,9 +9427,8 @@ impl App {
         egui::SidePanel::left("tunnel_side")
             .resizable(true)
             .default_width(170.0)
-            .frame(egui::Frame::side_top_panel(&ctx.style()).fill(ctx.style().visuals.window_fill))
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.add_space(4.0);
@@ -10396,11 +9451,11 @@ impl App {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            // 第二批：max-width 1100 左对齐（内网穿透内容区，ScrollArea 移入容器内）
+            // 第二批：max-width 1100 水平居中（内网穿透内容区，ScrollArea 移入容器内）
             let _avail = ui.available_rect_before_wrap();
             let _w = _avail.width().min(1100.0);
             let _centered = egui::Rect::from_min_size(
-                egui::pos2(_avail.left(), _avail.top()),
+                egui::pos2(_avail.center().x - _w * 0.5, _avail.top()),
                 egui::vec2(_w, _avail.height()),
             );
             let mut _inner = ui.new_child(
@@ -10411,7 +9466,7 @@ impl App {
             );
             _inner.set_width(_w);
             let ui = &mut _inner;
-            egui::ScrollArea::vertical()
+            egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                 .id_salt("tunnel_content_scroll")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -10586,7 +9641,7 @@ impl App {
             }
         }
         if !self.frp_log.is_empty() {
-            egui::ScrollArea::vertical()
+            egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                 .id_salt("frp_log_dash")
                 .max_height(140.0)
                 .auto_shrink([false, false])
@@ -10615,7 +9670,7 @@ impl App {
             ui.horizontal(|ui| {
                 // 左：在线隧道列表（单击选中预览，双击跳转隧道管理并高亮）
                 ui.vertical(|ui| {
-                    egui::ScrollArea::vertical()
+                    egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                         .id_salt("dash_tunnel_list")
                         .max_height(300.0)
                         .auto_shrink([false, true])
@@ -11378,7 +10433,7 @@ impl App {
                     ui.label(RichText::new("（暂无日志，若长时间无输出请检查 frpc 配置与网络连接）").weak());
                     return;
                 }
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .id_salt(("tunnel_log_view", i))
                     .max_height(220.0)
                     .auto_shrink([false, false])
@@ -11459,8 +10514,7 @@ impl App {
             }
             self.tunnel_edit_draft = Some(draft);
         }
-        let is_light = self.theme_is_light();
-                    let fg = |c: egui::Color32| if is_light { theme::light_adapt(c) } else { c };
+        let fg = |c: egui::Color32| if self.cfg.theme_mode == "light" { theme::light_adapt(c) } else { c };
         let t = self.tunnel_edit_draft.as_mut().unwrap();
         egui::Window::new(format!("隧道配置（{}）", t.name))
             .collapsible(false)
@@ -11720,43 +10774,11 @@ impl App {
         sections[idx].anim = anim;
 
         let open = sections[idx].open;
-        // 头部：折叠箭头（随 anim 旋转/切换）+ 标题。
-        // 说明：之前两个分支写的是同一个字形（"▶" / "▶"），箭头永远不变 —— 用户感觉
-        // "折叠没有反馈、不如隧道管理那种丝滑"。现在箭头随动画在 ▼/▶ 间切换，
-        // 并给整行加悬停底色，与隧道管理页的行反馈一致。
-        let header_rect = ui.available_rect_before_wrap();
-        let resp = ui.interact(
-            egui::Rect::from_min_size(
-                header_rect.min,
-                egui::vec2(header_rect.width(), 22.0),
-            ),
-            ui.id().with(("sec_head", id)),
-            egui::Sense::click(),
-        );
-        let hover_t = ui.ctx().animate_bool_with_time(
-            ui.id().with(("sec_hover", id)),
-            resp.hovered(),
-            0.12,
-        );
-        if hover_t > 0.01 {
-            ui.painter().rect_filled(
-                resp.rect.expand2(egui::vec2(4.0, 2.0)),
-                5.0,
-                {
-                    let acc = ui.visuals().selection.bg_fill;
-                    Color32::from_rgba_unmultiplied(
-                        acc.r(),
-                        acc.g(),
-                        acc.b(),
-                        (20.0 * hover_t) as u8,
-                    )
-                },
-            );
-        }
+        // 头部：折叠箭�?+ 标题
         ui.horizontal(|ui| {
-            let arrow = if anim > 0.5 { "▼" } else { "▶" };
+            let arrow = if anim > 0.5 { "▶" } else { "▶" };
             let arrow_resp = ui.selectable_label(false, arrow);
-            if arrow_resp.clicked() || resp.clicked() {
+            if arrow_resp.clicked() {
                 sections[idx].open = !open;
             }
             ui.label(RichText::new(title).strong());
@@ -11765,26 +10787,21 @@ impl App {
             ui.label(RichText::new(h).weak());
         }
         if anim <= 0.02 {
-            ui.add_space(24.0);
             ui.separator();
             return sections;
         }
         let last_h = sections[idx].last_h.max(8.0);
         let max_h = anim * last_h;
         let mut content_h = 0.0_f32;
-        // 动画期间隐藏滚动条：ScrollArea 的高度在逐帧变化，滚动条会跟着闪/抖，
-        // 观感上就不如隧道管理页顺滑（那里没有滚动条参与布局）。
-        egui::ScrollArea::vertical()
+        egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
             .id_salt(("setting_section", id))
             .max_height(max_h)
-            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 add(ui);
                 content_h = ui.min_rect().height();
             });
         sections[idx].last_h = content_h;
-        ui.add_space(24.0);
         ui.separator();
         sections
     }
@@ -11794,12 +10811,14 @@ impl App {
     /// Recompute the target palette from config, advance the interpolation and
     /// apply style + background image to the context. Called every visible frame.
     fn tick_theme(&mut self, ctx: &egui::Context) {
-        // 主题模式：日间 / 夜间 / 自定义配色（第三独立模式）。自定义模式按背景 RGB
-        // 自动反算文字黑白深浅（见 theme::target_colors 的 luma 分支）。
-        let mode_ref: &str = &self.cfg.theme_mode;
+        // 跟随系统深浅色：每 3 秒轮询一次 Windows 注册表（读失败保持当前值）。
+        if self.cfg.theme_follow_system && self.last_sys_theme_check.elapsed().as_secs() >= 3 {
+            self.last_sys_theme_check = std::time::Instant::now();
+            self.sync_system_theme_now();
+        }
         self.theme_target = theme::target_colors(
-            mode_ref,
-            self.cfg.theme_mode == "custom",
+            &self.cfg.theme_mode,
+            self.cfg.custom_colors,
             self.cfg.custom_accent,
             self.cfg.custom_bg,
             self.cfg.custom_highlight,
@@ -11816,65 +10835,14 @@ impl App {
             self.theme_cur = self.theme_target;
         }
         let bg_enabled = !self.cfg.bg_image.is_empty() && self.bg_tex.is_some();
-        // 背景材质模式：把「桌面捕获底图 + 着色」合成后的**实际可见颜色**交给主题层，
-        // 由它自动挑选深/浅前景色 —— 否则在明亮桌面上会出现「浅字 + 亮底」= UI 看不清。
-        // 材质浓度：默认跟滑杆走；关闭「配色跟随材质」时抬到 0.60 下限，
-        // 保证固定深色主题在明亮桌面上依然可读（否则浅字 + 亮底 = 看不清）。
-        let t = self.effective_bg_opacity();
-        // ★ 防御：材质模式要求「底图纹理必须存在」。
-        // 材质模式下内容面板填充 alpha = 0（靠纹理透出桌面），一旦纹理不存在（刚从托盘恢复、
-        // 纹理被丢弃、首帧抓取还没完成），整窗就只剩 clear 色 = **黑屏窗口**。
-        // 这里在纹理缺失时把 material 置空 → 主题回落到常规不透明面板，绝不黑屏；
-        // 首帧抓取完成后材质自然出现。
-        let has_backdrop_tex = self.backdrop.texture().is_some();
-        let material = if self.plugin_bg_style != plugins::BgStyle::Default
-            && self.cfg.bg_capture_exclusion
-            && has_backdrop_tex
-        {
-            let (mean, _, captures, _, _, _) = self.backdrop.stats();
-            if captures > 0 {
-                let bg = self.theme_cur.bg;
-                let mix = |b: u8, m: u8| {
-                    (b as f32 * t + m as f32 * (1.0 - t)).round().clamp(0.0, 255.0) as u8
-                };
-                // 内容区实际可见色 = 衬底（主题底色 × scrim）叠在材质之上；
-                // 前景对比度必须按这个「最终可见色」来定，否则会选错深浅。
-                let scrim = self.cfg.bg_content_scrim.clamp(0.0, 0.6);
-                let mix2 = |b: u8, m: u8| {
-                    (b as f32 * scrim + m as f32 * (1.0 - scrim))
-                        .round()
-                        .clamp(0.0, 255.0) as u8
-                };
-                Some(egui::Color32::from_rgb(
-                    mix2(bg.r(), mix(bg.r(), mean.0)),
-                    mix2(bg.g(), mix(bg.g(), mean.1)),
-                    mix2(bg.b(), mix(bg.b(), mean.2)),
-                ))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let win_r = theme::apply(
+        theme::apply(
             ctx,
             &self.theme_cur,
             self.cfg.round_corners,
-            self.cfg.window_round_corners,
             self.cfg.corner_scale,
-            self.cfg.window_corner_scale,
             self.cfg.bg_alpha,
             bg_enabled,
-            self.plugin_bg_style,
-            t,
-            material,
-            self.cfg.bg_material_auto_contrast,
-            self.cfg.bg_content_scrim,
         );
-        // 整窗圆角走系统区域（SetWindowRgn）：无边框不透明窗口唯一可靠的圆角方案，
-        // 圆角轮廓由系统裁剪（含背景图/面板/内容），不是画在界面上的遮罩。
-        self.win_r_points = win_r;
-        self.apply_window_round_region(ctx, win_r);
         // 界面字号：以启动时系统 DPI 为基线，按 scaled_font(1.0, ui_font_scale) 缩放
         // （统一辅助函数，11.0..=20.0 钳制与字号比例定义集中在 theme::scaled_font）。
         let want_ppp = self.base_ppp * theme::scaled_font(1.0, self.cfg.ui_font_scale);
@@ -11891,283 +10859,23 @@ impl App {
         }
     }
 
-    /// Apply the window outer-corner radius via a Win32 system region.
-    /// A rounded region (CreateRoundRectRgn + SetWindowRgn) makes the whole frameless
-    /// window render with a rounded silhouette on Windows 10+: content, panels and the
-    /// wallpaper are all clipped by the system. Redundant calls are skipped using the
-    /// (r_px, w, h) cache. r=0 resets the region (sharp corners).
-    fn apply_window_round_region(&mut self, ctx: &egui::Context, r_points: f32) {
-        use winapi::shared::windef::RECT;
-        use winapi::um::wingdi::CreateRoundRectRgn;
-        use winapi::um::winuser::{GetWindowRect, SetWindowRgn};
-        let hwnd = resolve_main_hwnd(&mut self.hwnd_cache);
-        unsafe {
-            if hwnd.is_null() {
-                return;
+    /// 跟随系统深浅色：读取 Windows 注册表 AppsUseLightTheme 同步 theme_mode。
+    /// 读不到 / 失败时保持当前值。调用方应节流（tick_theme 每 3 秒一次）。
+    fn sync_system_theme_now(&mut self) {
+        if let Some(light) = system_light_theme() {
+            let mode = if light { "light" } else { "dark" };
+            if self.cfg.theme_mode != mode {
+                self.cfg.theme_mode = mode.to_string();
+                self.save_config();
             }
-            let mut rc: RECT = std::mem::zeroed();
-            if GetWindowRect(hwnd, &mut rc) == 0 {
-                return;
-            }
-            let w = rc.right - rc.left;
-            let h = rc.bottom - rc.top;
-            // 供桌面捕获使用（物理像素矩形）
-            self.win_rect_px = (rc.left, rc.top, w, h);
-            let r_px = (r_points * ctx.pixels_per_point()).round() as i32;
-            // F1：窗口位置/大小记忆 —— 几何变化后延迟 ~800ms 落盘（避免拖动过程中每帧写配置）。
-            //
-            // 两个坑（实测都被用户撞到）：
-            // ① `GetWindowRect` 是**外框**矩形（含不可见缩放边框），把它当 inner_size 还原来
-            //    每次重启都会变大一圈；且窗口最大化时外框 = 整个屏幕 → 下次启动开出「巨大窗口」。
-            //    因此尺寸一律取 egui 的**客户区逻辑尺寸**（`screen_rect`，即 inner_size 语义），
-            //    位置仍用外框左上角（winit 的 with_position 就是外框位置）。
-            // ② 最大化状态不记尺寸（否则会把屏幕大小当窗口大小存下来）。
-            let ppp = ctx.pixels_per_point().max(0.1);
-            // 最大化判定：状态位 + 矩形比对显示器工作区（见 window_is_maximized_now 注释）
-            let maximized = ctx.input(|i| i.viewport().maximized == Some(true))
-                || window_is_maximized_now(hwnd, (rc.left, rc.top, w, h));
-            // 拖动/缩放进行中（本帧几何与上一帧不同）不落盘，等稳定 800ms 后再写
-            let cur = (rc.left, rc.top, w, h);
-            if self.win_saved_rect != cur {
-                if self.win_save_at.is_none() {
-                    self.win_save_at = Some(std::time::Instant::now());
-                } else if self
-                    .win_save_at
-                    .map(|t| t.elapsed().as_millis() > 800)
-                    .unwrap_or(false)
-                {
-                    self.win_saved_rect = cur;
-                    self.win_save_at = None;
-                    // 最大化时既不能把屏幕尺寸当窗口尺寸，也不能把最大化位置当普通位置
-                    if !maximized {
-                        self.cfg.window_pos =
-                            [(rc.left as f32 / ppp).round(), (rc.top as f32 / ppp).round()];
-                        let sz = ctx.screen_rect().size();
-                        if sz.x >= 400.0 && sz.y >= 300.0 {
-                            self.cfg.window_size = [sz.x.round(), sz.y.round()];
-                        }
-                        self.save_config();
-                    }
-                }
-            } else {
-                self.win_save_at = None;
-            }
-            if self.last_win_rgn == (r_px, w, h) {
-                return;
-            }
-            self.last_win_rgn = (r_px, w, h);
-            let rgn = if r_px >= 1 {
-                CreateRoundRectRgn(0, 0, w + 1, h + 1, r_px * 2, r_px * 2)
-            } else {
-                std::ptr::null_mut()
-            };
-            // SetWindowRgn takes ownership of rgn on success; on failure we simply
-            // drop it (negligible, and this path is practically unreachable).
-            SetWindowRgn(hwnd, rgn, 1);
         }
     }
 
-    /// 确保亚克力噪点纹理已创建（96×96、重复寻址、无 mipmap 的随机灰点）。
-    /// 亚克力 = 模糊 + 噪点；本机 DWM accent 不可用，噪点由材质层自己画。
-    fn ensure_noise_tex(&mut self, ctx: &egui::Context) {
-        if self.noise_tex.is_some() {
-            return;
-        }
-        const N: usize = 96;
-        let mut px = Vec::with_capacity(N * N);
-        // 简单 LCG：不需要密码学随机，只要稳定且分布均匀
-        let mut seed: u32 = 0x9E37_79B9;
-        for _ in 0..(N * N) {
-            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            let v = ((seed >> 24) & 0xFF) as u8;
-            px.push(egui::Color32::from_rgba_unmultiplied(v, v, v, 255));
-        }
-        let img = egui::ColorImage {
-            size: [N, N],
-            pixels: px,
-        };
-        let opts = egui::TextureOptions {
-            magnification: egui::TextureFilter::Nearest,
-            minification: egui::TextureFilter::Nearest,
-            wrap_mode: egui::TextureWrapMode::Repeat,
-            mipmap_mode: None,
-        };
-        self.noise_tex = Some(ctx.load_texture("xmst_material_noise", img, opts));
-    }
-
-    /// Paint the window background on the background layer (behind all panels):
-    /// 1) 桌面捕获底图（非默认背景模式）—— 本机唯一可用的半透明/毛玻璃实现；
-    /// 2) 用户壁纸（若配置）叠在其上，保持原「cover」铺满行为。
+    /// Paint the background image on the background layer (behind all panels).
+    /// Cover-style fit: the image always fills the whole central content area.
     fn paint_bg(&mut self, ctx: &egui::Context) {
-        let rect = ctx.screen_rect();
-        let layer = egui::LayerId::background();
-
-        // ---- 1) 桌面捕获底图 ----
-        // D11：「抓屏排除」可关闭。关闭时不抓桌面（否则会把本窗口自己抓进底图，形成
-        // 自我递归的反馈画面）；此时效果回落到「面板半透明 + DWM 窗口合成」路径
-        // —— 在能合成窗口 alpha 的机器上依然有效。
-        let capture_on =
-            self.plugin_bg_style != plugins::BgStyle::Default && self.cfg.bg_capture_exclusion;
-        let hwnd = resolve_main_hwnd(&mut self.hwnd_cache);
-        if capture_on {
-            // 三种模式的观感差异：半透明＝几乎原图轻微模糊；毛玻璃＝高斯模糊；
-            // 亚克力＝更强模糊 + 噪点（Windows 亚克力本就是「模糊 + 噪点」两层，
-            // 本机 DWM accent 不可用，所以在材质阶段把这一层差异画出来）。
-            // blur_px 是在缩小后小图上的盒式模糊半径（点采样 StretchBlt 很快，
-            // 质量由这一步补回来）。
-            // ★ 「半透明」= 把桌面**原样**透出来、只叠一层底色，所以 ds=1（原生分辨率 /
-            //   完全不缩小）且不模糊 —— 这是唯一真正"清晰"的做法。抓屏 60~100ms 全部发生在
-            //   工作线程上（见 backdrop.rs），不再卡 UI。
-            //   毛玻璃/亚克力才有意缩小 + 盒式模糊；拖动/缩放期间完全冻结（见下方
-            //   「拖动/缩放期间的底图策略」），停止后立刻用精细档位补一张。
-            let (ds, blur_px, noise): (i32, i32, bool) = match self.plugin_bg_style {
-                plugins::BgStyle::Translucent => (1, 0, false),
-                plugins::BgStyle::Frosted => (4, 3, false),
-                plugins::BgStyle::Acrylic => (8, 4, true),
-                plugins::BgStyle::Default => (4, 3, false),
-            };
-            // 纹理像素上限：ds=1 在 2560×1440 这类窗口下是 3.7M 像素 / 14MB，上传会给
-            // UI 线程造成周期性长帧（"时不时闪一下"的来源之一）。按面积把倍率抬到
-            // 不超过 4M 像素；清晰度的主要收益来自 ds=4/8 → ds=1/2 这一段。
-            const MAX_TEX_PX: f32 = 4_000_000.0;
-            let px_area = (self.win_rect_px.2 as f32) * (self.win_rect_px.3 as f32);
-            let ds_cap = (px_area / MAX_TEX_PX).sqrt().ceil().max(1.0) as i32;
-            let ds = ds.max(ds_cap);
-            if !hwnd.is_null() {
-                self.backdrop.ensure_exclusion(hwnd as isize, true);
-            }
-            // ★ 拖动/缩放期间的底图策略（消除闪烁 + 保持跟手）：
-            //   上一版拖动中每 ~200ms 重抓一次且切粗档（ds×6）——每次抓屏完成都会上传
-            //   一张「清晰度跳变 + 内容滞后于窗口」的新纹理 → 视觉上表现为闪。
-            //   改为：拖动/缩放期间**完全冻结**（零抓屏、零上传、无清晰度跳变），
-            //   仅用 **UV 偏移**把上一张底图按窗口位移平移（零成本、视觉连续跟手）；
-            //   停止后立刻补抓一帧精细档（抓取矩形 == 当前矩形，与偏移后旧图内容对齐，无缝衔接）。
-            let rect_now = self.win_rect_px;
-            let moving = self.bg_prev_rect != rect_now;
-            self.bg_prev_rect = rect_now;
-            let now = std::time::Instant::now();
-            if moving {
-                self.bg_last_move_at = Some(now);
-                // 刚结束拖动后的那一帧要立刻补抓（下面 needs_refresh 用）
-                self.bg_needs_refresh = true;
-            }
-            let settling = self
-                .bg_last_move_at
-                .map(|t| now.duration_since(t) < std::time::Duration::from_millis(160))
-                .unwrap_or(false);
-            // 保险丝：无论判据为何，冻结都不允许超过 2 秒
-            let frozen_too_long = self
-                .bg_last_move_at
-                .map(|t| now.duration_since(t) > std::time::Duration::from_secs(2))
-                .unwrap_or(false);
-            // 拖动/缩放中：完全冻结（min_interval 拉长到 1 小时）；停止 160ms 沉降后
-            // 立即用精细档位补抓。拖动期间旧纹理靠 UV 偏移跟随，画面不跳、不闪。
-            let min_interval = if moving || settling {
-                std::time::Duration::from_secs(3600)
-            } else if self.bg_needs_refresh || frozen_too_long {
-                std::time::Duration::ZERO
-            } else {
-                std::time::Duration::from_millis(self.bg_cap_interval_ms as u64)
-            };
-            let updated = self
-                .backdrop
-                .update(ctx, rect_now, ds, blur_px, min_interval);
-            if updated {
-                self.bg_needs_refresh = false;
-                // 自适应刷新节奏：清晰档（ds=2）单次抓屏可达 ~30ms，固定 120ms 会让静止时
-                // 也有约 1/4 的帧被占用。规则：桌面内容在变（均值跳动）→ 120ms 跟住；
-                // 内容基本不变 → 逐步放宽到 600ms，省下绝大部分抓屏开销。
-                let mean = self.backdrop.stats().0;
-                let d = (mean.0 as i32 - self.bg_prev_mean.0 as i32).abs()
-                    + (mean.1 as i32 - self.bg_prev_mean.1 as i32).abs()
-                    + (mean.2 as i32 - self.bg_prev_mean.2 as i32).abs();
-                if d > 6 {
-                    self.bg_cap_interval_ms = 120.0;
-                } else {
-                    self.bg_cap_interval_ms = (self.bg_cap_interval_ms * 1.7).min(600.0);
-                }
-                self.bg_prev_mean = mean;
-            }
-            // 材质 UV 偏移：把上次抓取到的桌面图按「窗口相对上次抓取位置的位移」平移，
-            // 这样拖动/缩放期间即使完全不抓屏，材质也一直跟着桌面走（零成本、不闪）。
-            // 窗口尺寸变化时 UV 域仍按 (0,0)-(1,1) 铺满（拉伸近似，停止后立刻补抓对齐）。
-            let (cap_x, cap_y, _cap_w, _cap_h) = self.backdrop.last_rect();
-            let (tw, th) = self.backdrop.stats().3;
-            let uv_shift = if tw > 0 && th > 0 {
-                let dsp = self.backdrop.last_downscale() as f32;
-                (
-                    (rect_now.0 - cap_x) as f32 / dsp / tw as f32,
-                    (rect_now.1 - cap_y) as f32 / dsp / th as f32,
-                )
-            } else {
-                (0.0, 0.0)
-            };
-            // 诊断：首次抓到 + 之后每 ~40s 记一条，便于用户回传 bg_debug.log 定位
-            if updated {
-                let n = self.backdrop.stats().2;
-                // 前几次都记录（看冷启动/稳态差异），之后每 ~2.4s 记一条
-                // （n%20：用于验证「几何变化后底图仍在持续刷新」——冻结 bug 会让它停住）
-                if n <= 3 || n % 20 == 0 {
-                    let style = self.plugin_bg_style;
-                    self.bg_debug_log(style, style, self.effective_bg_opacity(), false, hwnd);
-                }
-            }
-            if let Some(tex) = self.backdrop.texture() {
-                let uv = egui::Rect::from_min_max(
-                    egui::pos2(uv_shift.0, uv_shift.1),
-                    egui::pos2(1.0 + uv_shift.0, 1.0 + uv_shift.1),
-                );
-                let mut mesh = egui::Mesh::with_texture(tex.id());
-                mesh.add_rect_with_uv(
-                    rect,
-                    uv,
-                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 255),
-                );
-                let painter = ctx.layer_painter(layer);
-                painter.add(egui::Shape::mesh(mesh));
-                // 亚克力噪点层（平铺一张重复寻址的小噪点纹理）
-                if noise {
-                    self.ensure_noise_tex(ctx);
-                    if let Some(nt) = self.noise_tex.as_ref() {
-                        let reps = (rect.width() / 96.0).max(1.0);
-                        let reps_y = (rect.height() / 96.0).max(1.0);
-                        let nuv = egui::Rect::from_min_max(
-                            egui::pos2(0.0, 0.0),
-                            egui::pos2(reps, reps_y),
-                        );
-                        let mut nm = egui::Mesh::with_texture(nt.id());
-                        nm.add_rect_with_uv(
-                            rect,
-                            nuv,
-                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16),
-                        );
-                        painter.add(egui::Shape::mesh(nm));
-                    }
-                }
-                // 材质着色：主题底色按材质浓度盖在底图上 —— 这既是「玻璃的颜色」，
-                // 也是 theme::apply 用来算前景对比度的那个合成色（两者必须一致）。
-                let tint_alpha = (self.effective_bg_opacity() * 255.0).round() as u8;
-                if tint_alpha > 0 {
-                    let bg = self.theme_cur.bg;
-                    painter.rect_filled(
-                        rect,
-                        0.0,
-                        egui::Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), tint_alpha),
-                    );
-                }
-            }
-        } else {
-            // 默认背景、或用户关闭了抓屏排除：撤销「排除抓屏」，避免影响其截屏/共享
-            if !hwnd.is_null() {
-                self.backdrop.ensure_exclusion(hwnd as isize, false);
-            }
-        }
-
-        // ---- 2) 用户壁纸（材质模式下滑杆不透明度已决定观感，壁纸会让材质被盖住，故跳过） ----
-        if self.plugin_bg_style != plugins::BgStyle::Default {
-            return;
-        }
         let Some(tex) = self.bg_tex.as_ref() else { return };
+        let rect = ctx.screen_rect();
         let size = tex.size_vec2();
         if size.x <= 0.0 || size.y <= 0.0 {
             return;
@@ -12184,7 +10892,8 @@ impl App {
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
         let mut mesh = egui::Mesh::with_texture(tex.id());
         mesh.add_rect_with_uv(img_rect, uv, color);
-        ctx.layer_painter(layer).add(egui::Shape::mesh(mesh));
+        ctx.layer_painter(egui::LayerId::background())
+            .add(egui::Shape::mesh(mesh));
     }
 
     /// (Re)load the background image texture from cfg.bg_image on a worker thread.
@@ -12238,92 +10947,52 @@ impl App {
         {
             self.save_config();
         }
+        // 预设配色已移除：主题系统只保留日间/夜间两套，强调色统一 #22D3EE。
+        // theme_preset 字段保留仅为旧配置反序列化兼容，不再参与配色。
         if ui
-            .radio_value(
-                &mut self.cfg.theme_mode,
-                "custom".to_string(),
-                "自定义配色",
-            )
+            .checkbox(&mut self.cfg.theme_follow_system, "跟随系统深浅色")
+            .changed()
+        {
+            if self.cfg.theme_follow_system {
+                // 重新开启跟随：立即按系统主题同步一次。
+                self.sync_system_theme_now();
+            }
+            self.save_config();
+        }
+        ui.horizontal(|ui| {
+            ui.label("界面字号:");
+            if ui
+                .add(egui::Slider::new(&mut self.cfg.ui_font_scale, 11.0..=20.0).fixed_decimals(1))
+                .changed()
+            {
+                self.save_config();
+            }
+            ui.label(format!("{:.1} px", self.cfg.ui_font_scale));
+        });
+        if ui
+            .checkbox(&mut self.cfg.custom_colors, "自定义配色（覆盖强调色/背景色）")
             .changed()
         {
             self.save_config();
         }
-        // 自定义配色作为第三独立主题模式：RGB 即时预览（每帧 target_colors 生效）并自动保存；
-        // 文字颜色按背景 RGB 自动反算黑白深浅，保证清晰可读。
-        // 界面字号已移至自定义配色下方（见下方「界面字号」块）。
-        if self.cfg.theme_mode == "custom" {
+        if self.cfg.custom_colors {
             ui.horizontal(|ui| {
                 ui.label("强调色 RGB:");
-                if ui.add(egui::DragValue::new(&mut self.cfg.custom_accent.0).range(0..=255).speed(1.0)).changed()
-                    || ui.add(egui::DragValue::new(&mut self.cfg.custom_accent.1).range(0..=255).speed(1.0)).changed()
-                    || ui.add(egui::DragValue::new(&mut self.cfg.custom_accent.2).range(0..=255).speed(1.0)).changed()
-                {
-                    self.save_config();
-                }
+                ui.add(egui::DragValue::new(&mut self.cfg.custom_accent.0).range(0..=255).speed(1.0));
+                ui.add(egui::DragValue::new(&mut self.cfg.custom_accent.1).range(0..=255).speed(1.0));
+                ui.add(egui::DragValue::new(&mut self.cfg.custom_accent.2).range(0..=255).speed(1.0));
             });
             ui.horizontal(|ui| {
                 ui.label("背景色 RGB:");
-                if ui.add(egui::DragValue::new(&mut self.cfg.custom_bg.0).range(0..=255).speed(1.0)).changed()
-                    || ui.add(egui::DragValue::new(&mut self.cfg.custom_bg.1).range(0..=255).speed(1.0)).changed()
-                    || ui.add(egui::DragValue::new(&mut self.cfg.custom_bg.2).range(0..=255).speed(1.0)).changed()
-                {
-                    self.save_config();
-                }
+                ui.add(egui::DragValue::new(&mut self.cfg.custom_bg.0).range(0..=255).speed(1.0));
+                ui.add(egui::DragValue::new(&mut self.cfg.custom_bg.1).range(0..=255).speed(1.0));
+                ui.add(egui::DragValue::new(&mut self.cfg.custom_bg.2).range(0..=255).speed(1.0));
             });
-            ui.label(RichText::new("配色修改实时生效并自动保存。").weak());
+            if ui.button("保存配色").clicked() {
+                self.save_config();
+            }
+            ui.label(RichText::new("修改后点击「保存配色」生效，或切换任意主题选项即时生效。").weak());
         }
-        // 界面字号：位于自定义配色下方（已从主题模式与配色之间移至此）
-        ui.label("界面字号:");
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                // 拖动只改待应用值，点「应用」才真正生效并落盘（避免实时缩放）。
-                ui.add(
-                    egui::Slider::new(&mut self.pending_font_scale, 11.0..=20.0)
-                        .fixed_decimals(1)
-                        .show_value(true),
-                );
-                ui.horizontal(|ui| {
-                    if ui.button("应用").clicked() {
-                        self.cfg.ui_font_scale = self.pending_font_scale.clamp(11.0, 20.0);
-                        self.save_config();
-                    }
-                    if ui.button("重置").clicked() {
-                        self.pending_font_scale = 14.0;
-                        self.cfg.ui_font_scale = 14.0;
-                        self.save_config();
-                    }
-                    ui.label(
-                        RichText::new("预览按当前滑杆值实时绘制")
-                            .weak()
-                            .small(),
-                    );
-                });
-            });
-            // 实时字号预览：直接按滑杆比例绘制，方便判断多大字号合适。
-            // 预览区的字号 = 基准字号 × 滑杆/默认，与真实界面同一换算（theme::scaled_font）。
-            let k = self.pending_font_scale.clamp(11.0, 20.0) / 14.0;
-            egui::Frame::none()
-                .fill(self.theme_cur.widget_bg)
-                .stroke(egui::Stroke::new(1.0, self.theme_cur.stroke))
-                .rounding(6.0)
-                .inner_margin(egui::Margin::symmetric(10.0, 8.0))
-                .show(ui, |ui| {
-                    ui.set_min_width(320.0);
-                    let base = 14.0 * k;
-                    ui.label(RichText::new("正文示例").size(theme::scaled_font(base, 14.0)));
-                    ui.label(
-                        RichText::new("次要文字示例：已停止 / 端口 25565")
-                            .size(theme::scaled_font(base, 14.0))
-                            .weak(),
-                    );
-                    ui.label(
-                        RichText::new("小字示例：内存 1.2G / 2G · 在线 3 人")
-                            .size(theme::scaled_font(11.0 * k, 14.0))
-                            .weak(),
-                    );
-                    ui.label(RichText::new("标题示例 服务器列表").size(theme::scaled_font(20.0 * k, 14.0)).strong());
-                });
-        });
         ui.separator();
         ui.label(RichText::new("背景图").strong());
         ui.horizontal(|ui| {
@@ -12364,15 +11033,9 @@ impl App {
         {
             self.save_config();
         }
-        if ui
-            .checkbox(&mut self.cfg.window_round_corners, "启用窗口圆角")
-            .changed()
-        {
-            self.save_config();
-        }
         if self.cfg.round_corners {
             ui.horizontal(|ui| {
-                ui.label("控件圆角幅度:");
+                ui.label("圆角幅度:");
                 if ui
                     .add(egui::Slider::new(&mut self.cfg.corner_scale, 0.0..=3.0).fixed_decimals(1))
                     .changed()
@@ -12381,37 +11044,6 @@ impl App {
                 }
             });
         }
-        if self.cfg.window_round_corners {
-            ui.horizontal(|ui| {
-                ui.label("窗口圆角幅度:");
-                if ui
-                    .add(egui::Slider::new(&mut self.cfg.window_corner_scale, 0.0..=3.0).fixed_decimals(1))
-                    .changed()
-                {
-                    self.save_config();
-                }
-            });
-        }
-        // F1：窗口位置/大小记忆的重置入口。
-        // 记忆功能一旦把「巨大尺寸」写进配置，用户需要一条明确的退路
-        // （也方便切显示器/拔掉显示器后把窗口找回来）。
-        ui.horizontal(|ui| {
-            if ui.button("重置窗口位置与大小").clicked() {
-                self.cfg.window_pos = [0.0, 0.0];
-                self.cfg.window_size = [0.0, 0.0];
-                self.save_config();
-                self.win_saved_rect = (0, 0, 0, 0);
-                self.win_save_at = None;
-                ui.ctx()
-                    .send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1180.0, 760.0)));
-                self.set_toast("已重置为 1180×760；下次启动也用默认尺寸".to_string());
-            }
-            ui.label(
-                RichText::new("拖动窗口边缘即可缩放（无边框窗口用四边热区）")
-                    .weak()
-                    .small(),
-            );
-        });
     }
 
     /// Background image editor window (preview + alpha + clear). ESC exits.
@@ -12478,9 +11110,8 @@ impl App {
         egui::SidePanel::left("settings_side")
             .resizable(true)
             .default_width(150.0)
-            .frame(egui::Frame::side_top_panel(&ctx.style()).fill(ctx.style().visuals.window_fill))
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.add_space(4.0);
@@ -12507,11 +11138,11 @@ impl App {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            // 第二批：max-width 1100 左对齐（设置页内容区，ScrollArea 移入容器内）
+            // 第二批：max-width 1100 水平居中（设置页内容区，ScrollArea 移入容器内）
             let _avail = ui.available_rect_before_wrap();
             let _w = _avail.width().min(1100.0);
             let _centered = egui::Rect::from_min_size(
-                egui::pos2(_avail.left(), _avail.top()),
+                egui::pos2(_avail.center().x - _w * 0.5, _avail.top()),
                 egui::vec2(_w, _avail.height()),
             );
             let mut _inner = ui.new_child(
@@ -12522,12 +11153,13 @@ impl App {
             );
             _inner.set_width(_w);
             let ui = &mut _inner;
-            egui::ScrollArea::vertical()
+            egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                 .id_salt("settings_scroll")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    // 平滑动画统一由「切换动效」总开关控制（原先设置页另有一个开关，已合并）
-                    let use_anim = self.cfg.ui_animations;
+                    // 设置页折叠动画独立开关：设置页内默认禁用平滑动画（避免折叠卡顿），
+                    // 仅当「启用切换动效」且「设置页平滑动画」都打开时才启用
+                    let use_anim = self.cfg.ui_animations && self.cfg.ui_settings_anim;
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         ui.label("🔍");
@@ -12618,7 +11250,7 @@ impl App {
                                 if self.cfg.close_behavior == "tray" && self.tray.is_none() {
                                     ui.label(RichText::new("⚠️ 系统托盘初始化失败（可能被其他程序占用），暂不可用，请改用“最小化”").color(self.fg(Color32::from_rgb(230, 180, 90))));
                                 }
-                                ui.label(RichText::new("有服务器运行时：选择“彻底关闭”会先询问是否静默关闭所有服务器后再退出（可取消）；选择“最小化”则无论是否有服务器运行都仅最小化；“最小化到托盘”还会隐藏任务栏按钮，恢复方式：双击/单击托盘图标或托盘菜单“显示主窗口”").weak().small());
+                                ui.label(RichText::new("有服务器运行时：选择“彻底关闭”会先询问是否静默关闭所有服务器后再退出（可取消）；选择“最小化”则无论是否有服务器运行都仅最小化；“最小化到托盘”还会隐藏任务栏按钮，恢复方式：双击/单击托盘图标或托盘菜单“显示主窗口”").weak());
                             });
                             self.settings_sections = sections;
 
@@ -12637,7 +11269,7 @@ impl App {
                                         self.set_toast("写入注册表失败".to_string());
                                     }
                                 }
-                                ui.label(RichText::new("通过 HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run 实现；注册表项指向本程序并附带 --autostart 参数，登录后自动启动并显示主窗口").weak().small());
+                                ui.label(RichText::new("通过 HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run 实现；注册表项指向本程序并附带 --autostart 参数，登录后自动启动并显示主窗口").weak());
                             });
                             self.settings_sections = sections;
 
@@ -12674,20 +11306,9 @@ impl App {
                                             )),
                                         }
                                     }
-                                    // 高风险操作：红色边框卡片包裹「完全禁用 Defender」
-                                    let risk_red = self.fg(Color32::from_rgb(230, 120, 120));
-                                    egui::Frame::none()
-                                        .fill(Color32::from_rgba_unmultiplied(230, 120, 120, 12))
-                                        .stroke(egui::Stroke::new(1.2, risk_red))
-                                        .rounding(egui::Rounding::same(8.0))
-                                        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
-                                        .show(ui, |ui| {
-                                            ui.horizontal(|ui| {
-                                                if ui.button(RichText::new("⚠️ 完全禁用 Defender 实时保护（风险）").color(risk_red)).clicked() {
-                                                    self.confirm_defender_disable = true;
-                                                }
-                                            });
-                                        });
+                                    if ui.button("⚠️ 完全禁用 Defender 实时保护（风险）").clicked() {
+                                        self.confirm_defender_disable = true;
+                                    }
                                     if ui.button("打开 Windows 安全中心").clicked() {
                                         // explorer.exe 打开 URI �?cmd start windowsdefender: 更稳（修复弹错误框）
                                         let opened = std::process::Command::new("explorer.exe")
@@ -12711,128 +11332,72 @@ impl App {
                         SettingsSide::Logs => {
                             let sections = std::mem::take(&mut self.settings_sections);
                             let sections = Self::setting_section(ctx, ui, sections, "log", "日志", None, true, use_anim, self.cfg.anim_speed, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label("最大显示行数");
+                                    ui.add(egui::DragValue::new(&mut self.cfg.max_log_lines).range(100..=20000));
+                                });
+                                ui.separator();
+                                ui.label(RichText::new("SQLite 日志库（阶段C）").strong());
                                 let (db_count, db_rows) = match &self.logdb {
                                     Some(db) => (db.count(), db.recent(5, None)),
                                     None => (0, Vec::new()),
                                 };
-                                let card_fill = ui.visuals().extreme_bg_color;
-                                let card_stroke = egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(150, 160, 180, 45));
-                                // 等高卡片组：显示设置 + SQLite 日志库（用 horizontal_top 顶部对齐，
-                                // 避免等高拉伸把短卡片撑高）
-                                ui.horizontal_top(|ui| {
-                                    egui::Frame::none()
-                                        .fill(card_fill)
-                                        .stroke(card_stroke)
-                                        .rounding(egui::Rounding::same(8.0))
-                                        .inner_margin(egui::Margin::symmetric(12.0, 10.0))
-                                        .show(ui, |ui| {
-                                            // 紧凑化：不再 set_min_height(300)（卡片高度由内容决定），
-                                            // 只保证一个小的最小高度让两张卡片视觉一致。
-                                            ui.set_width(300.0);
-                                            ui.set_min_height(120.0);
-                                            ui.label(RichText::new("显示设置").strong());
-                                            ui.separator();
-                                            ui.label("最大显示行数");
-                                            ui.horizontal(|ui| {
-                                                ui.add(egui::DragValue::new(&mut self.cfg.max_log_lines).range(100..=20000));
-                                                ui.label("行");
-                                            });
-                                            ui.label(RichText::new("仅影响主界面日志显示条数，日志库仍按 50000 行轮转").weak().small());
-                                        });
-                                    egui::Frame::none()
-                                        .fill(card_fill)
-                                        .stroke(card_stroke)
-                                        .rounding(egui::Rounding::same(8.0))
-                                        .inner_margin(egui::Margin::symmetric(12.0, 10.0))
-                                        .show(ui, |ui| {
-                                            // 右卡自适应剩余宽度（不再写死 300px）；
-                                            // 内层滚动区已限高 150px，卡片高度稳定 —— 之前两侧都写死
-                                            // 300px 宽/高，日志内容会把卡片撑变形（"日志配置窗口大小异常"）。
-                                            let rest = (ui.available_width() - 12.0).clamp(320.0, 760.0);
-                                            ui.set_width(rest);
-                                            ui.set_min_height(120.0);
-                                            ui.label(RichText::new("SQLite 日志库").strong());
-                                            ui.separator();
-                                            ui.label(format!("已存 {db_count} 行（上限 50000，超限自动轮转）"));
-                                            ui.horizontal(|ui| {
-                                                if ui.button("🗑 清空日志库").clicked() {
-                                                    if let Some(dbm) = self.logdb.as_mut() {
-                                                        dbm.clear();
-                                                    }
-                                                    self.set_toast("已清空日志库".to_string());
-                                                }
-                                            });
-                                            ui.separator();
-                                            if let Some(db) = &self.logdb {
-                                                if db_rows.is_empty() {
-                                                    ui.label(RichText::new("（暂无日志记录，启动服务器或隧道后自动写入）").weak().small());
-                                                } else {
-                                                    ui.label(RichText::new("最近 5 条（来源标记：服务器名 / 隧道:名称）：").weak().small());
-                                                    egui::ScrollArea::vertical()
-                                                        .id_salt("settings_log_recent")
-                                                        .max_height(110.0)
-                                                        .auto_shrink([false, false])
-                                                        .show(ui, |ui| {
-                                                            for r in &db_rows {
-                                                                let line = if r.line.chars().count() > 80 {
-                                                                    let s: String = r.line.chars().take(80).collect();
-                                                                    format!("{s}…")
-                                                                } else {
-                                                                    r.line.clone()
-                                                                };
-                                                                ui.label(RichText::new(format!("[{}] {} | {}", r.ts, r.src, line)).monospace());
-                                                            }
-                                                        });
-                                                }
-                                            } else {
-                                                ui.label(RichText::new(format!("日志库不可用：{}", self.logdb_err)).weak());
-                                            }
-                                        });
-                                });
-                                ui.add_space(16.0);
-                                // 统计信息：三张小卡片横向排布
-                                let recent_ts = db_rows.first().map(|r| r.ts.clone()).unwrap_or_else(|| "暂无".to_string());
                                 ui.horizontal(|ui| {
-                                    for (t, v, c) in [
-                                        ("日志总条数", format!("{db_count}"), Color32::from_rgb(120, 200, 255)),
-                                        ("库上限（轮转）", "50000".to_string(), Color32::from_rgb(240, 200, 120)),
-                                        ("最近写入", recent_ts, Color32::from_rgb(120, 200, 160)),
-                                    ] {
-                                        egui::Frame::none()
-                                            .fill(card_fill)
-                                            .stroke(card_stroke)
-                                            .rounding(egui::Rounding::same(8.0))
-                                            .inner_margin(egui::Margin::symmetric(12.0, 8.0))
-                                            .show(ui, |ui| {
-                                                ui.set_min_width(140.0);
-                                                ui.label(RichText::new(t).weak().small());
-                                                ui.label(RichText::new(v).strong().color(c));
-                                            });
+                                    ui.label(format!("已存 {db_count} 行（上限 50000，超限自动轮转）"));
+                                    if ui.button("🗑 清空日志库").clicked() {
+                                        if let Some(dbm) = self.logdb.as_mut() {
+                                            dbm.clear();
+                                        }
+                                        self.set_toast("已清空日志库".to_string());
                                     }
                                 });
+                                if let Some(db) = &self.logdb {
+                                    if db_rows.is_empty() {
+                                        ui.label(RichText::new("（暂无日志记录，启动服务器或隧道后自动写入）").weak().small());
+                                    } else {
+                                        ui.label(RichText::new("最近 5 条（来源标记：服务器名 / 隧道:名称）：").weak().small());
+                                        for r in db_rows {
+                                            let line = if r.line.chars().count() > 100 {
+                                                let s: String = r.line.chars().take(100).collect();
+                                                format!("{s}…")
+                                            } else {
+                                                r.line.clone()
+                                            };
+                                            ui.label(RichText::new(format!("[{}] {} | {}", r.ts, r.src, line)).weak().small());
+                                        }
+                                    }
+                                } else {
+                                    ui.label(RichText::new(format!("日志库不可用：{}", self.logdb_err)).weak());
+                                }
                             });
                             self.settings_sections = sections;
                         }
                         SettingsSide::Ui => {
                             let sections = std::mem::take(&mut self.settings_sections);
                             let sections = Self::setting_section(ctx, ui, sections, "ui", "界面", None, true, use_anim, self.cfg.anim_speed, |ui| {
-                                ui.label("语言:");
                                 ui.horizontal(|ui| {
+                                    ui.label("语言:");
                                     ui.radio_value(&mut self.cfg.lang, "zh".to_string(), "中文");
                                     ui.radio_value(&mut self.cfg.lang, "en".to_string(), "English");
                                 });
-                                ui.checkbox(&mut self.cfg.ui_animations, "启用切换动效（导航页签 / 折叠 / 按钮过渡）");
-                                // 说明：原先此处另有一个「设置页内平滑动画」开关，已并入上面的总开关
-                                // （用户反馈：两个开关语义重复且设置页看起来"没有动效"）。
-                                ui.label(RichText::new("关闭动效后所有过渡立即完成，后台以最低刷新率运行，进一步降低资源占用").weak().small());
-                                ui.label("平滑动画速度:");
+                                ui.checkbox(&mut self.cfg.ui_animations, "启用切换动效（导航页签平滑过渡）");
+                                if ui
+                                    .checkbox(
+                                        &mut self.cfg.ui_settings_anim,
+                                        "设置页内平滑动画（默认关闭，设置页折叠更跟手；仅影响设置页）",
+                                    )
+                                    .changed()
+                                {
+                                    self.save_config();
+                                }
+                                ui.label(RichText::new("关闭动效后后台以最低刷新率运行，进一步降低资源占用").weak());
                                 ui.horizontal(|ui| {
-                                    ui.add(egui::Slider::new(&mut self.cfg.anim_speed, 0.1..=2.0).logarithmic(true).fixed_decimals(2).show_value(true));
-                                    if ui.button("重置").clicked() {
-                                        self.cfg.anim_speed = 1.0;
+                                    ui.label("平滑动画速度:");
+                                    if ui.add(egui::Slider::new(&mut self.cfg.anim_speed, 0.1..=2.0).logarithmic(true).fixed_decimals(2)).changed() {
+                                        self.save_config();
                                     }
                                 });
-                                ui.label(RichText::new("数值越大展开/折叠越快，越小越平滑；关闭动效时此项不生效").weak().small());
+                                ui.label(RichText::new("数值越大展开/折叠越快，越小越平滑；关闭动效时此项不生效").weak());
                                 // Stage 6：主题系统 UI（模式/预设/自定义/背景图/圆角）
                                 self.ui_theme_settings(ui);
                             });
@@ -12938,7 +11503,7 @@ impl App {
                         SettingsSide::Notify => {
                             let sections = std::mem::take(&mut self.settings_sections);
                             let sections = Self::setting_section(ctx, ui, sections, "notify", "通知", None, true, use_anim, self.cfg.anim_speed, |ui| {
-                                // （已按用户要求删除原说明文本）
+                                ui.label("服务器启动/关闭、隧道添加/停止/异常时，工具内弹出侧滑通知；并同时调用 Windows 系统气泡通知（窗口最小化或关闭时右下角仍可见）");
                                 ui.horizontal(|ui| {
                                     let mut v = self.cfg.sys_notify;
                                     if ui.checkbox(&mut v, "启用 Windows 系统气泡通知（窗口关闭时也显示）").changed() {
@@ -13031,13 +11596,13 @@ impl App {
                 ui.label("启用后功能立即生效，并可能影响服务器运行稳定性；请先在测试环境验证，再决定是否长期开启。");
                 ui.separator();
                 // 测试功能：名称 + 状态 + 启用/禁用
-                // Bug6：网络下载/玩家管理/插件系统已转正式功能（Tool 组默认启用），不再作为测试功能在此展示开关
-                // 2026-10-02：特殊功能（Spark 分析）回归测试功能（Beta 组默认禁用），重新在此展示开关
-                let beta_list: [(&str, &str); 4] = [
+                // Bug6：网络下载/玩家管理/插件系统已转正式功能（Tool 组默认启用），
+                // 2026-09-28：特殊功能（Spark 分析）已转正式功能（Server 组默认启用），
+                // 均不再作为测试功能在此展示开关
+                let beta_list: [(&str, &str); 3] = [
                     (features::BETA_BACKUP, "自动备份"),
                     (features::BETA_CRASH_ANALYSIS, "崩溃报告分析"),
                     (features::BETA_TRAFFIC, "内网穿透流量显示"),
-                    (features::BETA_SPECIAL, "特殊功能"),
                 ];
                 for (id, name) in beta_list {
                     let enabled = features::is_enabled(&self.cfg.features, id);
@@ -13117,7 +11682,6 @@ impl App {
                     self.data_dir().join("plugins"),
                     self.data_dir().join("plugins_cache"),
                     self.cfg.plugin_states.clone(),
-                    self.cfg.plugin_configs.clone(),
                 );
                 let _ = std::fs::create_dir_all(pm.plugins_dir.clone());
                 let _ = std::fs::create_dir_all(pm.cache_dir.clone());
@@ -13125,12 +11689,6 @@ impl App {
                 self.plugins = Some(pm);
             } else if !enabled {
                 self.plugins = None;
-                // 插件系统整体关闭：背景效果一并复位，避免 DWM accent / 透明面板残留在窗口上
-                let ctx = self.egui_ctx.clone();
-                let op = self.plugin_bg_opacity;
-                if self.plugin_bg_style != plugins::BgStyle::Default {
-                    self.apply_bg(plugins::BgStyle::Default, &ctx, op, None);
-                }
             }
         }
     }
@@ -13142,12 +11700,10 @@ impl App {
         }
         // 插件目录随 data_dir() 动态解析，无法在 new() 前直接调用实例方法，
         // 因此这里只登记目录占位，真正目录在 first_plugin_tick 中补齐。
-        // 插件单独配置（plugin_configs）随 states 一并传入，脚本可经 xmst_config_get/set 读写。
         Some(plugins::PluginManager::new(
             PathBuf::from("plugins-placeholder"),
             PathBuf::from("plugins_cache-placeholder"),
             cfg.plugin_states.clone(),
-            cfg.plugin_configs.clone(),
         ))
     }
 
@@ -13189,8 +11745,6 @@ impl App {
         if self.plugins.is_none() {
             return;
         }
-        // 背景不透明度的兜底默认值（历史配置可能为 0，见 plugin_opacity_default）
-        let default_alpha = self.plugin_opacity_default();
         // 首次 tick：new() 中因 data_dir() 不可用而登记的占位目录，此处迁移到真实目录并扫描
         let placeholder = self
             .plugins
@@ -13202,7 +11756,6 @@ impl App {
                 self.data_dir().join("plugins"),
                 self.data_dir().join("plugins_cache"),
                 self.cfg.plugin_states.clone(),
-                self.cfg.plugin_configs.clone(),
             );
             let _ = std::fs::create_dir_all(pm.plugins_dir.clone());
             let _ = std::fs::create_dir_all(pm.cache_dir.clone());
@@ -13221,312 +11774,38 @@ impl App {
         for (title, body) in toasts {
             self.notify(&title, &body);
         }
-        // 插件脚本通过 xmst_config_set 修改了自己的配置：同步回 cfg 并落盘
-        if let Some(pm) = self.plugins.as_ref() {
-            if pm.configs_dirty {
-                if let Some(pm) = self.plugins.as_mut() {
-                    pm.configs_dirty = false;
-                    if let Ok(g) = pm.configs.lock() {
-                        self.cfg.plugin_configs = g.clone();
-                    }
-                    self.save_config();
-                }
-            }
-        }
-        // 启动后首次 tick：按「已启用插件」保存的 bg_style / bg_alpha 恢复背景效果。
-        // 修复「重启后窗口背景效果丢失」：以前 bg_style 只被卡片 UI 读写，启动时无人应用。
-        if !self.plugin_bg_restored {
-            self.plugin_bg_restored = true;
-            let restored = self
-                .plugins
-                .as_ref()
-                .map(|pm| {
-                    let mut found = None;
-                    if let Ok(g) = pm.configs.lock() {
-                        for inst in pm.instances.iter().filter(|i| i.enabled) {
-                            let Some(m) = g.get(&inst.manifest.name) else {
-                                continue;
-                            };
-                            let style = m
-                                .get("bg_style")
-                                .map(|s| plugins::BgStyle::from_key(s))
-                                .unwrap_or_default();
-                            if style != plugins::BgStyle::Default {
-                                let alpha = m
-                                    .get("bg_alpha")
-                                    .and_then(|v| v.parse::<f32>().ok())
-                                    .unwrap_or(default_alpha);
-                                found = Some((
-                                    inst.manifest.name.clone(),
-                                    style,
-                                    Self::norm_bg_opacity(alpha, default_alpha),
-                                ));
-                            }
-                        }
-                    }
-                    found
-                })
-                .flatten();
-            if let Some((name, style, alpha)) = restored {
-                // 启动恢复：静默应用（不弹提示条），避免每次开机都蹦一条像“警告”的提示
-                self.bg_suppress_toast = true;
-                self.apply_bg(style, ctx, alpha, Some(&name));
-                self.bg_suppress_toast = false;
-            }
-        }
-        if let Some((pname, bg)) = bg {
-            // 脚本触发：优先取请求插件自己的 bg_alpha（单插件配置区设置值），无则回退全局默认
-            let alpha = self
-                .plugins
-                .as_ref()
-                .and_then(|pm| pm.configs.lock().ok())
-                .and_then(|g| {
-                    g.get(&pname)
-                        .and_then(|m| m.get("bg_alpha"))
-                        .and_then(|v| v.parse::<f32>().ok())
-                })
-                .unwrap_or(default_alpha);
-            // 脚本事件（含启动时的 on_enabled）触发的应用同样静默
-            let na = Self::norm_bg_opacity(alpha, default_alpha);
-            self.bg_suppress_toast = true;
-            self.apply_bg(bg, ctx, na, Some(&pname));
-            self.bg_suppress_toast = false;
+        if let Some(bg) = bg {
+            self.apply_bg(bg, ctx);
         }
     }
 
-    /// 插件背景不透明度的安全默认值。
-    /// 历史配置里 `plugin_bg_alpha` 可能被旧的「毛玻璃暗度」滑杆拖到 0（0 = 完全无着色，
-    /// 等于「看不到任何效果」），此时若继续沿用 0，新做的三模式也会「点了没反应」。
-    fn plugin_opacity_default(&self) -> f32 {
-        let v = self.cfg.plugin_bg_alpha;
-        if v.is_finite() && v >= 0.05 {
-            v.clamp(0.05, 1.0)
-        } else {
-            0.55
-        }
-    }
-
-    /// 归一化插件背景不透明度：落在 [0.05, 1.0] 之外（含历史遗留的 0.00）一律取兜底默认值，
-    /// 避免「配置里是 0 → 效果等于没有」再次发生。
-    fn norm_bg_opacity(v: f32, fallback: f32) -> f32 {
-        if v.is_finite() && v >= 0.05 {
-            v.clamp(0.05, 1.0)
-        } else {
-            fallback
-        }
-    }
-
-    /// 实际用于材质的浓度：
-    /// * 默认 = 滑杆值（越底越透，桌面越抢眼）；
-    /// * 关闭「配色跟随材质明暗」时抬到 0.60 下限 —— 因为此时界面固定用主题（深色）配色，
-    ///   浓度太低会让明亮桌面上变成「浅字 + 亮底」而看不清。
-    fn effective_bg_opacity(&self) -> f32 {
-        let v = self.plugin_bg_opacity.clamp(0.0, 1.0);
-        if self.cfg.bg_material_auto_contrast {
-            v
-        } else {
-            v.max(0.60)
-        }
-    }
-
-    /// 应用插件请求的窗口背景效果：半透明 / 毛玻璃 / 亚克力 / 恢复默认。
-    ///
-    /// `opacity` 0.0-1.0 = 窗口不透明度（三种模式共用的滑杆）。
-    /// `owner`：请求方插件名（`None` = 保持当前归属，例如滑杆微调、程序启动恢复）。
-/// 材质状态（D4 唯一真源）在 `plugin_configs` 中使用的归属名：背景材质统一落到这个名字下，
-/// 避免「UI 滑杆写一份、插件配置写另一份」导致重启后生效的不是用户刚调的值。
-const MATERIAL_OWNER_FALLBACK: &str = "xmst-frosted-glass-demo";
-    /// 归属用于 D2：禁用/卸载该插件时自动回收背景效果，避免「插件停了窗口还透」。
-    ///
-    /// 透明机制（实测结论见 docs\背景材质失效根因分析_毛玻璃亚克力半透明.md §10）：
-    /// 本机 OpenGL 呈现路径不透明，逐像素窗口 alpha / LWA_ALPHA 均无效，
-    /// 因此视觉效果由 `backdrop.rs` 的**桌面捕获底图**承担；DWM accent 仅作增强。
-    fn apply_bg(
-        &mut self,
-        style: plugins::BgStyle,
-        ctx: &egui::Context,
-        opacity: f32,
-        owner: Option<&str>,
-    ) {
-        let opacity = opacity.clamp(0.0, 1.0);
-        let hwnd = resolve_main_hwnd(&mut self.hwnd_cache);
-        let h = hwnd as isize;
-        let tint_c = self.theme_cur.bg;
-        let tint = (tint_c.r(), tint_c.g(), tint_c.b());
-        let alpha_u8 = (opacity * 255.0).round().clamp(1.0, 255.0) as u8;
-        let mut effective = style;
-        let mut note = String::new();
-        let mut accent_ok = false;
-
-        match style {
-            plugins::BgStyle::Default => {
+    /// 应用插件请求的窗口背景效果（毛玻璃/半透明/恢复）
+    fn apply_bg(&mut self, bg: plugins::BgStyle, ctx: &egui::Context) {
+        match bg {
+            plugins::BgStyle::Acrylic => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Transparent(true));
+                let hwnd = main_hwnd();
                 if !hwnd.is_null() {
-                    plugins::clear_accent(h);
-                    // 防御性清理：早期版本可能残留过 WS_EX_LAYERED
-                    plugins::clear_uniform_alpha(h);
+                    plugins::apply_acrylic(hwnd as isize, true);
                 }
-                self.backdrop.ensure_exclusion(h, false);
+                self.plugin_bg_active = true;
+                self.set_toast("毛玻璃（亚克力）背景已开启（实验性，依赖系统合成支持）".to_string());
             }
             plugins::BgStyle::Translucent => {
-                // 桌面捕获模式下不需要 DWM accent；清掉可能残留的
+                ctx.send_viewport_cmd(egui::ViewportCommand::Transparent(true));
+                self.plugin_bg_active = true;
+                self.set_toast("半透明背景已开启".to_string());
+            }
+            plugins::BgStyle::Default => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Transparent(false));
+                let hwnd = main_hwnd();
                 if !hwnd.is_null() {
-                    plugins::clear_accent(h);
+                    plugins::apply_acrylic(hwnd as isize, false);
                 }
-                self.backdrop.ensure_exclusion(h, true);
-            }
-            plugins::BgStyle::Frosted | plugins::BgStyle::Acrylic => {
-                // 桌面捕获承担主要视觉效果；DWM accent 仍下发一次，
-                // 在「窗口 alpha 可合成」的正常本机会话里作为额外增强（此处无效也无害）
-                if !hwnd.is_null() {
-                    if let Some(state) = style.accent_state() {
-                        accent_ok = plugins::apply_accent(h, state, tint, alpha_u8);
-                    }
-                    if !accent_ok {
-                        let alt = if style == plugins::BgStyle::Acrylic {
-                            plugins::BgStyle::Frosted
-                        } else {
-                            plugins::BgStyle::Acrylic
-                        };
-                        if let Some(state) = alt.accent_state() {
-                            if plugins::apply_accent(h, state, tint, alpha_u8) {
-                                accent_ok = true;
-                                effective = alt;
-                                note = "（首选效果不可用，已回退另一档 DWM 模糊）".to_string();
-                            }
-                        }
-                    }
-                }
-                self.backdrop.ensure_exclusion(h, true);
+                self.plugin_bg_active = false;
+                self.set_toast("窗口背景已恢复默认".to_string());
             }
         }
-
-        self.plugin_bg_style = effective;
-        self.plugin_bg_opacity = opacity;
-        // D4：把材质状态**只写一份**到插件配置（作为唯一真源），并同步历史字段
-        // `plugin_bg_alpha`（老配置兼容）。
-        //
-        // 这里是真的踩过坑：UI 滑杆写 `plugin_bg_alpha`、恢复流程读插件配置的
-        // `bg_alpha`，两边一旦不一致（实测 UI 记 0.55、插件配置仍是 0.32），
-        // 启动后生效的就是那个没人再维护的旧值 —— 表现为「我明明调过，重启又不对」。
-        if effective != plugins::BgStyle::Default {
-            if let Some(name) = self
-                .plugin_bg_owner
-                .clone()
-                .or_else(|| Some(Self::MATERIAL_OWNER_FALLBACK.to_string()))
-            {
-                let entry = self.cfg.plugin_configs.entry(name).or_default();
-                entry.insert("bg_style".to_string(), effective.key().to_string());
-                entry.insert("bg_alpha".to_string(), format!("{opacity:.2}"));
-            }
-        }
-        // 注意：`Default`（关闭效果 / 插件被禁用时的效果回收）**不写回**插件配置，
-        // 否则"停用插件 / 关掉效果"会把用户选好的模式清成 default，下次启用就没了。
-        // 模式是否真正变化：只在变化时重设窗口区域、立即落盘（避免拖动滑杆时闪烁/写盘）
-        let style_changed = self.plugin_bg_style != effective;
-        self.plugin_bg_style = effective;
-        self.cfg.plugin_bg_alpha = opacity;
-        // 落盘做去抖：拖动不透明度滑杆时每帧写配置既浪费又会卡顿（D4 唯一真源已保证一致性）
-        if style_changed || self.bg_save_at.map(|t| t.elapsed().as_millis() > 600).unwrap_or(true) {
-            self.save_config();
-            self.bg_save_at = Some(std::time::Instant::now());
-        }
-        // D2：记录/清理背景效果归属
-        if effective == plugins::BgStyle::Default {
-            self.plugin_bg_owner = None;
-        } else if let Some(name) = owner {
-            self.plugin_bg_owner = Some(name.to_string());
-        }
-        // ★ 关键：DWM accent 会重置窗口区域（SetWindowRgn 的结果被抹掉），而
-        // apply_window_round_region 有 (r,w,h) 去重缓存，于是圆角永久变成「尖锐直角」。
-        // 这里既失效缓存，也在同一步内立即用当前半径重设区域，不依赖下一帧。
-        //
-        // 但**只在模式/圆角真正变化时**才重设：SetWindowRgn 会让整窗重绘一次，
-        // 挪动不透明度滑杆时每帧都调用就会周期性地"闪一下"（用户反馈的闪烁根因之一）。
-        if style_changed {
-            self.last_win_rgn = (-1, -1, -1);
-        }
-        self.apply_window_round_region(ctx, self.win_r_points);
-        // 提示条只在本机 DWM 不可用时说明「已改用桌面捕获材质」，
-        // 且**启动恢复时不弹**（启动就弹一条带“不可用”字样的提示，用户会以为出错了）。
-        if !self.bg_suppress_toast {
-            let msg = if !note.is_empty() {
-                format!(
-                    "窗口背景：{}（不透明度 {:.0}%）｜ 本机 DWM 亚克力不可用，已用桌面捕获材质实现同等效果",
-                    effective.label(),
-                    opacity * 100.0
-                )
-            } else {
-                format!(
-                    "窗口背景：{}（不透明度 {:.0}%）",
-                    effective.label(),
-                    opacity * 100.0
-                )
-            };
-            self.set_toast(msg);
-        }
-        self.bg_debug_log(style, effective, opacity, accent_ok, hwnd);
-        ctx.request_repaint();
-    }
-
-    /// 运行时诊断：把背景模式相关的关键事实追加到 `data\bg_debug.log`。
-    /// 这是排查「毛玻璃/亚克力不生效」的唯一可靠手段（DWM accent 是未公开 API，
-    /// 失败时既无返回值也无日志；eframe/winit 的 log 在本程序里没有初始化）。
-    fn bg_debug_log(
-        &self,
-        requested: plugins::BgStyle,
-        effective: plugins::BgStyle,
-        opacity: f32,
-        accent_ok: bool,
-        hwnd: winapi::shared::windef::HWND,
-    ) {
-        use std::io::Write;
-        let path = self.data_dir().join("bg_debug.log");
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        // D7：日志轮转（超过 256KB 保留最后 200 行），避免长期运行无限增长
-        if let Ok(meta) = std::fs::metadata(&path) {
-            if meta.len() > 256 * 1024 {
-                if let Ok(text) = std::fs::read_to_string(&path) {
-                    let lines: Vec<&str> = text.lines().collect();
-                    let keep: Vec<&str> = lines[lines.len().saturating_sub(200)..].to_vec();
-                    let _ = std::fs::write(&path, keep.join("\n") + "\n");
-                }
-            }
-        }
-        let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        else {
-            return;
-        };
-        let (bd_mean, bd_samples, bd_count, bd_size, bd_ms, bd_max_ms) = self.backdrop.stats();
-        let samples: Vec<String> = bd_samples
-            .iter()
-            .map(|(r, g, b)| format!("{r},{g},{b}"))
-            .collect();
-        let _ = writeln!(
-            f,
-            "[{}] requested={:?} effective={:?} opacity={:.2} accent_ok={} hwnd_null={} layered={} composition={} gl(red,alpha)={:?} ppp={:.2} | backdrop mean={:?} samples=[{}] captures={} tex={}x{} cap_ms={:.2}/max{:.2}",
-            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-            requested,
-            effective,
-            opacity,
-            accent_ok,
-            hwnd.is_null(),
-            if hwnd.is_null() { false } else { plugins::is_layered(hwnd as isize) },
-            plugins::is_composition_enabled(),
-            self.gl_fb_bits,
-            self.egui_ctx.pixels_per_point(),
-            bd_mean,
-            samples.join(" "),
-            bd_count,
-            bd_size.0,
-            bd_size.1,
-            bd_ms,
-            bd_max_ms,
-        );
     }
 
     /// 导入插件 zip：复制到插件目录并热加载（B5：zip 拖入 / 导入按钮）
@@ -13559,30 +11838,22 @@ const MATERIAL_OWNER_FALLBACK: &str = "xmst-frosted-glass-demo";
             self.nav = Nav::Settings;
             return;
         }
-        let bg_now = self.plugin_bg_style;
-        let bg_now_opacity = self.plugin_bg_opacity;
-        // 卡片滑杆的兜底默认值（历史配置可能是 0.00，见 plugin_opacity_default）
-        let default_alpha = self.plugin_opacity_default();
+        let bg_active = self.plugin_bg_active;
         let plugins_dir = self
             .plugins
             .as_ref()
             .map(|p| p.plugins_dir.display().to_string())
             .unwrap_or_default();
         let mut msgs: Vec<String> = Vec::new();
-        // 单插件卡片「配置」区发起的背景效果动作：(插件名, 样式)；不透明度从该插件 configs 读
-        let mut bg_action: Option<(String, plugins::BgStyle)> = None;
-        // 滑杆即时生效：半透明改覆盖层 alpha，模糊类重设 DWM 着色
-        let mut bg_reapply: Option<f32> = None;
+        let mut bg_cmd: Option<plugins::BgStyle> = None;
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(ctx.style().visuals.panel_fill))
             .show(ctx, |ui| {
-                // 第二批：max-width 1100 左对齐（插件页，ScrollArea 移入容器内）
+                // 第二批：max-width 1100 水平居中（插件页，ScrollArea 移入容器内）
                 let _avail = ui.available_rect_before_wrap();
-                // 左侧留出 14px 内边距：此前内容紧贴侧栏/窗口边缘，文字看起来"贴太近"。
-                let _pad = 14.0f32;
-                let _w = (_avail.width() - _pad).min(1100.0);
+                let _w = _avail.width().min(1100.0);
                 let _centered = egui::Rect::from_min_size(
-                    egui::pos2(_avail.left() + _pad, _avail.top()),
+                    egui::pos2(_avail.center().x - _w * 0.5, _avail.top()),
                     egui::vec2(_w, _avail.height()),
                 );
                 let mut _inner = ui.new_child(
@@ -13593,7 +11864,7 @@ const MATERIAL_OWNER_FALLBACK: &str = "xmst-frosted-glass-demo";
                 );
                 _inner.set_width(_w);
                 let ui = &mut _inner;
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.add_space(8.0);
@@ -13632,29 +11903,27 @@ const MATERIAL_OWNER_FALLBACK: &str = "xmst-frosted-glass-demo";
                                     self.import_plugin_zip(&p);
                                 }
                             }
-                            let bg_txt = if bg_now == plugins::BgStyle::Default {
-                                "背景效果：默认".to_string()
+                            let bg_txt = if bg_active {
+                                "背景效果：已应用（插件可调用 xmst_set_bg 调整）"
                             } else {
-                                format!(
-                                    "背景效果：{}（不透明度 {:.0}%）",
-                                    bg_now.label(),
-                                    bg_now_opacity * 100.0
-                                )
+                                "背景效果：默认"
                             };
                             ui.label(
-                                RichText::new(bg_txt).color(if bg_now == plugins::BgStyle::Default {
-                                    self.fg(Color32::from_rgb(150, 150, 150))
-                                } else {
+                                RichText::new(bg_txt).color(if bg_active {
                                     self.fg(Color32::from_rgb(120, 200, 160))
+                                } else {
+                                    self.fg(Color32::from_rgb(150, 150, 150))
                                 }),
                             );
-                            // 背景效果配置入口位于每张插件卡片的「配置」区（单插件配置），
-                            // 不再放这里的总设置工具栏。
+                            if bg_active && ui.button("恢复默认背景").clicked() {
+                                bg_cmd = Some(plugins::BgStyle::Default);
+                            }
                         });
                         ui.separator();
-                        // 插件列表（卡片式：名称 + 状态徽章 + 描述 + 操作右对齐）
+                        // 插件列表（文件浏览式：左侧列表 + 右侧详情预览）
                         let mut toggle: Option<(String, bool)> = None;
                         let mut unload_name: Option<String> = None;
+                        let mut picked: Option<String> = None;
                         let names: Vec<String> = match self.plugins.as_mut() {
                             Some(pm) => pm.instances.iter().map(|i| i.manifest.name.clone()).collect(),
                             None => Vec::new(),
@@ -13671,362 +11940,112 @@ const MATERIAL_OWNER_FALLBACK: &str = "xmst-frosted-glass-demo";
                                 self.plugin_sel = None;
                             }
                         }
-                        let sel_name = self.plugin_sel.clone();
-                        for name in &names {
-                            let (ver, desc, enabled, hooks, err) = {
-                                let pm = match self.plugins.as_ref() {
-                                    Some(pm) => pm,
-                                    None => continue,
-                                };
-                                match pm.instances.iter().find(|i| i.manifest.name == *name) {
-                                    Some(i) => (
-                                        i.manifest.version.clone(),
-                                        i.manifest.description.clone(),
-                                        i.enabled,
-                                        i.hook_calls.clone(),
-                                        i.last_error.clone(),
-                                    ),
-                                    None => (String::new(), String::new(), false, std::collections::HashMap::new(), None),
-                                }
-                            };
-                            let is_sel = sel_name.as_deref() == Some(name.as_str());
-                            let card_bg = if is_sel {
-                                Color32::from_rgba_unmultiplied(
-                                    self.theme_target.accent.r(),
-                                    self.theme_target.accent.g(),
-                                    self.theme_target.accent.b(),
-                                    14,
-                                )
-                            } else {
-                                Color32::from_rgba_unmultiplied(150, 160, 180, 8)
-                            };
-                            let card_stroke = if is_sel {
-                                self.theme_target.accent
-                            } else {
-                                Color32::from_rgba_unmultiplied(150, 160, 180, 50)
-                            };
-                            egui::Frame::none()
-                                .fill(card_bg)
-                                .stroke(egui::Stroke::new(1.0, card_stroke))
-                                .rounding(egui::Rounding::same(8.0))
-                                .inner_margin(egui::Margin::symmetric(12.0, 10.0))
-                                .show(ui, |ui| {
-                                    ui.set_width(ui.available_width());
-                                    ui.horizontal(|ui| {
-                                        // 名称 + 版本（左侧）
-                                        ui.label(RichText::new(name.as_str()).strong().size(16.0));
-                                        if !ver.is_empty() {
-                                            ui.label(RichText::new(format!("v{ver}")).color(self.fg(Color32::from_rgb(150, 150, 150))));
-                                        }
-                                        // 状态徽章：运行中=绿色实心圆点 / 已停止=红色实心圆点
-                                        if enabled {
-                                            ui.label(RichText::new("● 运行中").color(self.fg(Color32::from_rgb(80, 200, 120))));
-                                        } else {
-                                            ui.label(RichText::new("● 已停止").color(self.fg(Color32::from_rgb(220, 90, 90))));
-                                        }
-                                        // 操作按钮右对齐（启动/停止、卸载）
-                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            if ui.button("卸载").clicked() {
-                                                unload_name = Some(name.clone());
-                                            }
-                                            if ui.button(if enabled { "禁用" } else { "启用" }).clicked() {
-                                                toggle = Some((name.clone(), !enabled));
-                                            }
-                                        });
-                                    });
-                                    // 描述（弱化色、换行完整显示）
-                                    if desc.is_empty() {
-                                        ui.label(RichText::new("（无描述）").color(self.fg(Color32::from_rgb(150, 150, 150))));
-                                    } else {
-                                        ui.label(RichText::new(desc).color(self.fg(Color32::from_rgb(170, 170, 170))));
-                                    }
-                                    // 钩子（弱化小字）
-                                    if !hooks.is_empty() {
-                                        let mut parts: Vec<String> = hooks
-                                            .iter()
-                                            .map(|(k, v)| format!("{k} x{v}"))
-                                            .collect();
-                                        parts.sort();
-                                        ui.label(RichText::new(parts.join(" · ")).color(self.fg(Color32::from_rgb(150, 150, 150))).small());
-                                    }
-                                    if let Some(e) = &err {
-                                        ui.label(RichText::new(format!("最近错误：{e}")).color(self.fg(Color32::from_rgb(220, 90, 90))));
-                                    }
-                                    // 插件单独配置（键值对；脚本内通过 xmst_config_get/set 读写，改动实时落盘）
-                                    egui::CollapsingHeader::new(
-                                        RichText::new("配置")
-                                            .color(self.fg(Color32::from_rgb(170, 170, 170)))
-                                            .small(),
-                                    )
-                                    .id_salt(("plugin_cfg", name.as_str()))
-                                    .default_open(false)
+                        ui.horizontal(|ui| {
+                            // 左侧：插件列表
+                            ui.vertical(|ui| {
+                                ui.set_width(210.0);
+                                egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                                    .id_salt("plugin_list_left")
+                                    .max_height(360.0)
+                                    .auto_shrink([false, false])
                                     .show(ui, |ui| {
-                                        // ---- 背景效果（本插件配置，非插件页总设置）----
-                                        // bg_style / bg_alpha 为本插件保留键：UI 与脚本（xmst_config_get/set）共用
-                                        let (mut bg_style, mut bg_alpha) = {
-                                            let g = self
-                                                .plugins
-                                                .as_ref()
-                                                .and_then(|pm| pm.configs.lock().ok());
-                                            match g {
-                                                Some(g) => {
-                                                    let m = g.get(name.as_str());
-                                                    let s = m
-                                                        .and_then(|m| m.get("bg_style"))
-                                                        .cloned()
-                                                        .unwrap_or_default();
-                                                    let a = m
-                                                        .and_then(|m| m.get("bg_alpha"))
-                                                        .and_then(|v| v.parse::<f32>().ok())
-                                                        .unwrap_or(default_alpha);
-                                                    (s, a.max(0.05))
+                                        for name in &names {
+                                            let (enabled, ver) = {
+                                                let pm = match self.plugins.as_ref() {
+                                                    Some(pm) => pm,
+                                                    None => continue,
+                                                };
+                                                match pm.instances.iter().find(|i| i.manifest.name == *name) {
+                                                    Some(i) => (i.enabled, i.manifest.version.clone()),
+                                                    None => (false, String::new()),
                                                 }
-                                                None => (String::new(), default_alpha),
-                                            }
-                                        };
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new("背景效果:")
-                                                    .small()
-                                                    .color(self.fg(Color32::from_rgb(170, 170, 170))),
+                                            };
+                                            let sel = self.plugin_sel.as_deref() == Some(name.as_str());
+                                            let label = format!(
+                                                "{} {}{}",
+                                                if enabled { "●" } else { "○" },
+                                                name,
+                                                if ver.is_empty() { String::new() } else { format!("  v{ver}") }
                                             );
-                                            if ui.small_button("半透明").clicked() {
-                                                bg_action = Some((
-                                                    name.clone(),
-                                                    plugins::BgStyle::Translucent,
-                                                ));
-                                            }
-                                            if ui.small_button("毛玻璃").clicked() {
-                                                bg_action = Some((
-                                                    name.clone(),
-                                                    plugins::BgStyle::Frosted,
-                                                ));
-                                            }
-                                            if ui.small_button("亚克力").clicked() {
-                                                bg_action = Some((
-                                                    name.clone(),
-                                                    plugins::BgStyle::Acrylic,
-                                                ));
-                                            }
-                                            if ui.small_button("恢复默认背景").clicked() {
-                                                bg_action = Some((
-                                                    name.clone(),
-                                                    plugins::BgStyle::Default,
-                                                ));
-                                            }
-                                            if !bg_style.is_empty() {
-                                                let st = plugins::BgStyle::from_key(&bg_style).label();
-                                                ui.label(
-                                                    RichText::new(format!("当前：{st}"))
-                                                        .small()
-                                                        .color(self.fg(Color32::from_rgb(150, 150, 150))),
-                                                );
-                                            }
-                                        });
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new("不透明度:")
-                                                    .small()
-                                                    .color(self.fg(Color32::from_rgb(170, 170, 170))),
-                                            );
-                                            if ui
-                                                .add(egui::Slider::new(&mut bg_alpha, 0.05..=1.0).fixed_decimals(2))
-                                                .changed()
-                                            {
-                                                // 写回本插件配置（随 configs_dirty 落盘），三种模式共用该值
-                                                if let Some(pm) = self.plugins.as_mut() {
-                                                    if let Ok(mut g) = pm.configs.lock() {
-                                                        g.entry(name.clone())
-                                                            .or_default()
-                                                            .insert(
-                                                                "bg_alpha".to_string(),
-                                                                format!("{:.2}", bg_alpha),
-                                                            );
-                                                    }
-                                                    pm.configs_dirty = true;
-                                                }
-                                                // 任意非默认模式下即时生效：
-                                                // 半透明=覆盖层 alpha（theme 每帧读取），模糊类=重设 DWM 着色
-                                                if self.plugin_bg_style != plugins::BgStyle::Default {
-                                                    bg_reapply = Some(bg_alpha.clamp(0.0, 1.0));
-                                                }
-                                            }
-                                        });
-                                        ui.label(
-                                            RichText::new("半透明=窗口背后桌面透进来；毛玻璃/亚克力=同一张底图做重度模糊。三者均可调不透明度。")
-                                                .weak()
-                                                .small(),
-                                        );
-                                        // 界面配色是否跟随材质明暗：明亮桌面→自动转浅色界面，
-                                        // 深色桌面→保持深色。关闭后固定主题配色（材质浓度会被抬到 0.60 下限）。
-                                        let mut auto_c = self.cfg.bg_material_auto_contrast;
-                                        if ui
-                                            .checkbox(
-                                                &mut auto_c,
-                                                RichText::new(
-                                                    "界面配色跟随材质明暗（关闭则固定当前主题配色）",
-                                                )
-                                                .small()
-                                                .color(self.fg(Color32::from_rgb(170, 170, 170))),
-                                            )
-                                            .changed()
-                                        {
-                                            self.cfg.bg_material_auto_contrast = auto_c;
-                                            self.save_config();
-                                            let ctx2 = ctx.clone();
-                                            let op = self.plugin_bg_opacity;
-                                            if self.plugin_bg_style != plugins::BgStyle::Default {
-                                                let style = self.plugin_bg_style;
-                                                self.apply_bg(style, &ctx2, op, None);
-                                            }
-                                        }
-                                        // F2 效果可用性自检：Windows 在「透明效果关闭 / 节电 / 远程会话」
-                                        // 时会禁用亚克力，而 TranslucentTB 那类工具失败时静默无提示。
-                                        // 这里显式列出当前环境里会削弱效果的系统级门槛。
-                                        for warn in plugins::material_env_warnings() {
-                                            ui.label(
-                                                RichText::new(format!("⚠ {warn}"))
-                                                    .small()
-                                                    .color(Color32::from_rgb(232, 176, 72)),
-                                            );
-                                        }
-                                        // 内容衬底：材质之上再铺一层主题底色的半透明衬底，
-                                        // 桌面材质仍可见，但文字有稳定底色（小字可读性关键）。
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new("内容衬底:")
-                                                    .small()
-                                                    .color(self.fg(Color32::from_rgb(170, 170, 170))),
-                                            );
-                                            let mut scrim = self.cfg.bg_content_scrim;
-                                            if ui
-                                                .add(
-                                                    egui::Slider::new(&mut scrim, 0.0..=0.6)
-                                                        .fixed_decimals(2),
-                                                )
-                                                .changed()
-                                            {
-                                                self.cfg.bg_content_scrim = scrim;
-                                                self.save_config();
-                                                if self.plugin_bg_style != plugins::BgStyle::Default {
-                                                    let ctx2 = ctx.clone();
-                                                    let op = self.plugin_bg_opacity;
-                                                    let style = self.plugin_bg_style;
-                                                    self.apply_bg(style, &ctx2, op, None);
-                                                }
-                                            }
-                                            ui.label(
-                                                RichText::new("越大文字越清晰、桌面越淡")
-                                                    .weak()
-                                                    .small(),
-                                            );
-                                        });
-                                        // D11：抓屏排除开关。桌面捕获式背景必须让本窗口对「抓屏」
-                                        // 不可见，否则会把界面自己抓进底图形成反馈；
-                                        // 代价是本工具会从用户的截屏/录屏/共享屏幕中消失。
-                                        let mut excl = self.cfg.bg_capture_exclusion;
-                                        if ui
-                                            .checkbox(
-                                                &mut excl,
-                                                RichText::new(
-                                                    "开启效果时把本工具排除在截屏/录屏之外（避免背景自我递归）",
-                                                )
-                                                .small()
-                                                .color(self.fg(Color32::from_rgb(170, 170, 170))),
-                                            )
-                                            .changed()
-                                        {
-                                            self.cfg.bg_capture_exclusion = excl;
-                                            self.save_config();
-                                            let ctx2 = ctx.clone();
-                                            let op = self.plugin_bg_opacity;
-                                            if self.plugin_bg_style != plugins::BgStyle::Default {
-                                                let style = self.plugin_bg_style;
-                                                self.apply_bg(style, &ctx2, op, None);
-                                            }
-                                        }
-                                        ui.separator();
-                                        let entries: Vec<(String, String)> = {
-                                            let g = self
-                                                .plugins
-                                                .as_ref()
-                                                .and_then(|pm| pm.configs.lock().ok());
-                                            match g {
-                                                Some(g) => g
-                                                    .get(name.as_str())
-                                                    .map(|m| {
-                                                        m.iter()
-                                                            .map(|(k, v)| (k.clone(), v.clone()))
-                                                            .collect()
-                                                    })
-                                                    .unwrap_or_default(),
-                                                None => Vec::new(),
-                                            }
-                                        };
-                                        if entries.is_empty() {
-                                            ui.label(
-                                                RichText::new("（暂无配置项，插件可通过 xmst_config_set 写入）")
-                                                    .color(self.fg(Color32::from_rgb(150, 150, 150)))
-                                                    .small(),
-                                            );
-                                        }
-                                        let mut dirty = false;
-                                        let mut del_key: Option<String> = None;
-                                        let mut upsert: Option<(String, String)> = None;
-                                        for (k, v) in &entries {
-                                            ui.horizontal(|ui| {
-                                                ui.label(
-                                                    RichText::new(k.as_str())
-                                                        .monospace()
-                                                        .color(self.fg(Color32::from_rgb(170, 170, 170))),
-                                                );
-                                                let mut val_edit = v.clone();
-                                                let resp = ui.add(
-                                                    egui::TextEdit::singleline(&mut val_edit)
-                                                        .desired_width(200.0)
-                                                        .hint_text("值"),
-                                                );
-                                                if resp.changed() {
-                                                    upsert = Some((k.clone(), val_edit));
-                                                    dirty = true;
-                                                }
-                                                if ui.small_button("删除").clicked() {
-                                                    del_key = Some(k.clone());
-                                                    dirty = true;
-                                                }
-                                            });
-                                        }
-                                        ui.horizontal(|ui| {
-                                            ui.add(
-                                                egui::TextEdit::singleline(&mut self.plugin_cfg_new_key)
-                                                    .hint_text("新配置项 key")
-                                                    .desired_width(140.0),
-                                            );
-                                            if ui.button("添加配置项").clicked() {
-                                                let k = std::mem::take(&mut self.plugin_cfg_new_key);
-                                                if !k.trim().is_empty() {
-                                                    upsert = Some((k, String::new()));
-                                                    dirty = true;
-                                                }
-                                            }
-                                        });
-                                        if dirty {
-                                            if let Some(pm) = self.plugins.as_mut() {
-                                                if let Ok(mut g) = pm.configs.lock() {
-                                                    let m = g.entry(name.clone()).or_default();
-                                                    if let Some(k) = del_key {
-                                                        m.remove(&k);
-                                                    }
-                                                    if let Some((k, v)) = upsert {
-                                                        m.insert(k, v);
-                                                    }
-                                                }
-                                                pm.configs_dirty = true;
+                                            if ui.selectable_label(sel, label).clicked() {
+                                                picked = Some(name.clone());
                                             }
                                         }
                                     });
+                            });
+                            ui.separator();
+                            // 右侧：详情预览（描述 / 钩子 / 错误 / 启停操作）
+                            ui.vertical(|ui| {
+                                ui.set_width(ui.available_width());
+                                let Some(sel) = self.plugin_sel.clone() else {
+                                    ui.add_space(8.0);
+                                    ui.label(
+                                        RichText::new("选择左侧插件查看详情（描述 / 钩子 / 日志）")
+                                            .color(self.fg(Color32::from_rgb(150, 150, 150))),
+                                    );
+                                    return;
+                                };
+                                let info = self.plugins.as_ref().and_then(|pm| {
+                                    pm.instances.iter().find(|i| i.manifest.name == sel).map(|i| {
+                                        (
+                                            i.manifest.version.clone(),
+                                            i.manifest.description.clone(),
+                                            i.enabled,
+                                            i.hook_calls.clone(),
+                                            i.last_error.clone(),
+                                        )
+                                    })
                                 });
-                            ui.add_space(10.0);
+                                let Some((ver, desc, enabled, hooks, err)) = info else {
+                                    ui.label(
+                                        RichText::new("插件未加载（请重新扫描）")
+                                            .color(self.fg(Color32::from_rgb(220, 90, 90))),
+                                    );
+                                    return;
+                                };
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(sel.as_str()).strong().size(18.0));
+                                    ui.label(RichText::new(format!("v{ver}")).color(self.fg(Color32::from_rgb(150, 150, 150))));
+                                    if enabled {
+                                        ui.label(RichText::new("● 运行中").color(self.fg(Color32::from_rgb(80, 200, 120))));
+                                    } else {
+                                        ui.label(RichText::new("○ 已停止").color(self.fg(Color32::from_rgb(180, 180, 180))));
+                                    }
+                                    if ui.button(if enabled { "禁用" } else { "启用" }).clicked() {
+                                        toggle = Some((sel.clone(), !enabled));
+                                    }
+                                    if ui.button("卸载").clicked() {
+                                        unload_name = Some(sel.clone());
+                                    }
+                                });
+                                ui.separator();
+                                ui.label(RichText::new("描述").strong().small());
+                                if desc.is_empty() {
+                                    ui.label(RichText::new("（无描述）").color(self.fg(Color32::from_rgb(150, 150, 150))));
+                                } else {
+                                    ui.label(RichText::new(desc).color(self.fg(Color32::from_rgb(170, 170, 170))));
+                                }
+                                ui.add_space(6.0);
+                                ui.label(RichText::new("钩子").strong().small());
+                                if hooks.is_empty() {
+                                    ui.label(RichText::new("（无已触发事件）").color(self.fg(Color32::from_rgb(150, 150, 150))));
+                                } else {
+                                    let mut parts: Vec<String> = hooks
+                                        .iter()
+                                        .map(|(k, v)| format!("{k} x{v}"))
+                                        .collect();
+                                    parts.sort();
+                                    ui.label(parts.join(" · "));
+                                }
+                                if let Some(e) = &err {
+                                    ui.add_space(6.0);
+                                    ui.label(RichText::new(format!("最近错误：{e}")).color(self.fg(Color32::from_rgb(220, 90, 90))));
+                                }
+                            });
+                        });
+                        // 选中项更新
+                        if let Some(p) = picked {
+                            self.plugin_sel = Some(p);
                         }
                         // 应用启停（即时热开关）
                         if let Some((name, on)) = toggle {
@@ -14035,34 +12054,7 @@ const MATERIAL_OWNER_FALLBACK: &str = "xmst-frosted-glass-demo";
                                 None => Err("插件运行时未就绪".to_string()),
                             };
                             match res {
-                                Ok(()) => {
-                                    msgs.push(format!("插件「{name}」已{}", if on { "启用" } else { "禁用" }));
-                                    // ★ 启用状态落盘（修复「每次重进插件都变回关闭、需要重新开启」）：
-                                    // 以前只改了 PluginManager.states，cfg.plugin_states 从不写回，
-                                    // reload_all 的 unwrap_or(false) 让插件每次启动都按禁用加载。
-                                    if let Some(pm) = self.plugins.as_ref() {
-                                        self.cfg.plugin_states = pm.states.clone();
-                                    }
-                                    self.save_config();
-                                    if on {
-                                        // 单播 on_enabled（D9）：脚本可立即应用自己的背景效果。
-                                        // 用 emit_to 而不是广播，否则「启用 A」会把所有插件的
-                                        // on_enabled 都触发一遍（各自重设一次窗口背景）。
-                                        if let Some(pm) = self.plugins.as_mut() {
-                                            pm.emit_to(&name, "enabled", Vec::new());
-                                        }
-                                    } else {
-                                        // D2：被禁用的插件若正在持有窗口背景效果 → 立即回收
-                                        if self.plugin_bg_owner.as_deref() == Some(name.as_str()) {
-                                            let ctx = self.egui_ctx.clone();
-                                            let op = self.plugin_bg_opacity;
-                                            self.apply_bg(plugins::BgStyle::Default, &ctx, op, None);
-                                            msgs.push(format!(
-                                                "插件「{name}」持有窗口背景效果，已自动恢复默认背景"
-                                            ));
-                                        }
-                                    }
-                                }
+                                Ok(()) => msgs.push(format!("插件「{name}」已{}", if on { "启用" } else { "禁用" })),
                                 Err(e) => msgs.push(format!("插件操作失败：{e}")),
                             }
                         }
@@ -14070,19 +12062,7 @@ const MATERIAL_OWNER_FALLBACK: &str = "xmst-frosted-glass-demo";
                             if let Some(pm) = self.plugins.as_mut() {
                                 pm.unload(&name);
                             }
-                            if let Some(pm) = self.plugins.as_ref() {
-                                self.cfg.plugin_states = pm.states.clone();
-                            }
-                            self.save_config();
-                            // D2：卸载的插件若正在持有背景效果 → 立即回收
-                            if self.plugin_bg_owner.as_deref() == Some(name.as_str()) {
-                                let ctx = self.egui_ctx.clone();
-                                let op = self.plugin_bg_opacity;
-                                self.apply_bg(plugins::BgStyle::Default, &ctx, op, None);
-                                msgs.push(format!("插件「{name}」已卸载，窗口背景已恢复默认"));
-                            } else {
-                                msgs.push(format!("插件「{name}」已卸载"));
-                            }
+                            msgs.push(format!("插件「{name}」已卸载"));
                         }
                         // 插件日志（可折叠）
                         ui.separator();
@@ -14097,7 +12077,7 @@ const MATERIAL_OWNER_FALLBACK: &str = "xmst-frosted-glass-demo";
                         )
                         .default_open(true)
                         .show(ui, |ui| {
-                            egui::ScrollArea::vertical()
+                            egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                                 .id_salt("plugin_log_scroll")
                                 .max_height(220.0)
                                 .stick_to_bottom(true)
@@ -14117,48 +12097,8 @@ const MATERIAL_OWNER_FALLBACK: &str = "xmst-frosted-glass-demo";
         for m in msgs {
             self.set_toast(m);
         }
-        if let Some((pname, bg)) = bg_action {
-            // 不透明度取该插件配置区的 bg_alpha（无则安全默认值）。
-            // 历史配置里可能是 0.00（旧「毛玻璃暗度」滑到底 = 完全无效果），
-            // 这种情况下沿用 0 会让人以为「点了没反应」，故抬到默认值并写回配置，
-            // 保证「滑杆显示的值」与「实际生效的浓度」一致。
-            let stored = self
-                .plugins
-                .as_ref()
-                .and_then(|pm| pm.configs.lock().ok())
-                .and_then(|g| {
-                    g.get(&pname)
-                        .and_then(|m| m.get("bg_alpha"))
-                        .and_then(|v| v.parse::<f32>().ok())
-                })
-                .unwrap_or(default_alpha);
-            let alpha = Self::norm_bg_opacity(stored, default_alpha);
-            self.apply_bg(bg, ctx, alpha, Some(&pname));
-            // 背景效果状态写回该插件配置区（bg_style 保留键），脚本端可用 xmst_config_get 读到，
-            // 下次启动也由 tick_plugins 的恢复逻辑读回
-            if let Some(pm) = self.plugins.as_mut() {
-                if let Ok(mut g) = pm.configs.lock() {
-                    let m = g.entry(pname.clone()).or_default();
-                    m.insert("bg_style".to_string(), bg.key().to_string());
-                    // 非默认模式把实际生效的不透明度写回（含把历史 0.00 纠正为默认值），
-                    // 保证卡片滑杆显示值与真实浓度一致
-                    if bg != plugins::BgStyle::Default {
-                        m.insert("bg_alpha".to_string(), format!("{alpha:.2}"));
-                    }
-                }
-                pm.configs_dirty = true;
-            }
-        }
-        if let Some(a) = bg_reapply {
-            // 滑杆即时生效：任一种非默认模式都要重新应用（半透明改的是窗口级均匀 alpha，
-            // 模糊类改的是 DWM 着色 —— 两者都不是主题层每帧自动读取的）
-            self.plugin_bg_opacity = a.clamp(0.0, 1.0);
-            if self.plugin_bg_style != plugins::BgStyle::Default {
-                let style = self.plugin_bg_style;
-                self.apply_bg(style, ctx, a, None); // owner 不变
-            } else {
-                ctx.request_repaint();
-            }
+        if let Some(bg) = bg_cmd {
+            self.apply_bg(bg, ctx);
         }
     }
 }
@@ -14386,8 +12326,7 @@ impl App {
         let mut do_start = false;
         let mut do_close = false;
         let mut open = self.create_server.is_some();
-        let is_light = self.theme_is_light();
-                    let fg = |c: egui::Color32| if is_light { theme::light_adapt(c) } else { c };
+        let fg = |c: egui::Color32| if self.cfg.theme_mode == "light" { theme::light_adapt(c) } else { c };
         if let Some(cs) = self.create_server.as_mut() {
             egui::Window::new("创建新服务器")
                 .collapsible(false)
@@ -14896,13 +12835,11 @@ impl App {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(ctx.style().visuals.panel_fill))
             .show(ctx, |ui| {
-                // 第二批：max-width 1100 左对齐（下载页，ScrollArea 移入容器内）
+                // 第二批：max-width 1100 水平居中（下载页，ScrollArea 移入容器内）
                 let _avail = ui.available_rect_before_wrap();
-                // 左侧留出 14px 内边距：此前内容紧贴侧栏/窗口边缘，文字看起来"贴太近"。
-                let _pad = 14.0f32;
-                let _w = (_avail.width() - _pad).min(1100.0);
+                let _w = _avail.width().min(1100.0);
                 let _centered = egui::Rect::from_min_size(
-                    egui::pos2(_avail.left() + _pad, _avail.top()),
+                    egui::pos2(_avail.center().x - _w * 0.5, _avail.top()),
                     egui::vec2(_w, _avail.height()),
                 );
                 let mut _inner = ui.new_child(
@@ -14913,7 +12850,7 @@ impl App {
                 );
                 _inner.set_width(_w);
                 let ui = &mut _inner;
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.add_space(8.0);
@@ -14938,87 +12875,50 @@ impl App {
 
     /// 图1「自定义下载」标签页：URL + 文件名 + 保存目录 + 线程数 + 开始下载
     fn ui_dl_custom_tab(&mut self, ui: &mut egui::Ui) {
-        let is_light = self.theme_is_light();
-                    let fg = |c: egui::Color32| if is_light { theme::light_adapt(c) } else { c };
+        let fg = |c: egui::Color32| if self.cfg.theme_mode == "light" { theme::light_adapt(c) } else { c };
         let dl = self.dl.as_mut().unwrap();
-        // 两列网格表单（行1：下载地址|文件名；行2：保存目录|线程数）
-        egui::Grid::new("dl_custom_form_grid")
-            .num_columns(4)
-            .spacing([12.0, 10.0])
-            .show(ui, |ui| {
-                ui.label("下载地址");
-                ui.add(
-                    egui::TextEdit::singleline(&mut dl.custom_url)
-                        .hint_text("https://…")
-                        .min_size(egui::vec2(380.0, 26.0)),
-                );
-                ui.label("文件名");
-                ui.add(
-                    egui::TextEdit::singleline(&mut dl.custom_file_name)
-                        .hint_text("如 server.jar")
-                        .min_size(egui::vec2(200.0, 26.0)),
-                );
-                ui.end_row();
-                ui.label("保存目录");
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut dl.custom_dest_dir)
-                            .hint_text("选择保存目录")
-                            .min_size(egui::vec2(260.0, 26.0)),
-                    );
-                    if ui.button("选择目录…").clicked() {
-                        if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                            dl.custom_dest_dir = p.display().to_string();
-                        }
-                    }
-                });
-                ui.label("线程数");
-                ui.add(
-                    egui::TextEdit::singleline(&mut dl.custom_threads)
-                        .min_size(egui::vec2(70.0, 26.0)),
-                );
-                ui.end_row();
-            });
+        ui.horizontal(|ui| {
+            ui.label("下载地址");
+            ui.add(
+                egui::TextEdit::singleline(&mut dl.custom_url)
+                    .hint_text("https://…")
+                    .desired_width(420.0),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("文件名");
+            ui.add(
+                egui::TextEdit::singleline(&mut dl.custom_file_name)
+                    .hint_text("如 server.jar")
+                    .desired_width(220.0),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("保存目录");
+            ui.add(
+                egui::TextEdit::singleline(&mut dl.custom_dest_dir)
+                    .hint_text("选择保存目录")
+                    .desired_width(280.0),
+            );
+            if ui.button("选择目录…").clicked() {
+                if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                    dl.custom_dest_dir = p.display().to_string();
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("线程数");
+            ui.add(egui::TextEdit::singleline(&mut dl.custom_threads).desired_width(80.0));
+        });
         if dl.custom_busy {
-            // 两段式下载行：左侧进度信息区 + 竖分割线 + 右侧固定 200px 操作列
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    let left_w = (ui.available_width() - 212.0).max(140.0);
-                    ui.set_width(left_w);
-                    ui.add(
-                        egui::ProgressBar::new(dl.custom_progress.fraction())
-                            .desired_width(left_w)
-                            .text(format!("{:.1}%", dl.custom_progress.percent())),
-                    );
-                    let (total_txt, done_txt) = match dl.custom_progress.total {
-                        Some(t) => (fmt_size(t), fmt_size(dl.custom_progress.downloaded)),
-                        None => ("未知大小".to_string(), fmt_size(dl.custom_progress.downloaded)),
-                    };
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(format!("阶段: {}", dl.custom_progress.phase))
-                                .size(11.0)
-                                .color(fg(Color32::from_rgb(150, 150, 150))),
-                        );
-                        ui.label(
-                            RichText::new(format!("{done_txt} / {total_txt}"))
-                                .size(11.0)
-                                .color(fg(Color32::from_rgb(150, 150, 150))),
-                        );
-                    });
-                });
-                ui.separator();
-                ui.vertical(|ui| {
-                    ui.set_width(200.0);
-                    let btn = egui::Button::new("📂 打开目录")
-                        .min_size(egui::vec2(96.0, 26.0));
-                    if ui.add(btn).clicked() {
-                        if !dl.custom_dest_dir.trim().is_empty() {
-                            explorer_select(&dl.custom_dest_dir);
-                        }
-                    }
-                });
-            });
+            ui.add(
+                egui::ProgressBar::new(dl.custom_progress.fraction())
+                    .text(format!("{:.1}%", dl.custom_progress.percent())),
+            );
+            ui.label(
+                RichText::new(dl.custom_progress.phase)
+                    .color(fg(Color32::from_rgb(150, 150, 150))),
+            );
         }
         let can_dl = !dl.custom_busy
             && !dl.custom_url.trim().is_empty()
@@ -15038,7 +12938,6 @@ impl App {
         egui::SidePanel::left("dl_comm_nav")
             .resizable(false)
             .exact_width(150.0)
-            .frame(egui::Frame::side_top_panel(&ui.ctx().style()).fill(ui.ctx().style().visuals.window_fill))
             .show_inside(ui, |ui| {
                 ui.add_space(4.0);
                 let nav_items: &[(&str, ModCommunityNav)] = &[
@@ -15124,7 +13023,7 @@ impl App {
         let mut install: Option<String> = None;
         let mut unfav: Option<String> = None;
         let mut detail: Option<modrinth::ModrinthHit> = None;
-        egui::ScrollArea::vertical()
+        egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
             .id_salt("dl_fav_list")
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -15255,26 +13154,23 @@ impl App {
     /// 社区搜索页（图2 主界面：搜索栏 + 两行筛选 + 卡片网格 + 返回顶部）
     fn ui_dl_community_search(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
-        // 过滤栏统一间距（控件间距 8px）
-        ui.style_mut().spacing.item_spacing.y = 8.0;
-        ui.style_mut().spacing.item_spacing.x = 8.0;
-        // 搜索栏（图2 顶部）：放大镜 + Search... + 回车搜索（高 26px）
+        // 搜索区紧凑间距（搜索栏 + 两行筛选）
+        ui.style_mut().spacing.item_spacing.y = 3.0;
+        ui.style_mut().spacing.item_spacing.x = 6.0;
+        // 搜索栏（图2 顶部）：放大镜 + Search... + 回车搜索
         let mut do_search = false;
         ui.horizontal(|ui| {
             ui.label("🔍");
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.dl.as_mut().unwrap().mod_query)
                     .hint_text("Search...")
-                    .min_size(egui::vec2(300.0, 26.0)),
+                    .desired_width(300.0),
             );
             if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 do_search = true;
                 resp.request_focus();
             }
-            if ui
-                .add_sized([64.0, 26.0], egui::Button::new("搜索"))
-                .clicked()
-            {
+            if ui.button("搜索").clicked() {
                 do_search = true;
             }
             if self.dl.as_ref().unwrap().mod_search_busy {
@@ -15288,12 +13184,11 @@ impl App {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(RichText::new("过滤").strong().size(13.0));
-                // 筛选行1：来源 / 标签（下拉选择）/ 排序（控件高 26px）
+                // 筛选行1：来源 / 标签（下拉选择）/ 排序
                 ui.horizontal(|ui| {
                     ui.label("来源");
             egui::ComboBox::from_id_salt("dl_comm_source")
                 .selected_text("Modrinth")
-                .height(26.0)
                 .show_ui(ui, |ui| {
                     ui.selectable_label(true, "Modrinth");
                 });
@@ -15306,7 +13201,6 @@ impl App {
                     tags.as_str()
                 })
                 .width(150.0)
-                .height(26.0)
                 .show_ui(ui, |ui| {
                     for t in modrinth::category_options() {
                         if ui.selectable_label(tags == t, t.clone()).clicked() {
@@ -15330,7 +13224,6 @@ impl App {
                     "updated" => "最近",
                     _ => "默认（相关）",
                 })
-                .height(26.0)
                 .show_ui(ui, |ui| {
                     for (label, val) in [
                         ("默认（相关）", "relevance"),
@@ -15352,19 +13245,18 @@ impl App {
                     }
                 });
         });
-        // 筛选行2：MC 版本 / 加载器 / 目标位置模式（控件高 26px）
+        // 筛选行2：MC 版本 / 加载器 / 目标位置模式
         ui.horizontal(|ui| {
             ui.label("MC 版本");
             ui.add(
                 egui::TextEdit::singleline(&mut self.dl.as_mut().unwrap().mod_mc_version)
                     .hint_text("任意")
-                    .min_size(egui::vec2(110.0, 26.0)),
+                    .desired_width(110.0),
             );
             ui.label("加载器");
             let loader = self.dl.as_ref().unwrap().mod_loader.clone();
             egui::ComboBox::from_id_salt("dl_comm_loader")
                 .selected_text(loader.clone())
-                .height(26.0)
                 .show_ui(ui, |ui| {
                     for l in modrinth::loader_options() {
                         if ui
@@ -15382,8 +13274,7 @@ impl App {
                 // 显示模组数量（1-20）：变更即重搜（回第 1 页）
                 ui.label("显示模组数量");
                 if ui
-                    .add_sized(
-                        [64.0, 26.0],
+                    .add(
                         egui::DragValue::new(&mut self.dl.as_mut().unwrap().mod_page_size)
                             .range(1..=20),
                     )
@@ -15418,14 +13309,14 @@ impl App {
             self.ui_mod_detail_header(ui);
             ui.separator();
             // body：左版本列表 / 右预览，独立滚动
-            egui::ScrollArea::vertical()
+            egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                 .id_salt("dl_detail_body")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     self.ui_mod_detail_body(ui);
                 });
         } else {
-            egui::ScrollArea::vertical()
+            egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                 .id_salt("dl_comm_results")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -15558,8 +13449,6 @@ impl App {
                             if ui.selectable_label(false, n).clicked() {
                                 self.dl.as_mut().unwrap().mod_target_dir =
                                     servers[i].dir.display().to_string();
-                                // 功能优化：选定服务器即**自动套用它识别出的加载器与 MC 版本**
-                                self.apply_platform_from_dir(&servers[i].dir);
                             }
                         }
                     });
@@ -15568,34 +13457,6 @@ impl App {
                         .color(self.fg(Color32::from_rgb(150, 150, 150))),
                 );
             });
-            // 识别结果显示 + 一键重新识别
-            let cur_dir = self
-                .dl
-                .as_ref()
-                .map(|d| d.mod_target_dir.clone())
-                .unwrap_or_default();
-            if !cur_dir.trim().is_empty() {
-                let info = serverinfo::detect(std::path::Path::new(cur_dir.trim()));
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        RichText::new(format!("识别到目标：{}", info.summary()))
-                            .color(self.fg(Color32::from_rgb(120, 200, 255))),
-                    );
-                    if ui
-                        .small_button("重新识别并套用")
-                        .on_hover_text(info.evidence.join("\n"))
-                        .clicked()
-                    {
-                        self.apply_platform_from_dir(std::path::Path::new(cur_dir.trim()));
-                    }
-                    if !info.kind.is_modded() {
-                        ui.label(
-                            RichText::new("该目标不是模组加载器（原版/纯插件端），模组无法加载")
-                                .color(Color32::from_rgb(240, 176, 96)),
-                        );
-                    }
-                });
-            }
         } else {
             ui.horizontal(|ui| {
                 ui.label("安装到");
@@ -15614,23 +13475,6 @@ impl App {
                 );
             });
         }
-    }
-
-    /// 依据目标目录识别服务端平台，并把结果**套用到下载页**（加载器 + MC 版本）。
-    ///
-    /// 只在识别到模组加载器时改加载器；MC 版本识别到就填（原版也能识别版本，
-    /// 便于用户至少把版本选对）。返回识别结果供调用方展示。
-    fn apply_platform_from_dir(&mut self, dir: &Path) -> serverinfo::PlatformInfo {
-        let info = serverinfo::detect(dir);
-        if let Some(dl) = self.dl.as_mut() {
-            if let Some(loader) = info.kind.modrinth_loader() {
-                dl.mod_loader = loader.to_string();
-            }
-            if let Some(v) = &info.mc_version {
-                dl.mod_mc_version = v.clone();
-            }
-        }
-        info
     }
 
     /// 安装模组：取最新版下载地址 -> 归类到目标目录 -> 启动下载
@@ -16640,7 +14484,7 @@ impl App {
             ui.label(RichText::new("暂无记录").color(self.fg(Color32::from_rgb(150, 150, 150))));
             return;
         }
-        egui::ScrollArea::vertical()
+        egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
             .id_salt("dl_log")
             .max_height(160.0)
             .stick_to_bottom(true)
@@ -17605,7 +15449,7 @@ fn show_colored_log(
             },
         );
     }
-    let mut area = egui::ScrollArea::vertical()
+    let mut area = egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
         .id_salt("show_colored_log")
         .auto_shrink([false, false]);
     if let Some(h) = max_height {

@@ -32,7 +32,7 @@ impl ThemeColors {
             panel: Color32::from_rgb(27, 27, 32),
             text: Color32::from_rgb(222, 222, 228),
             weak: Color32::from_rgb(150, 150, 158),
-            accent: Color32::from_rgb(28, 150, 130), // default accent (28,150,130)
+            accent: Color32::from_rgb(34, 211, 238), // #22D3EE
             widget_bg: Color32::from_rgb(60, 60, 64),
             widget_hover: Color32::from_rgb(74, 74, 80),
             widget_active: Color32::from_rgb(52, 52, 58),
@@ -45,9 +45,9 @@ impl ThemeColors {
             bg: Color32::from_rgb(244, 244, 246),
             panel: Color32::from_rgb(255, 255, 255),
             text: Color32::from_rgb(38, 38, 42),
-            // weak: needs >= 4.5:1 on #f4f4f6 (WCAG AA body); gray 95 gives ~5.6:1.
+            // weak 在 #f4f4f6 背景上需 ≥4.5:1（WCAG AA 正文）；95 灰对比度约 5.6:1。
             weak: Color32::from_rgb(95, 95, 103),
-            accent: Color32::from_rgb(45, 75, 65), // light_adapt((28,150,130))
+            accent: Color32::from_rgb(45, 106, 119), // light_adapt(#22D3EE)
             widget_bg: Color32::from_rgb(222, 222, 226),
             widget_hover: Color32::from_rgb(204, 204, 210),
             widget_active: Color32::from_rgb(186, 186, 194),
@@ -94,9 +94,9 @@ impl ThemeColors {
     }
 }
 
-/// Light-mode foreground helper: dims light colors (light gray/tint) designed
-/// for dark backgrounds so they reach WCAG AA body 4.5:1 on light backgrounds
-/// (#f4f4f6 / #ffffff). Dark mode returns the color unchanged.
+/// 亮色模式前景色辅助：把为深色背景设计的浅色前景（浅灰/浅彩）压暗，
+/// 使其在亮色背景（#f4f4f6 / #ffffff 附近）上达到 WCAG AA 正文 4.5:1。
+/// 深色模式下原样返回。
 pub fn light_adapt(c: Color32) -> Color32 {
     let f = |x: u8| ((x as f32 * 0.5).round().max(45.0) as u8);
     Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()))
@@ -116,9 +116,8 @@ pub fn scaled_font(base: f32, ui_font_scale: f32) -> f32 {
 /// Build the target palette from config fields.
 /// - mode: "dark" (night) / "light" (day)
 /// - custom: when enabled, overrides accent + background with user colors
-/// Accent is unified to RGB(28,150,130): dark uses it directly; light goes through
-/// light_adapt to guarantee AA. Green is reserved for "success/running" semantics,
-/// no longer used as a UI accent.
+/// 主强调色统一为 #22D3EE (34,211,238)：深色直接使用；亮色经 light_adapt 压暗保证 AA。
+/// 绿色仅保留给"成功/运行中"等状态语义，不再作为界面强调色。
 pub fn target_colors(
     mode: &str,
     custom: bool,
@@ -140,160 +139,41 @@ pub fn target_colors(
             (custom_bg.2 as f32 * 1.12).round().min(255.0) as u8,
         );
     }
-    // Auto-contrast text: derive text/weak/widget colors from the actual background
-    // luminance so custom backgrounds never leave unreadable text.
-    let bg = c.bg;
-    auto_contrast(&mut c, bg);
     // Reserve the highlight color for future secondary-accent usage (e.g. toast emphasis).
     let _ = custom_highlight;
     c
 }
 
-/// Shift `bg` by `delta` with clamping to 0-255: used to generate contrast widget
-/// colors on *any* background/material. Fixed light/dark grays no longer work — a
-/// fixed gray melts into mid-luminance materials and buttons become invisible
-/// (user feedback: background got translucent but buttons disappeared).
-fn shade(bg: Color32, delta: i32) -> Color32 {
-    let f = |v: u8| (v as i32 + delta).clamp(0, 255) as u8;
-    Color32::from_rgb(f(bg.r()), f(bg.g()), f(bg.b()))
-}
-
-/// Pick readable foreground/control colors from the *actual visible* background
-/// color (threshold ~140 luma).
-/// When background effects (translucent/frosted/acrylic) are active, the real color
-/// under the UI is "desktop texture + tint", not `ThemeColors.bg`; keeping the
-/// theme's light text on a bright desktop becomes unreadable (user feedback).
-/// The caller passes the composited material color; here we decide the foreground
-/// colors and make control bases clearly darker/brighter than the material.
-pub fn auto_contrast(c: &mut ThemeColors, bg: Color32) {
-    let luma = 0.299 * bg.r() as f32 + 0.587 * bg.g() as f32 + 0.114 * bg.b() as f32;
-    // Accent must follow too: custom accents are "bright colors designed for dark
-    // backgrounds" (teal/green); on bright materials they have almost no contrast
-    // (user feedback: "light mode unreadable" partly comes from this). Push the
-    // accent the opposite way by material luminance so it stays visible.
-    let accent_luma = 0.299 * c.accent.r() as f32
-        + 0.587 * c.accent.g() as f32
-        + 0.114 * c.accent.b() as f32;
-    if luma > 140.0 {
-        // Bright background -> dark foreground; controls darker than the bg. Body
-        // text near-black, secondary text also high-contrast ("blurred texture +
-        // small text" is harder to read than a plain background, so go more extreme).
-        c.text = Color32::from_rgb(8, 8, 10);
-        c.weak = Color32::from_rgb(52, 52, 60);
-        c.widget_bg = shade(bg, -58);
-        c.widget_hover = shade(bg, -78);
-        c.widget_active = shade(bg, -96);
-        c.stroke = shade(bg, -84);
-        if accent_luma > 120.0 {
-            c.accent = shade(c.accent, -85);
-        }
-    } else {
-        // Dark background -> light foreground; controls brighter than the bg.
-        c.text = Color32::from_rgb(250, 250, 253);
-        c.weak = Color32::from_rgb(200, 200, 208);
-        c.widget_bg = shade(bg, 36);
-        c.widget_hover = shade(bg, 56);
-        c.widget_active = shade(bg, 20);
-        c.stroke = shade(bg, 74);
-        if accent_luma < 150.0 {
-            c.accent = shade(c.accent, 70);
-        }
-    }
-}
-
 /// Apply the palette + corner radius + background translucency to the current context style.
-/// Returns the window outer-corner radius (points, 0 = sharp) for the caller to apply
-/// via a Win32 system region (SetWindowRgn), the only reliable way to round the
-/// silhouette of a frameless opaque window.
-///
-/// `bg_style` / `overlay_alpha` come from the plugin background request:
-/// * All non-default modes: panel fill alpha = `overlay_alpha` (slider opacity).
-///   The desktop is captured by `backdrop.rs` and painted on the background layer,
-///   so "see-through panels" rely on no OS transparency mechanism.
-/// * `Default`: opaque (or legacy wallpaper route).
 pub fn apply(
     ctx: &egui::Context,
     c: &ThemeColors,
     round_corners: bool,
-    window_round_corners: bool,
     corner_scale: f32,
-    window_corner_scale: f32,
     bg_alpha: f32,
     bg_enabled: bool,
-    bg_style: crate::plugins::BgStyle,
-    overlay_alpha: f32,
-    // Composited visible color of the background material (desktop capture + tint).
-    // Some = effect active: panels fully transparent (material painted on the
-    // background layer) and this color drives the auto light/dark foreground pick
-    // so the UI stays readable on any desktop.
-    material: Option<Color32>,
-    // Whether UI colors follow material luminance (user can disable in plugin page).
-    // When disabled the theme palette is used; the caller then clamps material
-    // intensity to 0.60 lower bound to keep readability.
-    auto_contrast_material: bool,
-    // Content scrim density 0.0-0.6: in material mode the content panel
-    // (CentralPanel) is not fully transparent; it gets a translucent theme-color
-    // backing so text has a stable base (improves small-text readability).
-    content_scrim: f32,
-) -> f32 {
-    use crate::plugins::BgStyle;
-    // When the effect is active, foreground/control colors follow the material's
-    // actual color instead of the theme's own bg.
-    let mut colors = *c;
-    if let Some(m) = material {
-        if auto_contrast_material {
-            auto_contrast(&mut colors, m);
-        }
-    }
-    let c = &colors;
+) {
     ctx.style_mut(|s| {
         let v = &mut s.visuals;
-        // Material mode: content panels get a translucent theme-color backing
-        // (content_scrim, default 0.5) so text has a stable base while the desktop
-        // material stays visible (key to small-text readability; same idea as
-        // Fluent's in-app acrylic tint).
-        // Default mode: original logic (opaque / legacy wallpaper opacity).
-        let panel_alpha = if material.is_some() {
-            (content_scrim.clamp(0.0, 0.6) * 255.0).round() as u8
+        let panel_alpha = if bg_enabled {
+            ((1.0 - bg_alpha.clamp(0.0, 1.0)) * 255.0) as u8
         } else {
-            match bg_style {
-                BgStyle::Acrylic | BgStyle::Frosted | BgStyle::Translucent => {
-                    (overlay_alpha.clamp(0.0, 1.0) * 255.0).round() as u8
-                }
-                BgStyle::Default => {
-                    if bg_enabled {
-                        ((1.0 - bg_alpha.clamp(0.0, 1.0)) * 255.0) as u8
-                    } else {
-                        255
-                    }
-                }
-            }
+            255
         };
         let bg_fill = Color32::from_rgba_unmultiplied(c.bg.r(), c.bg.g(), c.bg.b(), panel_alpha);
-        // NOTE (egui 0.29): SidePanel / TopBottomPanel / CentralPanel default to
-        // `panel_fill` — *not* `window_fill` (only Window / menu / popup use it).
-        // Top bars and side bars rely on `.frame(...)` at each construction site
-        // (see main.rs); in material mode `window_fill` becomes a "near-opaque
-        // material" so side bars/popups share the content palette and auto-contrast
-        // foreground colors hold on both sides.
+        let panel_fill =
+            Color32::from_rgba_unmultiplied(c.panel.r(), c.panel.g(), c.panel.b(), panel_alpha);
         v.panel_fill = bg_fill;
-        v.window_fill = match material {
-            Some(m) => Color32::from_rgba_unmultiplied(m.r(), m.g(), m.b(), 236),
-            None => Color32::from_rgb(c.panel.r(), c.panel.g(), c.panel.b()),
-        };
-        v.extreme_bg_color = match material {
-            Some(m) => Color32::from_rgba_unmultiplied(m.r(), m.g(), m.b(), 240),
-            None => Color32::from_rgb(c.bg.r(), c.bg.g(), c.bg.b()),
-        };
+        v.window_fill = panel_fill;
+        v.extreme_bg_color = bg_fill;
         v.faint_bg_color = c.widget_hover;
         v.override_text_color = Some(c.text);
-        // dark_mode tracks palette luminance: light theme sets false so egui's
-        // built-in controls (scroll bars, selection) render in light mode and the
-        // thumb does not melt into the light background.
+        // dark_mode 标志跟随调色板亮度：亮色主题置 false，使滚动条/选区等 egui 内建控件
+        // 按浅色模式渲染（滚动条槽位/拖拽条不至于融进浅背景）。
         v.dark_mode = c.text.r() > 128;
         v.window_stroke.color = c.stroke;
-        // Light mode uniformly darkens accent-derived text / selection / cursor to
-        // avoid unreadable light accents on light backgrounds (same contrast issue).
+        // 亮色模式统一把"强调色派生"的文字/选区/光标压暗，避免自定义浅色强调色
+        // 在浅背景上不可读（图1 同源对比度问题）。
         let accent_fg = if c.text.r() > 128 {
             c.accent
         } else {
@@ -305,10 +185,9 @@ pub fn apply(
         v.text_cursor.stroke.color = accent_fg;
         // Widget state colors
         v.widgets.noninteractive.bg_fill = c.widget_bg;
-        // In egui 0.29, `.weak()` text color = gray_out(body); weak tinted targets
-        // use widgets.noninteractive.weak_bg_fill. In light mode the default 248
-        // (near-white) makes weak text (group headers / captions) almost invisible
-        // on light backgrounds; pressing to mid-gray reaches AA.
+        // egui 0.29 中 .weak() 文字色 = gray_out(正文色)，混色目标取
+        // widgets.noninteractive.weak_bg_fill。亮色模式下该值默认为 248(近白)，
+        // 导致弱文字(分组标题/说明文字)在浅背景上几乎不可见；压到中灰使其达到 AA。
         v.widgets.noninteractive.weak_bg_fill = if c.text.r() > 128 {
             c.widget_bg
         } else {
@@ -354,24 +233,18 @@ pub fn apply(
         let frame_r = Rounding::same(cr(6.0));
         v.window_rounding = frame_r;
         v.menu_rounding = frame_r;
-        // Batch 2: scroll-bar styling. Solid 8px bars with a neutral handle (widget
-        // bg_fill, not the accent color) so it reads as a traditional scroll bar
-        // rather than an accent decoration line (user feedback: accent line looked
-        // like a non-draggable decoration).
-        let mut scroll = egui::style::ScrollStyle::solid();
+        // Batch 2: scroll-bar enhancement. Floating 8px bars, thumb = accent (via
+        // foreground_color + widget fg_stroke above), semi-transparent when idle,
+        // brightening on hover/drag (opacity ladder dormant -> active -> interact).
+        let mut scroll = egui::style::ScrollStyle::floating();
         scroll.bar_width = 8.0;
         scroll.handle_min_length = 24.0;
+        scroll.dormant_background_opacity = 0.06;
+        scroll.dormant_handle_opacity = 0.35;
+        scroll.active_background_opacity = 0.10;
+        scroll.active_handle_opacity = 0.85;
+        scroll.interact_background_opacity = 0.12;
+        scroll.interact_handle_opacity = 1.0;
         s.spacing.scroll = scroll;
     });
-    // ---- Window outer-corner radius (feedback #2): the frameless window gets its
-    // rounded silhouette from a Win32 system region (SetWindowRgn + CreateRoundRectRgn)
-    // applied by the caller with the returned radius. Painting corner masks on the
-    // Foreground layer cannot work on an opaque window (the mask is the same color as
-    // the background), which is why the previous mask had no visible effect.
-    let r = if window_round_corners {
-        (12.0 * window_corner_scale.clamp(0.0, 3.0)).round().clamp(0.0, 48.0)
-    } else {
-        0.0
-    };
-    r
 }

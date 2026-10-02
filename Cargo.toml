@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "xmst"
 version = "0.1.0-alpha"
 edition = "2021"
@@ -30,7 +30,7 @@ walkdir = "2"
 filetime = "0.2"
 rhai = "1"
 libc = "0.2"
-winapi = { version = "0.3", features = ["winbase", "wincon", "processenv", "handleapi", "synchapi", "fileapi", "namedpipeapi", "processthreadsapi", "errhandlingapi", "winerror", "winnt", "winuser", "tlhelp32", "psapi", "sysinfoapi", "winreg", "iphlpapi", "iprtrmib", "ifmib", "tcpestats", "memoryapi", "winsock2", "ntdef", "minwindef", "libloaderapi", "jobapi2"] }
+winapi = { version = "0.3", features = ["winbase", "wincon", "processenv", "handleapi", "synchapi", "fileapi", "namedpipeapi", "processthreadsapi", "errhandlingapi", "winerror", "winnt", "winuser", "tlhelp32", "psapi", "sysinfoapi", "winreg", "iphlpapi", "iprtrmib", "ifmib", "tcpestats", "memoryapi", "winsock2", "ntdef", "minwindef", "libloaderapi", "jobapi2", "wingdi"] }
 tray-icon = "0.19"
 encoding_rs = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json", "gzip"] }
@@ -47,4 +47,11 @@ embed-resource = "3"
 prost-build = "0.13"
 # prost-build 编译 proto 需要 protoc 二进制；开发机未安装 protoc 时使用 vendored 预编译版
 protoc-bin-vendored = "3"
+
+# 本地补丁版 eframe 0.29.1（vendor\eframe-0.29.1）：
+#   1) 托盘隐藏时不再 Poll 空转（P0 CPU 修复，此前因缺 [patch] 而未进二进制）；
+#   2) 小字号文字自动加 1 物理像素描边（提升模糊材质上的文字可读性，见文档 §11）。
+# 注意：改动后确认构建日志出现 `Compiling eframe v0.29.1 (F:\XMST\vendor\eframe-0.29.1)`。
+[patch.crates-io]
+eframe = { path = "vendor/eframe-0.29.1" }
 
