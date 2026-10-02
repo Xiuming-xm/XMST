@@ -861,6 +861,8 @@ struct DlUiState {
     ver_translate_cache: std::collections::HashMap<String, String>,
     /// 更新日志翻译进行中
     ver_translate_busy: bool,
+    /// 更新日志翻译错误（显示给用户，不再静默）
+    ver_translate_error: Option<String>,
     /// 更新日志翻译线程回传：version_number -> 结果
     ver_translate_shared:
         Option<std::sync::Arc<std::sync::Mutex<Option<(String, Result<String, String>)>>>>,
@@ -964,6 +966,7 @@ impl Default for DlUiState {
             mod_translate_error: None,
             ver_translate_cache: std::collections::HashMap::new(),
             ver_translate_busy: false,
+            ver_translate_error: None,
             ver_translate_shared: None,
             mod_translate_shared: None,
             mod_ver_log_open: None,
@@ -1556,6 +1559,8 @@ struct App {
     tray_cleanup_done: bool,
     /// 崩溃分析结果：(服务器下标, 服务器名, 分析结论)；Some 时自动弹出小窗
     crash_report: Option<(usize, String, crashscan::CrashFinding)>,
+    /// 术语表搜索关键字
+    glossary_query: String,
     /// 日志页：搜索关键字
     log_query: String,
     /// 日志页：级别筛选（全部/信息/警告/错误）
@@ -1907,6 +1912,7 @@ impl App {
             tray_restoring_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tray_cleanup_done: false,
             crash_report: None,
+            glossary_query: String::new(),
             log_query: String::new(),
             log_level: "全部".to_string(),
             log_src: "全部".to_string(),
@@ -4092,6 +4098,30 @@ impl App {
     /// 避免 0xc0000142；只有 spawn 本身失败时才退化为 ShellExecuteW。
     fn open_folder(&self, path: &std::path::Path) {
         use std::process::Stdio;
+        // 去抖：重复点击不再连续拉起 explorer 进程。短时间大量创建 explorer 会耗尽
+        // 「桌面堆」，随后**所有** shell 操作都报 0xc0000142 —— 这正是"很多功能莫名失效"
+        // 的级联现象。
+        {
+            static LAST: std::sync::OnceLock<std::sync::Mutex<Option<std::time::Instant>>> =
+                std::sync::OnceLock::new();
+            let m = LAST.get_or_init(|| std::sync::Mutex::new(None));
+            if let Ok(mut g) = m.lock() {
+                if let Some(t) = *g {
+                    if t.elapsed() < std::time::Duration::from_millis(1200) {
+                        return;
+                    }
+                }
+                *g = Some(std::time::Instant::now());
+            }
+        }
+        if !path.exists() {
+            set_open_error(format!("目录不存在：{}", path.display()));
+            return;
+        }
+        // 首选 ShellExecuteW("explore")：不创建新进程，交给已在运行的资源管理器
+        if shell_explore(path) {
+            return;
+        }
         let ok = std::process::Command::new("explorer.exe")
             .arg(path)
             .stdin(Stdio::null())
@@ -4100,7 +4130,10 @@ impl App {
             .spawn()
             .is_ok();
         if !ok {
-            shell_open(path);
+            set_open_error(format!(
+                "打开目录失败（ShellExecute 与 explorer 都不可用）：{}",
+                path.display()
+            ));
         }
     }
 
@@ -5286,6 +5319,46 @@ fn write_bat_max_restarts(dir: &Path, value: i32) -> Result<String, String> {
         return Ok(p.file_name().unwrap_or_default().to_string_lossy().to_string());
     }
     Err("未找到含 MAX_RESTARTS 的 .bat".to_string())
+}
+
+/// 用资源管理器打开目录（`ShellExecuteW("explore")`，不创建新进程）。成功返回 true。
+/// 记录“打开目录”失败原因（静态槽；open_folder 只需 &self，错误由 update 弹出 toast）。
+fn set_open_error(msg: String) {
+    static SLOT: std::sync::OnceLock<std::sync::Mutex<Option<String>>> = std::sync::OnceLock::new();
+    if let Ok(mut g) = SLOT.get_or_init(|| std::sync::Mutex::new(None)).lock() {
+        *g = Some(msg);
+    }
+}
+
+/// 取出并清空“打开目录”失败信息。
+fn take_open_error() -> Option<String> {
+    static SLOT: std::sync::OnceLock<std::sync::Mutex<Option<String>>> = std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|mut g| g.take())
+}
+fn shell_explore(path: &Path) -> bool {
+    use winapi::um::shellapi::ShellExecuteW;
+    use winapi::um::winuser::SW_SHOWNORMAL;
+    let op: Vec<u16> = "explore\0".encode_utf16().collect();
+    let file: Vec<u16> = path
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let r = ShellExecuteW(
+            std::ptr::null_mut(),
+            op.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        );
+        // ShellExecute 约定：返回值 > 32 表示成功
+        r as isize > 32
+    }
 }
 
 /// 用系统默认关联打开文件/目录（ShellExecuteW，不创建子进程）。
@@ -7146,6 +7219,10 @@ impl eframe::App for App {
         self.ui_bg_editor(ctx);
         // 崩溃分析小窗（服务端异常退出后自动出现）
         self.ui_crash_report(ctx);
+        // “打开目录”失败提示（错误经静态槽从 open_folder 带回）
+        if let Some(e) = take_open_error() {
+            self.set_toast(e);
+        }
     }
 }
 
@@ -13253,21 +13330,64 @@ impl App {
                             // 翻译术语表（模组简介 / 更新日志翻译时优先采用用户译法）
                             let sections = std::mem::take(&mut self.settings_sections);
                             let sections = Self::setting_section(ctx, ui, sections, "glossary", "翻译术语", Some("模组简介与更新日志翻译时按你的译法处理（长词优先匹配）"), true, use_anim, self.cfg.anim_speed, |ui| {
+                                // 导入 / 导出 / 搜索
+                                ui.horizontal(|ui| {
+                                    if ui.button("📥 导入…").on_hover_text("从 JSON 文件导入词条（追加合并）").clicked() {
+                                        if let Some(p) = rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file() {
+                                            if let Ok(s) = std::fs::read_to_string(&p) {
+                                                match serde_json::from_str::<Vec<(String, String)>>(&s) {
+                                                    Ok(v) => {
+                                                        let mut add = 0;
+                                                        for (a, b) in v {
+                                                            if !a.trim().is_empty() && !self.cfg.translate_glossary.iter().any(|(x, _)| x == &a) {
+                                                                self.cfg.translate_glossary.push((a, b));
+                                                                add += 1;
+                                                            }
+                                                        }
+                                                        self.save_config();
+                                                        self.set_toast(format!("已导入 {add} 条词条"));
+                                                    }
+                                                    Err(e) => self.set_toast(format!("导入失败：JSON 应为 [[\"原文\",\"译法\"], …]（{e}）")),
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if ui.button("📤 导出…").clicked() {
+                                        if let Some(p) = rfd::FileDialog::new().set_file_name("xmst_glossary.json").save_file() {
+                                            match serde_json::to_string_pretty(&self.cfg.translate_glossary) {
+                                                Ok(s) => match std::fs::write(&p, s) {
+                                                    Ok(_) => self.set_toast(format!("已导出到 {}", p.display())),
+                                                    Err(e) => self.set_toast(format!("导出失败：{e}")),
+                                                },
+                                                Err(e) => self.set_toast(format!("序列化失败：{e}")),
+                                            }
+                                        }
+                                    }
+                                    ui.label("搜索");
+                                    ui.add(egui::TextEdit::singleline(&mut self.glossary_query).hint_text("筛选词条…").desired_width(160.0));
+                                });
                                 let mut remove: Option<usize> = None;
                                 let mut edited = false;
                                 let n = self.cfg.translate_glossary.len();
+                                let q = self.glossary_query.trim().to_lowercase();
                                 for i in 0..n {
+                                    if !q.is_empty() {
+                                        let (a, b) = &self.cfg.translate_glossary[i];
+                                        if !a.to_lowercase().contains(&q) && !b.to_lowercase().contains(&q) {
+                                            continue;
+                                        }
+                                    }
                                     ui.horizontal(|ui| {
                                         let (mut a, mut b) = self.cfg.translate_glossary[i].clone();
                                         let ra = ui.add(
                                             egui::TextEdit::singleline(&mut a)
-                                                .hint_text("原文，如 Create")
+                                                .hint_text(egui::RichText::new("原文，如 Create").color(self.theme_cur.weak.gamma_multiply(0.55)))
                                                 .desired_width(200.0),
                                         );
                                         ui.label("→");
                                         let rb = ui.add(
                                             egui::TextEdit::singleline(&mut b)
-                                                .hint_text("译法，如 创建")
+                                                .hint_text(egui::RichText::new("译法，如 机械动力").color(self.theme_cur.weak.gamma_multiply(0.55)))
                                                 .desired_width(200.0),
                                         );
                                         if ui.button("🗑").on_hover_text("删除该词条").clicked() {
@@ -13295,11 +13415,6 @@ impl App {
                                         self.cfg.translate_glossary.clear();
                                         edited = true;
                                     }
-                                    ui.label(
-                                        RichText::new("例：Fabric API → Fabric 前置库；Create → 机械动力")
-                                            .weak()
-                                            .small(),
-                                    );
                                 });
                                 if edited {
                                     self.save_config();
@@ -15148,6 +15263,7 @@ impl App {
                         }
                         Err(e) => {
                             dl.dl_log.push(format!("更新日志翻译失败: {e}"));
+                            dl.ver_translate_error = Some(e);
                         }
                     }
                     dl.ver_translate_busy = false;
@@ -17468,6 +17584,13 @@ impl App {
                         }
                     }
                 });
+                if let Some(err) = self.dl.as_ref().and_then(|d| d.ver_translate_error.clone()) {
+                    ui.label(
+                        RichText::new(format!("翻译失败：{err}"))
+                            .small()
+                            .color(Color32::from_rgb(235, 120, 120)),
+                    );
+                }
                 if cl.is_empty() {
                     ui.label(
                         RichText::new("该版本无更新日志")
