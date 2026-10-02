@@ -6488,10 +6488,17 @@ impl eframe::App for App {
                         if min_btn.clicked() {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                         }
-                        // 主题切换（日/夜/自定义配色三态轮转）：按当前 mode 显示对应图标；
-                        // 点击依次切换 light -> dark -> custom -> light。
+                        // 主题切换（日/夜/自定义三态轮转）。
+                        // 图标重画：太阳=实心圆+八条短光线（更细更匀），月亮=真·新月（外圆内切偏移圆的多边形），
+                        // 不再用"亮圆 + 深色圆覆盖"（在浅色顶栏上会露出一个突兀的深色圆斑）。
+                        // 切换动效：日/夜两枚图标按 animate_bool 交叉淡入淡出，并带一点旋转与缩放。
                         let is_light_theme = self.cfg.theme_mode == "light";
                         let is_custom_theme = self.cfg.theme_mode == "custom";
+                        let dark_t = ctx.animate_bool_with_time(
+                            ui.id().with("theme_icon_dark"),
+                            !is_light_theme && !is_custom_theme,
+                            if self.cfg.ui_animations { 0.25 } else { 0.0 },
+                        );
                         let theme_btn = titlebar_button(
                             ui,
                             "title_theme",
@@ -6504,20 +6511,51 @@ impl eframe::App for App {
                                     p.circle_filled(m + egui::vec2(-5.0, 2.6), 2.6, Color32::from_rgb(28, 150, 130));
                                     p.circle_filled(m, 2.6, Color32::from_rgb(235, 120, 60));
                                     p.circle_filled(m + egui::vec2(5.0, 2.6), 2.6, Color32::from_rgb(90, 140, 235));
-                                } else if is_light_theme {
-                                    // 太阳：实心圆 + 八条光线
-                                    p.circle_filled(m, 3.6, ic);
-                                    for ang in [0.0f32, 0.7854, 1.5708, 2.3562, 3.1416, 3.9270, 4.7124, 5.4978] {
-                                        let d = egui::Vec2::angled(ang) * 7.2;
-                                        p.line_segment(
-                                            [m + d, m + d * 1.62],
-                                            egui::Stroke::new(1.4, ic),
-                                        );
-                                    }
                                 } else {
-                                    // 月亮：新月（亮圆 + 覆盖暗圆）
-                                    p.circle_filled(m + egui::vec2(-1.8, -1.2), 4.4, ic);
-                                    p.circle_filled(m + egui::vec2(0.2, 0.6), 3.8, Color32::from_rgb(58, 66, 84));
+                                    // 交叉淡入淡出：dark_t=0 → 太阳；dark_t=1 → 月亮
+                                    let sun_a = (1.0 - dark_t).clamp(0.0, 1.0);
+                                    let moon_a = dark_t.clamp(0.0, 1.0);
+                                    if sun_a > 0.01 {
+                                        let col = ic.gamma_multiply(sun_a);
+                                        let scale = 0.8 + 0.2 * sun_a;
+                                        p.circle_filled(m, 3.4 * scale, col);
+                                        for k in 0..8 {
+                                            let ang = k as f32 * std::f32::consts::TAU / 8.0
+                                                + (1.0 - sun_a) * 0.6;
+                                            let d = egui::Vec2::angled(ang) * (6.6 * scale);
+                                            p.line_segment(
+                                                [m + d, m + d * 1.42],
+                                                egui::Stroke::new(1.3, col),
+                                            );
+                                        }
+                                    }
+                                    if moon_a > 0.01 {
+                                        let col = ic.gamma_multiply(moon_a);
+                                        // 新月 = 外圆 + 内切偏移圆构成的多边形（真·月牙，不用覆盖圆）
+                                        let r = 5.0f32;
+                                        let dx = 2.6f32;
+                                        let dy = -1.2f32;
+                                        let mut pts: Vec<egui::Pos2> = Vec::with_capacity(48);
+                                        // 外圆：从 -90° 顺时针到 90°（右侧弧）
+                                        for i in 0..=24 {
+                                            let a = -std::f32::consts::FRAC_PI_2
+                                                + std::f32::consts::PI * (i as f32 / 24.0);
+                                            pts.push(m + egui::vec2(a.cos() * r, a.sin() * r));
+                                        }
+                                        // 内圆：从 90° 回到 -90°（左侧弧，圆心偏移形成月牙）
+                                        for i in 0..=24 {
+                                            let a = std::f32::consts::FRAC_PI_2
+                                                - std::f32::consts::PI * (i as f32 / 24.0);
+                                            pts.push(
+                                                m + egui::vec2(dx + a.cos() * r * 0.86, dy + a.sin() * r * 0.86),
+                                            );
+                                        }
+                                        p.add(egui::Shape::convex_polygon(
+                                            pts,
+                                            col,
+                                            egui::Stroke::NONE,
+                                        ));
+                                    }
                                 }
                             },
                         );
@@ -11169,11 +11207,11 @@ impl App {
                     let (resp, painter) =
                         ui.allocate_painter(egui::vec2(chart_w, chart_h), egui::Sense::hover());
                     let rect = resp.rect;
-                    painter.rect_filled(rect, 4.0, Color32::from_rgb(26, 29, 34));
+                    painter.rect_filled(rect, 4.0, self.theme_cur.widget_bg);
                     painter.rect_stroke(
                         rect,
                         4.0,
-                        egui::Stroke::new(1.0_f32, Color32::from_rgb(45, 56, 48)),
+                        egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
                     );
                     if running && hist_in.len() >= 2 {
                         let plot = rect.shrink(3.0);
@@ -11626,7 +11664,7 @@ impl App {
                             let dtxt = dtxt.clone();
                             ui.add_space(4.0);
                             egui::Frame::group(ui.style())
-                                .fill(Color32::from_rgb(30, 32, 38))
+                                .fill(self.theme_cur.widget_bg)
                                 .show(ui, |ui| {
                                     ui.label(RichText::new("🩺 流量诊断").strong().small().color(Color32::from_rgb(220, 224, 232)));
                                     ui.label(RichText::new(dtxt).monospace().size(11.0).color(Color32::from_rgb(200, 205, 215)));
@@ -11655,11 +11693,11 @@ impl App {
                                 egui::Sense::hover(),
                             );
                             let rect = resp.rect;
-                            painter.rect_filled(rect, 4.0, Color32::from_rgb(26, 29, 34));
+                            painter.rect_filled(rect, 4.0, self.theme_cur.widget_bg);
                             painter.rect_stroke(
                                 rect,
                                 4.0,
-                                egui::Stroke::new(1.0_f32, Color32::from_rgb(45, 56, 48)),
+                                egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
                             );
                             if running && hist_in.len() >= 2 {
                                 let plot = rect.shrink(3.0);
@@ -13081,25 +13119,17 @@ impl App {
                                     // 高风险操作：与其它按钮同一行、同一高度对齐；
                                     // 只用红色文字表达风险，不再套一个突兀的红框（用户反馈）。
                                     let risk_red = self.fg(Color32::from_rgb(230, 120, 120));
+                                    // 三个按钮统一用默认按钮尺寸（此前两个大按钮 add_sized 显得"一小两大"）
                                     if ui
-                                        .add_sized(
-                                            [280.0, 26.0],
-                                            egui::Button::new(
-                                                RichText::new("⚠ 完全禁用 Defender 实时保护（风险）")
-                                                    .color(risk_red),
-                                            ),
+                                        .button(
+                                            RichText::new("⚠ 完全禁用 Defender 实时保护（风险）")
+                                                .color(risk_red),
                                         )
                                         .clicked()
                                     {
                                         self.confirm_defender_disable = true;
                                     }
-                                    if ui
-                                        .add_sized(
-                                            [220.0, 26.0],
-                                            egui::Button::new("打开 Windows 安全中心"),
-                                        )
-                                        .clicked()
-                                    {
+                                    if ui.button("打开 Windows 安全中心").clicked() {
                                         // explorer.exe 打开 URI 比 cmd start windowsdefender: 更稳（修复弹错误框）
                                         let opened = std::process::Command::new("explorer.exe")
                                             .arg("windowsdefender:")
@@ -17538,8 +17568,9 @@ fn show_perf_bar(ui: &mut egui::Ui, rt: &ServerRuntime, running: bool) {
     let (resp, painter) =
         ui.allocate_painter(egui::vec2(ui.available_width(), h), egui::Sense::hover());
     let rect = resp.rect;
-    painter.rect_filled(rect, 6.0, Color32::from_rgb(26, 29, 34));
-    painter.rect_stroke(rect, 6.0, egui::Stroke::new(1.0_f32, Color32::from_rgb(45, 56, 48)));
+    let card = ui.visuals().widgets.noninteractive.bg_fill;
+    painter.rect_filled(rect, 6.0, card);
+    painter.rect_stroke(rect, 6.0, egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color));
     painter.text(
         egui::pos2(rect.left() + 12.0, rect.top() + 9.0),
         egui::Align2::LEFT_TOP,
@@ -17550,14 +17581,14 @@ fn show_perf_bar(ui: &mut egui::Ui, rt: &ServerRuntime, running: bool) {
             mem
         ),
         egui::FontId::proportional(13.0),
-        Color32::from_rgb(200, 210, 220),
+        ui.visuals().text_color(),
     );
     if running && rt.perf.samples.len() >= 2 {
         let plot = egui::Rect::from_min_max(
             egui::pos2(rect.left() + 10.0, rect.top() + 34.0),
             egui::pos2(rect.right() - 10.0, rect.bottom() - 28.0),
         );
-        painter.rect_filled(plot, 3.0, Color32::from_rgb(20, 22, 26));
+        painter.rect_filled(plot, 3.0, ui.visuals().extreme_bg_color);
         let samples: Vec<(f32, f32)> = rt
             .perf
             .samples
@@ -17576,7 +17607,7 @@ fn show_perf_bar(ui: &mut egui::Ui, rt: &ServerRuntime, running: bool) {
             let y = plot.top() + (plot.height() * k as f32 / 3.0_f32);
             painter.line_segment(
                 [egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)],
-                egui::Stroke::new(1.0_f32, Color32::from_rgb(40, 44, 50)),
+                egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
             );
         }
         let cpu_pts: Vec<egui::Pos2> = samples
