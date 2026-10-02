@@ -30,6 +30,8 @@ pub struct Cause {
     pub evidence: Vec<String>,
     /// 建议查看/修改的文件或目录（相对服务器目录）；Some 时弹窗给出跳转按钮
     pub path: Option<String>,
+    /// 该文件内容不是合法 JSON（极可能就是崩溃元凶，UI 会特别标注）
+    pub path_broken: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -290,6 +292,7 @@ pub fn analyze(dir: &Path) -> Option<CrashFinding> {
                         advice,
                         evidence: vec![exc.clone()],
                     path: None,
+                    path_broken: false,
                     },
                 );
                 if suspects.is_empty() {
@@ -303,6 +306,7 @@ pub fn analyze(dir: &Path) -> Option<CrashFinding> {
                                 .to_string(),
                             evidence: vec![],
                             path: None,
+                            path_broken: false,
                         },
                     );
                 }
@@ -340,6 +344,7 @@ pub fn analyze(dir: &Path) -> Option<CrashFinding> {
                             .to_string(),
                         evidence: vec![truncate(l)],
                         path: None,
+                        path_broken: false,
                     },
                 );
             }
@@ -357,6 +362,7 @@ pub fn analyze(dir: &Path) -> Option<CrashFinding> {
                             .to_string(),
                         evidence: vec![truncate(l)],
                         path: None,
+                        path_broken: false,
                     },
                 );
             }
@@ -372,6 +378,7 @@ pub fn analyze(dir: &Path) -> Option<CrashFinding> {
                             .to_string(),
                         evidence: vec![truncate(l)],
                         path: None,
+                        path_broken: false,
                     },
                 );
             }
@@ -387,6 +394,7 @@ pub fn analyze(dir: &Path) -> Option<CrashFinding> {
                             .to_string(),
                         evidence: vec![truncate(l)],
                         path: Some("server.properties".to_string()),
+                        path_broken: false,
                     },
                 );
             }
@@ -405,6 +413,7 @@ pub fn analyze(dir: &Path) -> Option<CrashFinding> {
                             .to_string(),
                         evidence: vec![truncate(l)],
                         path: None,
+                        path_broken: false,
                     },
                 );
             }
@@ -418,6 +427,7 @@ pub fn analyze(dir: &Path) -> Option<CrashFinding> {
                             .to_string(),
                         evidence: vec![truncate(l)],
                         path: Some("eula.txt".to_string()),
+                        path_broken: false,
                     },
                 );
             }
@@ -431,6 +441,7 @@ pub fn analyze(dir: &Path) -> Option<CrashFinding> {
                         advice: "删除 mods 下多余的旧版本 jar（`.mcsrv_trash` 里可找回）。".to_string(),
                         evidence: vec![truncate(l)],
                         path: None,
+                        path_broken: false,
                     },
                 );
             }
@@ -448,6 +459,7 @@ pub fn analyze(dir: &Path) -> Option<CrashFinding> {
                             .to_string(),
                         evidence: vec![truncate(l)],
                         path: None,
+                        path_broken: false,
                     },
                 );
             }
@@ -460,6 +472,7 @@ pub fn analyze(dir: &Path) -> Option<CrashFinding> {
                         advice: "换回原来的服务端版本，或从备份恢复 world（.mcsrv_backups）。".to_string(),
                         evidence: vec![truncate(l)],
                         path: None,
+                        path_broken: false,
                     },
                 );
             }
@@ -477,27 +490,36 @@ pub fn analyze(dir: &Path) -> Option<CrashFinding> {
             break; // 只用最相关的一份来源
         }
     }
-    // 为每条结论补充"建议查看的文件/目录"（用户可直接跳过去改）：
-    // 有 suspects 时在 config/ 下按模组 id 模糊找同名文件或目录。
+    // 为每条结论补充"建议查看的数据文件"（用户可直接跳过去改）。
+    // 搜索范围不止 config/：carpet 系列等模组把服务端设置放在 **world/** 下，
+    // 也有模组直接写在服务器根目录，所以按 config → world → 根目录 → defaultconfigs 依次找。
     if !finding.causes.is_empty() {
         for c in finding.causes.iter_mut() {
             if c.path.is_some() {
                 continue;
             }
-            for s in &c.suspects {
-                // 友好名形如 "Carpet Ayaka Addition（carpet-ayaka-addition）"，取括号里的 id
-                let id = s
-                    .rsplit_once('（')
-                    .map(|(_, r)| r.trim_end_matches('）').to_string())
-                    .unwrap_or_else(|| s.clone());
-                if let Some(p) = find_config_for(dir, &id) {
-                    c.path = Some(p);
-                    break;
+            let ids: Vec<String> = c
+                .suspects
+                .iter()
+                .map(|s| {
+                    s.rsplit_once('（')
+                        .map(|(_, r)| r.trim_end_matches('）').to_string())
+                        .unwrap_or_else(|| s.clone())
+                })
+                .collect();
+            if let Some((rel, broken)) = find_data_file(dir, &ids) {
+                c.path = Some(rel);
+                c.path_broken = broken;
+            } else if c.title.contains("json")
+                || c.title.contains("配置")
+                || c.title.to_lowercase().contains("json")
+            {
+                // 名字对不上时，退一步做**内容级**排查：JSON 配置损坏类崩溃，
+                // 直接把"解析失败的那个 json"找出来报给用户（比猜文件名可靠得多）。
+                if let Some(rel) = find_broken_json(dir) {
+                    c.path = Some(rel);
+                    c.path_broken = true;
                 }
-            }
-            // 一个都没匹配到：至少指向 config/ 目录
-            if c.path.is_none() && dir.join("config").is_dir() {
-                c.path = Some("config".to_string());
             }
         }
     }
@@ -649,4 +671,169 @@ fn first_exception(text: &str, map: &HashMap<String, String>) -> Option<(String,
         }
     }
     exc_line.map(|e| (e, suspects))
+}
+
+/// 在多个可能的位置查找与模组相关的数据文件，返回 (相对路径, 内容是否不是合法 JSON)。
+///
+/// 搜索顺序（先找到先用，都是"与模组 id 强匹配"才算命中）：
+///   `config/`（含一层子目录）→ `world/`（含一层子目录）→ 服务器根目录 → `defaultconfigs/`
+///
+/// 匹配规则（旧实现用 `contains` 导致 "carpet" 命中了 "antideath-carpet-addition" 这类误报）：
+/// * 归一化后**完全相等** → 最高分；
+/// * 一方是另一方的前缀，且长度比 ≥ 0.75 → 次之；
+/// * 其余一律不算命中（宁可回退到目录，也不要指错文件）。
+/// 另外：如果候选文件本身**解析 JSON 失败**，说明它极可能就是元凶（配置损坏类崩溃），
+/// 会被优先选中并在 UI 上标注。
+fn find_data_file(dir: &Path, mod_ids: &[String]) -> Option<(String, bool)> {
+    let keys: Vec<String> = mod_ids
+        .iter()
+        .map(|s| norm(s))
+        .filter(|k| k.len() >= 4)
+        .collect();
+    if keys.is_empty() {
+        return None;
+    }
+    let mut best: Option<(f32, String, bool)> = None;
+    let mut consider = |p: &Path, best: &mut Option<(f32, String, bool)>| {
+        let Some(name) = p.file_name().map(|n| n.to_string_lossy().to_string()) else {
+            return;
+        };
+        let stem = name
+            .trim_end_matches(".json")
+            .trim_end_matches(".toml")
+            .trim_end_matches(".properties")
+            .to_string();
+        let n = norm(&stem);
+        if n.len() < 4 {
+            return;
+        }
+        let mut score = 0.0f32;
+        for k in &keys {
+            // 短/通用 id（如 "carpet"）只接受**完全相等**：否则会把
+            // antideath-carpet-addition 这类"名字里恰好含 carpet"的无关模组错认成目标
+            // （用户实测到的错误跳转就是它）。
+            if k.len() < 10 && n != *k {
+                continue;
+            }
+            if n == *k {
+                score = score.max(1.0 + (k.len() as f32) * 0.01);
+            } else if n.starts_with(k.as_str()) || k.starts_with(n.as_str()) {
+                let ratio = (n.len().min(k.len()) as f32) / (n.len().max(k.len()) as f32);
+                if ratio >= 0.75 {
+                    score = score.max(0.6 + 0.3 * ratio + (k.len() as f32) * 0.01);
+                }
+            }
+        }
+        if score <= 0.0 {
+            return;
+        }
+        // 内容不是合法 JSON → 加权（配置损坏类崩溃的第一嫌疑）
+        let broken = p.extension().map(|e| e == "json").unwrap_or(false) && json_is_broken(p);
+        if broken {
+            score += 0.5;
+        }
+        let rel = p
+            .strip_prefix(dir)
+            .map(|r| r.to_string_lossy().to_string())
+            .unwrap_or(name);
+        if best.as_ref().map(|(s, _, _)| score > *s).unwrap_or(true) {
+            *best = Some((score, rel, broken));
+        }
+    };
+    for root in ["config", "world", "defaultconfigs", "."] {
+        let base = dir.join(root);
+        let Ok(rd) = std::fs::read_dir(&base) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            consider(&p, &mut best);
+            if p.is_dir() {
+                if let Ok(rd2) = std::fs::read_dir(&p) {
+                    for e2 in rd2.flatten() {
+                        consider(&e2.path(), &mut best);
+                    }
+                }
+            }
+        }
+        // 命中且是"坏文件"就不必继续找别的根目录了
+        if best.as_ref().map(|(_, _, b)| *b).unwrap_or(false) {
+            break;
+        }
+    }
+    best.map(|(_, rel, broken)| (rel, broken))
+}
+
+/// 尝试把文件当 JSON 解析；失败返回 true（空文件也算"坏"——实测空配置同样会导致模组崩溃）。
+fn json_is_broken(p: &Path) -> bool {
+    let Ok(s) = std::fs::read_to_string(p) else {
+        return false;
+    };
+    let t = s.trim();
+    if t.is_empty() {
+        return true;
+    }
+    serde_json::from_str::<serde_json::Value>(t).is_err()
+}
+
+/// 扫描 config/、world/（一层）、根目录下的 *.json，返回**第一个解析失败**的相对路径。
+///
+/// 用于"配置损坏"类崩溃的兜底：即使文件名与模组 id 对不上，坏掉的那个 json 也能被找出来。
+/// 空文件同样算坏（实测空配置也会让模组崩溃）。
+fn find_broken_json(dir: &Path) -> Option<String> {
+    let mut checked = 0;
+    // 只扫"模组配置文件该在的地方"：config/（含一层子目录）、世界目录**顶层**
+    // （Carpet 等把服务端设置写在 world/ 下，如 world/carpet.conf）、服务器根目录。
+    // 故意**不**深入 world/ 子目录 —— 那里是存档数据（advancements/playerdata/stats），
+    // 它们的 json 损坏与模组启动崩溃无关，误报会把人带偏（实测踩过）。
+    for (root, recurse) in [("config", true), ("world", false), (".", false)] {
+        let base = dir.join(root);
+        let Ok(rd) = std::fs::read_dir(&base) else {
+            continue;
+        };
+        let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if recurse {
+                    dirs.push(p);
+                }
+                continue;
+            }
+            if p.extension().map(|x| x == "json").unwrap_or(false) {
+                checked += 1;
+                if checked > 400 {
+                    return None;
+                }
+                if json_is_broken(&p) {
+                    return Some(
+                        p.strip_prefix(dir)
+                            .map(|r| r.to_string_lossy().to_string())
+                            .unwrap_or_else(|_| p.display().to_string()),
+                    );
+                }
+            }
+        }
+        for d in dirs {
+            if let Ok(rd2) = std::fs::read_dir(&d) {
+                for e2 in rd2.flatten() {
+                    let p = e2.path();
+                    if p.is_file() && p.extension().map(|x| x == "json").unwrap_or(false) {
+                        checked += 1;
+                        if checked > 400 {
+                            return None;
+                        }
+                        if json_is_broken(&p) {
+                            return Some(
+                                p.strip_prefix(dir)
+                                    .map(|r| r.to_string_lossy().to_string())
+                                    .unwrap_or_else(|_| p.display().to_string()),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }

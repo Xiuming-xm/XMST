@@ -5293,6 +5293,12 @@ fn main() -> eframe::Result {
                         println!("  涉及：{}", c.suspects.join("、"));
                     }
                     println!("  建议：{}", c.advice);
+                    if let Some(p) = &c.path {
+                        println!(
+                            "  跳转：{p}{}",
+                            if c.path_broken { "（内容不是合法 JSON）" } else { "" }
+                        );
+                    }
                     for e in &c.evidence {
                         println!("  证据：{}", e);
                     }
@@ -12058,17 +12064,21 @@ impl App {
         let last_h = sections[idx].last_h.max(8.0);
         let max_h = anim * last_h;
         let mut content_h = 0.0_f32;
-        // 动画期间隐藏滚动条：ScrollArea 的高度在逐帧变化，滚动条会跟着闪/抖，
-        // 观感上就不如隧道管理页顺滑（那里没有滚动条参与布局）。
-        egui::ScrollArea::vertical()
-            .id_salt(("setting_section", id))
-            .max_height(max_h)
-            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                add(ui);
-                content_h = ui.min_rect().height();
-            });
+        // ★ 用与 egui 内建 `CollapsingHeader` 完全相同的做法（分配 + 裁剪子 UI），
+        // 不再用 ScrollArea —— ScrollArea 会随高度变化反复重排内容并参与滚动条布局，
+        // 这正是"设置折叠始终卡一下、不如隧道管理那边顺滑"的原因。
+        let (body_rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), max_h),
+            egui::Sense::hover(),
+        );
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(body_rect)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        child.set_clip_rect(body_rect.intersect(ui.clip_rect()));
+        add(&mut child);
+        content_h = child.min_rect().height();
         // ★ 折叠"卡一下"的根因：动画期间 `content_h` 取到的是**被 max_height 裁剪后**的高度，
         // 若把它写回 last_h，下一帧的动画目标就变小，于是目标逐帧缩水 → 展开过程一顿一顿。
         // 只在"完全展开"时记录真实内容高度（或首次未知时取一次）。
@@ -15978,14 +15988,40 @@ impl App {
                                         .get(idx)
                                         .map(|s| s.dir.join(rel))
                                         .unwrap_or_default();
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label(
                                             RichText::new(format!("📄 {rel}"))
                                                 .small()
                                                 .color(self.fg(Color32::from_rgb(120, 200, 255))),
                                         );
+                                        if c.path_broken {
+                                            ui.label(
+                                                RichText::new("（内容不是合法 JSON，极可能就是它）")
+                                                    .small()
+                                                    .color(Color32::from_rgb(255, 120, 120)),
+                                            );
+                                        } else if !full.exists() {
+                                            ui.label(
+                                                RichText::new("（文件不存在，可能是同级目录/文件名不同）")
+                                                    .small()
+                                                    .weak(),
+                                            );
+                                        }
                                         if ui.button("跳转到该位置").clicked() {
-                                            reveal_in_explorer(&full);
+                                            if full.exists() {
+                                                reveal_in_explorer(&full);
+                                            } else {
+                                                // 文件不存在时打开它的上一级目录，避免"跳转无效"
+                                                let parent = full
+                                                    .parent()
+                                                    .map(|p| p.to_path_buf())
+                                                    .unwrap_or_default();
+                                                self.open_folder(&parent);
+                                            }
+                                        }
+                                        if ui.button("复制路径").clicked() {
+                                            ctx.copy_text(full.display().to_string());
+                                            self.set_toast("路径已复制".to_string());
                                         }
                                     });
                                 }
@@ -16001,7 +16037,25 @@ impl App {
                     }
                 }
                 ui.separator();
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("📂 打开 config 目录").clicked() {
+                        if let Some(s) = self.cfg.servers.get(idx) {
+                            self.open_folder(&s.dir.join("config"));
+                        }
+                    }
+                    // 模组服务端设置也常放在 world/ 下（如 Carpet 系），或直接写在根目录
+                    if ui.button("📂 打开 world 目录").clicked() {
+                        if let Some(s) = self.cfg.servers.get(idx) {
+                            self.open_folder(&s.dir.join("world"));
+                        }
+                    }
+                    if ui.button("📂 打开服务器根目录").clicked() {
+                        if let Some(s) = self.cfg.servers.get(idx) {
+                            self.open_folder(&s.dir);
+                        }
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
                     if ui.button("📂 打开日志目录").clicked() {
                         if let Some(s) = self.cfg.servers.get(idx) {
                             self.open_folder(&s.dir.join("logs"));
