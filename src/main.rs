@@ -3345,7 +3345,7 @@ impl App {
                     );
                     match std::process::Command::new("powershell")
                         .args(["-NoProfile", "-Command", &ps])
-                        .creation_flags(0x08000000).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+                        .current_dir(sane_cwd()).creation_flags(0x08000000).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
                         .stdin(std::process::Stdio::null())
                         .output()
                     {
@@ -3592,7 +3592,7 @@ impl App {
                 let local = frp_local_version(&frp_dir).ok_or("未找到 frpc.exe，无法检查版本")?;
                 let script = "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; (Invoke-RestMethod -Uri 'https://api.github.com/repos/fatedier/frp/releases/latest' -UseBasicParsing -Headers @{'User-Agent'='XMST'}).tag_name";
                 let out = std::process::Command::new("powershell")
-                    .creation_flags(0x0800_0000).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+                    .current_dir(sane_cwd()).creation_flags(0x0800_0000).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
                     .args(["-NoProfile", "-NonInteractive", "-Command", script])
                     .output()
                     .map_err(|e| e.to_string())?;
@@ -4080,6 +4080,7 @@ impl App {
         let ok = std::process::Command::new("explorer.exe")
             .arg("/select,")
             .arg(&p)
+            .current_dir(sane_cwd())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -4126,7 +4127,8 @@ impl App {
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             let mut c = std::process::Command::new("cmd");
             c.args(["/C", "start", "", &path.to_string_lossy()])
-                .creation_flags(CREATE_NO_WINDOW)
+                .current_dir(sane_cwd())
+                .current_dir(sane_cwd()).creation_flags(CREATE_NO_WINDOW)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
@@ -4141,6 +4143,7 @@ impl App {
         // ③ explorer.exe 直接打开
         let ok = std::process::Command::new("explorer.exe")
             .arg(path)
+            .current_dir(sane_cwd())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -4930,7 +4933,7 @@ $timer.Start(); \
         );
         let encoded = utf16le_b64(&script);
         let _ = std::process::Command::new("powershell")
-            .creation_flags(0x0800_0000).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .current_dir(sane_cwd()).creation_flags(0x0800_0000).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
             .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", &encoded])
             .spawn();
     }
@@ -5338,8 +5341,60 @@ fn write_bat_max_restarts(dir: &Path, value: i32) -> Result<String, String> {
     Err("未找到含 MAX_RESTARTS 的 .bat".to_string())
 }
 
+/// ShellExecuteW("open", 任意字符串：文件/目录/URL)。返回是否成功。
+fn shell_open_str(s: &str) -> bool {
+    use winapi::um::shellapi::ShellExecuteW;
+    use winapi::um::winuser::SW_SHOWNORMAL;
+    let op: Vec<u16> = "open\0".encode_utf16().collect();
+    let file: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let r = ShellExecuteW(
+            std::ptr::null_mut(),
+            op.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        );
+        r as isize > 32
+    }
+}
+
+/// 用系统默认浏览器打开网址。
+/// ★ 优先 ShellExecuteW：**不创建子进程**，因此不会出现 cmd 黑框一闪（用户反馈）。
+/// 仅在 ShellExecute 失败时才退化为 cmd（带 CREATE_NO_WINDOW，同样不闪框）。
+fn open_url(url: &str) {
+    if shell_open_str(url) {
+        return;
+    }
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let _ = std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .current_dir(sane_cwd())
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
 /// 用资源管理器打开目录（`ShellExecuteW("explore")`，不创建新进程）。成功返回 true。
 /// 记录“打开目录”失败原因（静态槽；open_folder 只需 &self，错误由 update 弹出 toast）。
+/// 给子进程显式指定一个一定存在的工作目录。
+///
+/// ★ 关键修复：本程序可能被从"之后被删除的目录"启动（例如从 dist\backup\<时间戳> 运行，
+/// 或旧目录启动后目录被更新替换），此时本进程的当前目录已经失效；子进程继承这个无效目录
+/// 会在初始化阶段失败 —— 表现为 explorer.exe 应用程序错误 0xc0000142，或
+/// 「Windows 无法访问指定设备、路径或文件（你可能没有适当的权限）」，于是所有需要 spawn
+/// 的功能（打开目录等）全部失效，而进程内的 ShellExecute 打开文件仍然正常。
+/// 服务器启动不受影响，是因为它本来就带显式 current_dir。
+fn sane_cwd() -> std::path::PathBuf {
+    let tmp = std::env::temp_dir();
+    if tmp.is_dir() {
+        return tmp;
+    }
+    std::path::PathBuf::from("C:\\Windows")
+}
 fn set_open_error(msg: String) {
     static SLOT: std::sync::OnceLock<std::sync::Mutex<Option<String>>> = std::sync::OnceLock::new();
     if let Ok(mut g) = SLOT.get_or_init(|| std::sync::Mutex::new(None)).lock() {
@@ -6685,33 +6740,42 @@ impl eframe::App for App {
                                     }
                                     if moon_a > 0.01 {
                                         let col = ic.gamma_multiply(moon_a);
-                                        // 新月：外圆 + 内切偏移圆构成的多边形，**只描边不填充**
-                                        // （DeepSeek 那枚就是细线月牙；实心月牙在小尺寸下显得很怪）
-                                        let r = 5.2f32;
-                                        let dx = 2.9f32;
-                                        let dy = -1.1f32;
-                                        let mut pts: Vec<egui::Pos2> = Vec::with_capacity(48);
-                                        for i in 0..=24 {
-                                            let a = -std::f32::consts::FRAC_PI_2
-                                                + std::f32::consts::PI * (i as f32 / 24.0);
-                                            pts.push(m + egui::vec2(a.cos() * r, a.sin() * r));
+                                        // 实心月牙，缺口朝**右上**（与 DeepSeek 的月亮图标同构：
+                                        // 外圆 - 向右上偏移的内圆 = 左下厚、右上薄的月牙）。
+                                        // 做法：沿外圆取"未被内圆覆盖"的点，再沿内圆取"落在外圆内"的点，
+                                        // 拼成一个凸性良好的多边形填充（避免小尺寸下的锯齿/怪异形状）。
+                                        let r_out = 5.6f32;
+                                        let r_in = 4.7f32;
+                                        let c_in = egui::vec2(3.1, -3.1);
+                                        let mut pts: Vec<egui::Pos2> = Vec::with_capacity(96);
+                                        // 外圆：保留在内圆之外的部分
+                                        for k in 0..=72 {
+                                            let a = k as f32 * std::f32::consts::TAU / 72.0;
+                                            let p = egui::vec2(a.cos() * r_out, a.sin() * r_out);
+                                            if (p - c_in).length() >= r_in {
+                                                pts.push(m + p);
+                                            }
                                         }
-                                        for i in 0..=24 {
-                                            let a = std::f32::consts::FRAC_PI_2
-                                                - std::f32::consts::PI * (i as f32 / 24.0);
-                                            pts.push(
-                                                m + egui::vec2(
-                                                    dx + a.cos() * r * 0.88,
-                                                    dy + a.sin() * r * 0.88,
-                                                ),
-                                            );
+                                        // 内圆：保留落在外圆之内的部分（按角度顺序接在外弧之后，
+                                        // 让多边形闭合时形成月牙的另一条边）
+                                        let mut inner: Vec<egui::Pos2> = Vec::new();
+                                        for k in 0..=72 {
+                                            let a = k as f32 * std::f32::consts::TAU / 72.0;
+                                            let p = c_in + egui::vec2(a.cos() * r_in, a.sin() * r_in);
+                                            if p.length() <= r_out {
+                                                inner.push(m + p);
+                                            }
                                         }
-                                        p.add(egui::Shape::closed_line(
-                                            pts,
-                                            egui::Stroke::new(1.4, col),
-                                        ));
-                                    }
-                                }
+                                        inner.reverse();
+                                        pts.extend(inner);
+                                        if pts.len() >= 3 {
+                                            p.add(egui::Shape::convex_polygon(
+                                                pts,
+                                                col,
+                                                egui::Stroke::NONE,
+                                            ));
+                                        }
+                                    }                                }
                             },
                         );
                         if theme_btn.clicked() {
@@ -13299,7 +13363,7 @@ impl App {
                                             use std::os::windows::process::CommandExt;
                                             let _ = std::process::Command::new("cmd")
                                                 .args(["/C", "start", "", "ms-settings:windowsdefender"])
-                                                .creation_flags(0x0800_0000).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+                                                .current_dir(sane_cwd()).creation_flags(0x0800_0000).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
                                                 .spawn();
                                         }
                                     }
@@ -15295,10 +15359,7 @@ impl App {
                 if let Some(res) = done {
                     match res {
                         Ok(url) => {
-                            let url_ref: &str = &url;
-                            let _ = std::process::Command::new("cmd")
-                                .args(["/C", "start", "", url_ref])
-                                .spawn();
+                            open_url(&url);
                             dl.dl_log.push(format!("已打开页面 {url}"));
                         }
                         Err(e) => {
@@ -17266,9 +17327,7 @@ impl App {
             let mcmod_url = self.dl.as_ref().unwrap().mod_mcmod_url.get(&hit.title).cloned();
             if let Some(u) = mcmod_url {
                 if ui.button("MC百科").clicked() {
-                    let _ = std::process::Command::new("cmd")
-                        .args(["/C", "start", "", &u])
-                        .spawn();
+                    open_url(&u);
                 }
             }
             if self.dl.as_ref().unwrap().mod_translate_busy {
@@ -17699,10 +17758,7 @@ impl App {
             } else {
                 format!("https://{src}")
             };
-            let url_ref: &str = &url;
-            let _ = std::process::Command::new("cmd")
-                .args(["/C", "start", "", url_ref])
-                .spawn();
+            open_url(&url);
             return;
         }
         // 无 source_url：后台拉取 project/{id} 拿 source_url 后打开（失败则打开 Modrinth 页）
@@ -17813,7 +17869,7 @@ fn utf16le_b64(s: &str) -> String {
 /// 当前进程是否管理�?
 fn is_admin() -> bool {
     std::process::Command::new("powershell")
-        .creation_flags(0x0800_0000).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+        .current_dir(sane_cwd()).creation_flags(0x0800_0000).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -17834,7 +17890,7 @@ fn run_powershell(script: &str) -> Result<String, String> {
     let encoded = utf16le_b64(script);
     if is_admin() {
         let out = std::process::Command::new("powershell")
-            .creation_flags(0x0800_0000).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .current_dir(sane_cwd()).creation_flags(0x0800_0000).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
             .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded])
             .output()
             .map_err(|e| e.to_string())?;
@@ -17854,7 +17910,7 @@ fn run_powershell(script: &str) -> Result<String, String> {
             "$p = Start-Process -FilePath 'powershell' -Verb RunAs -Wait -PassThru -ArgumentList '-NoProfile','-NonInteractive','-EncodedCommand','{encoded}'; if ($p) {{ exit $p.ExitCode }} else {{ exit 1 }}"
         );
         let out = std::process::Command::new("powershell")
-            .creation_flags(0x0800_0000).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .current_dir(sane_cwd()).creation_flags(0x0800_0000).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
             .args(["-NoProfile", "-NonInteractive", "-Command", &inner])
             .output()
             .map_err(|e| e.to_string())?;
@@ -18064,7 +18120,7 @@ fn download_frpc(
         );
         let out = std::process::Command::new("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-            .creation_flags(CREATE_NO_WINDOW).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .current_dir(sane_cwd()).creation_flags(CREATE_NO_WINDOW).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
             .output();
         match out {
             Ok(o) if o.status.success() => {
