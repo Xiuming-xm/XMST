@@ -857,6 +857,13 @@ struct DlUiState {
     /// 简介翻译加载中
     mod_translate_busy: bool,
     mod_translate_error: Option<String>,
+    /// 更新日志翻译结果（按版本号缓存：version_number -> 译文）
+    ver_translate_cache: std::collections::HashMap<String, String>,
+    /// 更新日志翻译进行中
+    ver_translate_busy: bool,
+    /// 更新日志翻译线程回传：version_number -> 结果
+    ver_translate_shared:
+        Option<std::sync::Arc<std::sync::Mutex<Option<(String, Result<String, String>)>>>>,
     /// 简介翻译线程回传
     mod_translate_shared:
         Option<std::sync::Arc<std::sync::Mutex<Option<Result<String, String>>>>>,
@@ -955,6 +962,9 @@ impl Default for DlUiState {
             mod_translate_hidden: false,
             mod_translate_busy: false,
             mod_translate_error: None,
+            ver_translate_cache: std::collections::HashMap::new(),
+            ver_translate_busy: false,
+            ver_translate_shared: None,
             mod_translate_shared: None,
             mod_ver_log_open: None,
             mod_ver_preview: None,
@@ -4075,9 +4085,23 @@ impl App {
         }
     }
 
-    /// 打开文件夹（纯目录）
+    /// 打开文件夹（纯目录）。
+    ///
+    /// 实测：**目录**用 `ShellExecuteW("open")` 在本程序里不生效（文件却可以），
+    /// 因此目录回到 `explorer.exe <目录>`（这条路径一直可用），同时补空标准句柄
+    /// 避免 0xc0000142；只有 spawn 本身失败时才退化为 ShellExecuteW。
     fn open_folder(&self, path: &std::path::Path) {
-        shell_open(path);
+        use std::process::Stdio;
+        let ok = std::process::Command::new("explorer.exe")
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .is_ok();
+        if !ok {
+            shell_open(path);
+        }
     }
 
     /// 删除文件/目录到系统回收站（阶段16④：经 PowerShell Microsoft.VisualBasic.FileIO，
@@ -13225,6 +13249,63 @@ impl App {
                                 self.ui_theme_settings(ui);
                             });
                             self.settings_sections = sections;
+
+                            // 翻译术语表（模组简介 / 更新日志翻译时优先采用用户译法）
+                            let sections = std::mem::take(&mut self.settings_sections);
+                            let sections = Self::setting_section(ctx, ui, sections, "glossary", "翻译术语", Some("模组简介与更新日志翻译时按你的译法处理（长词优先匹配）"), true, use_anim, self.cfg.anim_speed, |ui| {
+                                let mut remove: Option<usize> = None;
+                                let mut edited = false;
+                                let n = self.cfg.translate_glossary.len();
+                                for i in 0..n {
+                                    ui.horizontal(|ui| {
+                                        let (mut a, mut b) = self.cfg.translate_glossary[i].clone();
+                                        let ra = ui.add(
+                                            egui::TextEdit::singleline(&mut a)
+                                                .hint_text("原文，如 Create")
+                                                .desired_width(200.0),
+                                        );
+                                        ui.label("→");
+                                        let rb = ui.add(
+                                            egui::TextEdit::singleline(&mut b)
+                                                .hint_text("译法，如 创建")
+                                                .desired_width(200.0),
+                                        );
+                                        if ui.button("🗑").on_hover_text("删除该词条").clicked() {
+                                            remove = Some(i);
+                                        }
+                                        if ra.changed() || rb.changed() {
+                                            self.cfg.translate_glossary[i] = (a, b);
+                                            edited = true;
+                                        }
+                                    });
+                                }
+                                if let Some(i) = remove {
+                                    self.cfg.translate_glossary.remove(i);
+                                    edited = true;
+                                }
+                                ui.horizontal(|ui| {
+                                    if ui.button("➕ 添加词条").clicked() {
+                                        self.cfg.translate_glossary
+                                            .push((String::new(), String::new()));
+                                        edited = true;
+                                    }
+                                    if !self.cfg.translate_glossary.is_empty()
+                                        && ui.button("清空").clicked()
+                                    {
+                                        self.cfg.translate_glossary.clear();
+                                        edited = true;
+                                    }
+                                    ui.label(
+                                        RichText::new("例：Fabric API → Fabric 前置库；Create → 机械动力")
+                                            .weak()
+                                            .small(),
+                                    );
+                                });
+                                if edited {
+                                    self.save_config();
+                                }
+                            });
+                            self.settings_sections = sections;
                         }
                         SettingsSide::Java => {
                             let sections = std::mem::take(&mut self.settings_sections);
@@ -15054,6 +15135,25 @@ impl App {
                     wake = true;
                 } else {
                     dl.mod_translate_shared = Some(shared);
+                }
+            }
+            // 更新日志翻译 callback（按版本号缓存结果）
+            if let Some(shared) = dl.ver_translate_shared.take() {
+                let done = shared.lock().map(|mut g| g.take()).unwrap_or(None);
+                if let Some((ver, res)) = done {
+                    match res {
+                        Ok(t) => {
+                            dl.ver_translate_cache.insert(ver, t);
+                            dl.dl_log.push("更新日志翻译完成".to_string());
+                        }
+                        Err(e) => {
+                            dl.dl_log.push(format!("更新日志翻译失败: {e}"));
+                        }
+                    }
+                    dl.ver_translate_busy = false;
+                    wake = true;
+                } else {
+                    dl.ver_translate_shared = Some(shared);
                 }
             }
             // 详情页"打开页面" source_url 拉取回调：成功后打开系统浏览器
@@ -17324,8 +17424,50 @@ impl App {
                     );
                 }
                 ui.add_space(6.0);
-                ui.label(RichText::new("更新日志").strong().size(13.0));
+                // 「更新日志」+ 翻译按钮（复用简介翻译那一套：并行竞速 + 缓存 + 术语表）
+                let ver_key = pv.version_number.clone();
+                let cached_tr = self
+                    .dl
+                    .as_ref()
+                    .and_then(|d| d.ver_translate_cache.get(&ver_key).cloned());
+                let ver_busy = self.dl.as_ref().map(|d| d.ver_translate_busy).unwrap_or(false);
                 let cl = pv.changelog.trim();
+                let cl_clean = strip_html(cl);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("更新日志").strong().size(13.0));
+                    if !cl_clean.trim().is_empty() {
+                        if ver_busy {
+                            ui.spinner();
+                            ui.label(RichText::new("翻译中…").weak().small());
+                        } else if cached_tr.is_some() {
+                            if ui.button("收起译文").clicked() {
+                                if let Some(d) = self.dl.as_mut() {
+                                    d.ver_translate_cache.remove(&ver_key);
+                                }
+                            }
+                        } else if ui
+                            .button("🌐 翻译")
+                            .on_hover_text("翻译本版本更新日志（结果按版本缓存）")
+                            .clicked()
+                        {
+                            let text = cl_clean.clone();
+                            let gloss = self.cfg.translate_glossary.clone();
+                            let shared = std::sync::Arc::new(std::sync::Mutex::new(None));
+                            let sh2 = shared.clone();
+                            let key2 = ver_key.clone();
+                            std::thread::spawn(move || {
+                                let r = modrinth::translate_with_glossary(&text, &gloss);
+                                if let Ok(mut g) = sh2.lock() {
+                                    *g = Some((key2, r));
+                                }
+                            });
+                            if let Some(d) = self.dl.as_mut() {
+                                d.ver_translate_shared = Some(shared);
+                                d.ver_translate_busy = true;
+                            }
+                        }
+                    }
+                });
                 if cl.is_empty() {
                     ui.label(
                         RichText::new("该版本无更新日志")
@@ -17334,12 +17476,29 @@ impl App {
                 } else {
                     ui.add(
                         egui::Label::new(
-                            RichText::new(strip_html(cl))
+                            RichText::new(cl_clean.clone())
                                 .size(12.0)
                                 .color(self.fg(Color32::from_rgb(190, 190, 190))),
                         )
                         .wrap(),
                     );
+                    if let Some(tr) = cached_tr {
+                        ui.add_space(4.0);
+                        egui::Frame::none()
+                            .fill(self.theme_cur.widget_bg)
+                            .stroke(egui::Stroke::new(1.0, self.theme_cur.stroke))
+                            .rounding(6.0)
+                            .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                            .show(ui, |ui| {
+                                ui.label(RichText::new("译文").weak().small());
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(tr).size(12.0).color(self.theme_cur.text),
+                                    )
+                                    .wrap(),
+                                );
+                            });
+                    }
                 }
                 ui.add_space(8.0);
                 // 目标位置（下载前选择：自选目录 / 选服务器自动归类）

@@ -152,6 +152,9 @@ pub struct GlobalConfig {
     /// F1 窗口大小记忆（逻辑坐标；低于下限则用默认 1180×760）
     #[serde(default)]
     pub window_size: [f32; 2],
+    /// 翻译术语表（用户自定义：原文 -> 期望译法）。翻译时优先生效。
+    #[serde(default)]
+    pub translate_glossary: Vec<(String, String)>,
     /// 左侧栏折叠为纯图标（左下的 ◀/▶ 按钮切换）
     #[serde(default)]
     pub nav_collapsed: bool,
@@ -298,6 +301,7 @@ impl Default for GlobalConfig {
             window_pos: [0.0, 0.0],
             window_size: [0.0, 0.0],
             nav_collapsed: false,
+            translate_glossary: Vec::new(),
             mod_favorites: Vec::new(),
         }
     }

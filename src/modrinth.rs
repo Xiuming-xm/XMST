@@ -430,6 +430,47 @@ pub fn translate_best(text: &str) -> Result<String, String> {
     }
 }
 
+/// 带**自定义术语表**的翻译。
+///
+/// 做法（比"翻译后替换"准确得多）：先把用户词条替换成**私用区占位符**
+/// （U+E000 起，机翻不会改动它），翻译完再回填用户译法；最后再兜一次
+/// "原文仍在译文里出现"的替换，覆盖翻译器原样保留英文的情况。
+pub fn translate_with_glossary(text: &str, glossary: &[(String, String)]) -> Result<String, String> {
+    let terms: Vec<(String, String)> = glossary
+        .iter()
+        .filter(|(a, b)| !a.trim().is_empty() && !b.trim().is_empty())
+        .cloned()
+        .collect();
+    if terms.is_empty() {
+        return translate_best(text);
+    }
+    // 长词优先替换，避免 "Fabric API" 被 "Fabric" 先吃掉
+    let mut ordered = terms.clone();
+    ordered.sort_by_key(|(a, _)| std::cmp::Reverse(a.len()));
+    let mut marked = text.to_string();
+    let mut used: Vec<(usize, String)> = Vec::new();
+    for (i, (src, _)) in ordered.iter().enumerate() {
+        if marked.contains(src.as_str()) {
+            // 占位符：U+E000 + 两位序号 + U+E001（私用区，机翻不处理）
+            let ph = format!("\u{E000}{:02}\u{E001}", i);
+            marked = marked.replace(src.as_str(), &ph);
+            used.push((i, ph));
+        }
+    }
+    let mut out = translate_best(&marked)?;
+    // 回填占位符
+    for (i, ph) in &used {
+        out = out.replace(ph.as_str(), ordered[*i].1.as_str());
+    }
+    // 兜底：译文里仍是原文的，直接替换成用户译法
+    for (src, dst) in &ordered {
+        if out.contains(src.as_str()) {
+            out = out.replace(src.as_str(), dst.as_str());
+        }
+    }
+    Ok(out)
+}
+
 /// 翻译兜底（Google 失败时调用）：MyMemory 免费接口，英文 -> 简体中文。
 /// 注意 MyMemory 的 langpair 不接受 auto，源语言固定 en（模组标题基本为英文）。
 pub fn translate_text_fallback(text: &str) -> Result<String, String> {
