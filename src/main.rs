@@ -3329,7 +3329,7 @@ impl App {
                     );
                     match std::process::Command::new("powershell")
                         .args(["-NoProfile", "-Command", &ps])
-                        .creation_flags(0x08000000)
+                        .creation_flags(0x08000000).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
                         .stdin(std::process::Stdio::null())
                         .output()
                     {
@@ -3576,7 +3576,7 @@ impl App {
                 let local = frp_local_version(&frp_dir).ok_or("未找到 frpc.exe，无法检查版本")?;
                 let script = "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; (Invoke-RestMethod -Uri 'https://api.github.com/repos/fatedier/frp/releases/latest' -UseBasicParsing -Headers @{'User-Agent'='XMST'}).tag_name";
                 let out = std::process::Command::new("powershell")
-                    .creation_flags(0x0800_0000)
+                    .creation_flags(0x0800_0000).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
                     .args(["-NoProfile", "-NonInteractive", "-Command", script])
                     .output()
                     .map_err(|e| e.to_string())?;
@@ -4045,10 +4045,39 @@ impl App {
         }
     }
 
-    /// 用系统默认关联程序打开文件（如 .jar → 7zip）
+    /// 用系统默认关联程序打开文件（如 .jar → 7zip / 默认解压器）。
+    ///
+    /// ★ 改为 `ShellExecuteW(open)`：这是 Windows 官方推荐的"用默认程序打开"方式，
+    /// 不再 spawn `explorer.exe`。此前用 `explorer.exe <文件>` 在部分机器/文件类型上
+    /// 会弹「explorer.exe 应用程序无法正常启动(0xc0000142)」且打不开
+    /// （GUI 子系统进程没有有效标准句柄，子进程初始化失败）。`ShellExecuteW` 不创建
+    /// 子进程，彻底绕开这一类问题。
     fn open_file_system(&self, path: &std::path::Path) {
+        shell_open(path);
+    }
+
+    /// 打开文件所在目录并选中该文件（explorer 的 /select, 无 ShellExecute 等价物；
+    /// 传空标准句柄避免 0xc0000142，失败则退化为"打开父目录"）。
+    fn open_file_location(&self, path: &std::path::Path) {
+        use std::process::Stdio;
         let p = path.to_string_lossy().to_string();
-        let _ = std::process::Command::new("explorer.exe").arg(&p).spawn();
+        let ok = std::process::Command::new("explorer.exe")
+            .arg("/select,")
+            .arg(&p)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .is_ok();
+        if !ok {
+            let parent = path.parent().unwrap_or(path);
+            shell_open(parent);
+        }
+    }
+
+    /// 打开文件夹（纯目录）
+    fn open_folder(&self, path: &std::path::Path) {
+        shell_open(path);
     }
 
     /// 删除文件/目录到系统回收站（阶段16④：经 PowerShell Microsoft.VisualBasic.FileIO，
@@ -4073,22 +4102,7 @@ impl App {
         }
     }
 
-    /// 打开文件所在目录并选中该文件
-    /// 修复：explorer 对 "/select,"+路径 合并参数遇空格会失效，
-    /// 改为 "/select," 与路径分开传参，路径含空格也能正确选中。
-    fn open_file_location(&self, path: &std::path::Path) {
-        let p = path.to_string_lossy().to_string();
-        let _ = std::process::Command::new("explorer.exe")
-            .arg("/select,")
-            .arg(&p)
-            .spawn();
-    }
 
-    /// 打开文件夹（纯目录，explorer 直接打开）
-    fn open_folder(&self, path: &std::path::Path) {
-        let p = path.to_string_lossy().to_string();
-        let _ = std::process::Command::new("explorer.exe").arg(&p).spawn();
-    }
 
     /// mods 内 .jar 检查更新：后台算 SHA1 -> Modrinth version_files 指纹匹配 -> 对比项目最新版本
     fn mod_update_check(&mut self, idx: usize, name: &str, is_disabled: bool) {
@@ -4842,7 +4856,7 @@ $timer.Start(); \
         );
         let encoded = utf16le_b64(&script);
         let _ = std::process::Command::new("powershell")
-            .creation_flags(0x0800_0000)
+            .creation_flags(0x0800_0000).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
             .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", &encoded])
             .spawn();
     }
@@ -5250,6 +5264,27 @@ fn write_bat_max_restarts(dir: &Path, value: i32) -> Result<String, String> {
     Err("未找到含 MAX_RESTARTS 的 .bat".to_string())
 }
 
+/// 用系统默认关联打开文件/目录（ShellExecuteW，不创建子进程）。
+fn shell_open(path: &Path) {
+    use winapi::um::shellapi::ShellExecuteW;
+    use winapi::um::winuser::SW_SHOWNORMAL;
+    let op: Vec<u16> = "open\0".encode_utf16().collect();
+    let file: Vec<u16> = path
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            op.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}
 /// 在资源管理器中定位到某个文件/目录（文件则选中它）。
 ///
 /// 注意：**不要**用 `raw_arg` 传带引号的整串，也不要给 explorer.exe 加 CREATE_NO_WINDOW ——
@@ -13146,7 +13181,7 @@ impl App {
                                             use std::os::windows::process::CommandExt;
                                             let _ = std::process::Command::new("cmd")
                                                 .args(["/C", "start", "", "ms-settings:windowsdefender"])
-                                                .creation_flags(0x0800_0000)
+                                                .creation_flags(0x0800_0000).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
                                                 .spawn();
                                         }
                                     }
@@ -16634,8 +16669,7 @@ impl App {
         let shared2 = std::sync::Arc::clone(&shared);
         let t2 = t.clone();
         std::thread::spawn(move || {
-            let r = modrinth::translate_text(&t2)
-                .or_else(|_| modrinth::translate_text_fallback(&t2));
+            let r = modrinth::translate_best(&t2);
             *shared2.lock().unwrap() = Some(r);
         });
         dl.mod_cn_shared.insert(t.clone(), shared);
@@ -17028,8 +17062,7 @@ impl App {
                     ));
                     let shared2 = std::sync::Arc::clone(&shared);
                     std::thread::spawn(move || {
-                        let r = modrinth::translate_text(&text)
-                            .or_else(|_| modrinth::translate_text_fallback(&text));
+                        let r = modrinth::translate_best(&text);
                         *shared2.lock().unwrap() = Some(r);
                     });
                     let d = self.dl.as_mut().unwrap();
@@ -17481,7 +17514,7 @@ fn utf16le_b64(s: &str) -> String {
 /// 当前进程是否管理�?
 fn is_admin() -> bool {
     std::process::Command::new("powershell")
-        .creation_flags(0x0800_0000)
+        .creation_flags(0x0800_0000).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -17502,7 +17535,7 @@ fn run_powershell(script: &str) -> Result<String, String> {
     let encoded = utf16le_b64(script);
     if is_admin() {
         let out = std::process::Command::new("powershell")
-            .creation_flags(0x0800_0000)
+            .creation_flags(0x0800_0000).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
             .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded])
             .output()
             .map_err(|e| e.to_string())?;
@@ -17522,7 +17555,7 @@ fn run_powershell(script: &str) -> Result<String, String> {
             "$p = Start-Process -FilePath 'powershell' -Verb RunAs -Wait -PassThru -ArgumentList '-NoProfile','-NonInteractive','-EncodedCommand','{encoded}'; if ($p) {{ exit $p.ExitCode }} else {{ exit 1 }}"
         );
         let out = std::process::Command::new("powershell")
-            .creation_flags(0x0800_0000)
+            .creation_flags(0x0800_0000).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
             .args(["-NoProfile", "-NonInteractive", "-Command", &inner])
             .output()
             .map_err(|e| e.to_string())?;
@@ -17732,7 +17765,7 @@ fn download_frpc(
         );
         let out = std::process::Command::new("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-            .creation_flags(CREATE_NO_WINDOW)
+            .creation_flags(CREATE_NO_WINDOW).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
             .output();
         match out {
             Ok(o) if o.status.success() => {

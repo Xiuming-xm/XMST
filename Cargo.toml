@@ -30,7 +30,7 @@ walkdir = "2"
 filetime = "0.2"
 rhai = "1"
 libc = "0.2"
-winapi = { version = "0.3", features = ["winbase", "wincon", "processenv", "handleapi", "synchapi", "fileapi", "namedpipeapi", "processthreadsapi", "errhandlingapi", "winerror", "winnt", "winuser", "tlhelp32", "psapi", "sysinfoapi", "winreg", "iphlpapi", "iprtrmib", "ifmib", "tcpestats", "memoryapi", "winsock2", "ntdef", "minwindef", "libloaderapi", "jobapi2", "wingdi"] }
+winapi = { version = "0.3", features = ["winbase", "wincon", "processenv", "handleapi", "synchapi", "fileapi", "namedpipeapi", "processthreadsapi", "errhandlingapi", "winerror", "winnt", "winuser", "tlhelp32", "psapi", "sysinfoapi", "winreg", "iphlpapi", "iprtrmib", "ifmib", "tcpestats", "memoryapi", "winsock2", "ntdef", "minwindef", "libloaderapi", "jobapi2", "wingdi", "shellapi"] }
 tray-icon = "0.19"
 encoding_rs = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json", "gzip"] }

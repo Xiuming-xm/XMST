@@ -332,10 +332,10 @@ pub fn category_options() -> [&'static str; 15] {
 /// 在线翻译（Google 免费接口，无需 Key；自动检测 -> 简体中文）
 /// Google 失败时自动降级 MyMemory 兜底，避免长时间无结果。
 pub fn translate_text(text: &str) -> Result<String, String> {
-    // 独立短超时 client（10s 连接 / 25s 整体），翻译场景不等 120s
+    // 独立短超时 client（4s 连接 / 8s 整体）：免费接口被限流时，25s 的等待极其伤体验
     let client = reqwest::blocking::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(25))
+        .connect_timeout(std::time::Duration::from_secs(4))
+        .timeout(std::time::Duration::from_secs(8))
         .build()
         .map_err(|e| format!("构建翻译客户端失败: {e}"))?;
     let url = format!(
@@ -365,12 +365,77 @@ pub fn translate_text(text: &str) -> Result<String, String> {
     }
 }
 
+/// 翻译进程内缓存：同一段文本（模组简介/更新日志）重复翻译时**瞬间返回**。
+/// key = 文本长度 + 哈希，value = 译文。
+fn cache() -> &'static std::sync::Mutex<std::collections::HashMap<u64, String>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, String>>> =
+        std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn cache_key(text: &str) -> u64 {
+    // 简单 FNV-1a：够用且无需额外依赖
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in text.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    h ^ (text.len() as u64)
+}
+
+/// ★ 推荐入口：**并行竞速 + 缓存**的翻译。
+///
+/// 慢的根源：Google 免费接口经常被限流，先等它超时（原来 25s）再退到 MyMemory（再 25s），
+/// 最坏要等近 50s。现在改成：
+/// 1. 命中缓存直接返回（重复查看/翻回同一模组时 0 延迟）；
+/// 2. **同时**给 Google 与 MyMemory 发请求，谁先返回有效译文就用谁（单个 8s 超时兜底）；
+/// 3. 超长文本截断到 4500 字符，避免 URL 过长导致服务端慢/失败。
+pub fn translate_best(text: &str) -> Result<String, String> {
+    let trimmed: String = text.chars().take(4500).collect();
+    let key = cache_key(&trimmed);
+    if let Ok(g) = cache().lock() {
+        if let Some(v) = g.get(&key) {
+            return Ok(v.clone());
+        }
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    for f in [
+        translate_text as fn(&str) -> Result<String, String>,
+        translate_text_fallback,
+    ] {
+        let tx = tx.clone();
+        let t = trimmed.clone();
+        // 两个提供方各自独立线程：谁先成功谁先 send；另一个即使超时也只是自己结束
+        std::thread::spawn(move || {
+            if let Ok(r) = f(&t) {
+                if !r.trim().is_empty() {
+                    let _ = tx.send(r);
+                }
+            }
+        });
+    }
+    drop(tx);
+    match rx.recv_timeout(std::time::Duration::from_secs(12)) {
+        Ok(out) => {
+            if let Ok(mut g) = cache().lock() {
+                // 简单上限，避免长时间运行无限增长
+                if g.len() > 400 {
+                    g.clear();
+                }
+                g.insert(key, out.clone());
+            }
+            Ok(out)
+        }
+        Err(_) => Err("翻译超时（两个翻译服务都未在 12 秒内返回，可能是网络受限）".to_string()),
+    }
+}
+
 /// 翻译兜底（Google 失败时调用）：MyMemory 免费接口，英文 -> 简体中文。
 /// 注意 MyMemory 的 langpair 不接受 auto，源语言固定 en（模组标题基本为英文）。
 pub fn translate_text_fallback(text: &str) -> Result<String, String> {
     let client = reqwest::blocking::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(25))
+        .connect_timeout(std::time::Duration::from_secs(4))
+        .timeout(std::time::Duration::from_secs(8))
         .build()
         .map_err(|e| format!("构建翻译客户端失败: {e}"))?;
     let url = format!(
