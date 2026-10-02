@@ -44,16 +44,17 @@ impl ThemeColors {
         // 用户反馈「日间模式太亮、文字怪怪的」：把整体亮度压一档（纯白面板 → 略灰），
         // 文字用接近纯黑的高对比深灰，控件底色与描边都比旧值更明确一点。
         Self {
-            bg: Color32::from_rgb(233, 235, 239),
-            panel: Color32::from_rgb(245, 246, 249),
-            text: Color32::from_rgb(28, 30, 34),
+            // 参考 DeepSeek 亮色页面：极浅冷灰面 + 白色卡片 + 近黑正文，避免"纯白刺眼/灰得发脏"
+            bg: Color32::from_rgb(246, 247, 249),
+            panel: Color32::from_rgb(252, 252, 253),
+            text: Color32::from_rgb(27, 29, 34),
             // weak: needs >= 4.5:1 on the panel; gray 88 gives ~6:1.
-            weak: Color32::from_rgb(88, 90, 98),
+            weak: Color32::from_rgb(106, 110, 122),
             accent: Color32::from_rgb(38, 68, 60), // light_adapt((28,150,130))
-            widget_bg: Color32::from_rgb(219, 221, 226),
-            widget_hover: Color32::from_rgb(202, 205, 212),
-            widget_active: Color32::from_rgb(184, 188, 196),
-            stroke: Color32::from_rgb(154, 156, 164),
+            widget_bg: Color32::from_rgb(237, 239, 243),
+            widget_hover: Color32::from_rgb(228, 231, 237),
+            widget_active: Color32::from_rgb(217, 221, 228),
+            stroke: Color32::from_rgb(217, 222, 230),
         }
     }
 
@@ -301,8 +302,19 @@ pub fn apply(
         } else {
             light_adapt(c.accent)
         };
-        v.selection.bg_fill = accent_fg;
-        v.selection.stroke.color = c.accent;
+        // ★ 选中态底色：**强调色的低透明叠加**，而不是直接用强调色本体。
+        // 之前 `selection.bg_fill = accent_fg`，而浅色模式下 accent_fg 是"压暗后的强调色"
+        // （近黑墨绿）→ 选中的页签/列表项变成一块**深底**，配近黑正文 = 完全看不清
+        // （用户截图里的"模组 / 通用 / mods / Fabric1.21.11"这些黑块就是它）。
+        // 现在浅色=淡彩底+深字，深色=暗彩底+浅字，两种主题都可读。
+        let sel_alpha = if c.text.r() > 128 { 46 } else { 56 };
+        v.selection.bg_fill = Color32::from_rgba_unmultiplied(
+            accent_fg.r(),
+            accent_fg.g(),
+            accent_fg.b(),
+            sel_alpha,
+        );
+        v.selection.stroke.color = c.text;
         v.hyperlink_color = accent_fg;
         v.text_cursor.stroke.color = accent_fg;
         // Widget state colors

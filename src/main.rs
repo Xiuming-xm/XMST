@@ -6517,43 +6517,49 @@ impl eframe::App for App {
                                     let moon_a = dark_t.clamp(0.0, 1.0);
                                     if sun_a > 0.01 {
                                         let col = ic.gamma_multiply(sun_a);
-                                        let scale = 0.8 + 0.2 * sun_a;
-                                        p.circle_filled(m, 3.4 * scale, col);
+                                        let scale = 0.82 + 0.18 * sun_a;
+                                        // 参考 DeepSeek 的线性图标风格：**描边**圆 + 8 条细光线（不填充）
+                                        p.circle_stroke(
+                                            m,
+                                            3.3 * scale,
+                                            egui::Stroke::new(1.4, col),
+                                        );
                                         for k in 0..8 {
                                             let ang = k as f32 * std::f32::consts::TAU / 8.0
                                                 + (1.0 - sun_a) * 0.6;
-                                            let d = egui::Vec2::angled(ang) * (6.6 * scale);
+                                            let d = egui::Vec2::angled(ang) * (6.2 * scale);
                                             p.line_segment(
-                                                [m + d, m + d * 1.42],
-                                                egui::Stroke::new(1.3, col),
+                                                [m + d, m + d * 1.30],
+                                                egui::Stroke::new(1.4, col),
                                             );
                                         }
                                     }
                                     if moon_a > 0.01 {
                                         let col = ic.gamma_multiply(moon_a);
-                                        // 新月 = 外圆 + 内切偏移圆构成的多边形（真·月牙，不用覆盖圆）
-                                        let r = 5.0f32;
-                                        let dx = 2.6f32;
-                                        let dy = -1.2f32;
+                                        // 新月：外圆 + 内切偏移圆构成的多边形，**只描边不填充**
+                                        // （DeepSeek 那枚就是细线月牙；实心月牙在小尺寸下显得很怪）
+                                        let r = 5.2f32;
+                                        let dx = 2.9f32;
+                                        let dy = -1.1f32;
                                         let mut pts: Vec<egui::Pos2> = Vec::with_capacity(48);
-                                        // 外圆：从 -90° 顺时针到 90°（右侧弧）
                                         for i in 0..=24 {
                                             let a = -std::f32::consts::FRAC_PI_2
                                                 + std::f32::consts::PI * (i as f32 / 24.0);
                                             pts.push(m + egui::vec2(a.cos() * r, a.sin() * r));
                                         }
-                                        // 内圆：从 90° 回到 -90°（左侧弧，圆心偏移形成月牙）
                                         for i in 0..=24 {
                                             let a = std::f32::consts::FRAC_PI_2
                                                 - std::f32::consts::PI * (i as f32 / 24.0);
                                             pts.push(
-                                                m + egui::vec2(dx + a.cos() * r * 0.86, dy + a.sin() * r * 0.86),
+                                                m + egui::vec2(
+                                                    dx + a.cos() * r * 0.88,
+                                                    dy + a.sin() * r * 0.88,
+                                                ),
                                             );
                                         }
-                                        p.add(egui::Shape::convex_polygon(
+                                        p.add(egui::Shape::closed_line(
                                             pts,
-                                            col,
-                                            egui::Stroke::NONE,
+                                            egui::Stroke::new(1.4, col),
                                         ));
                                     }
                                 }
