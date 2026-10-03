@@ -1561,6 +1561,14 @@ struct App {
     crash_report: Option<(usize, String, crashscan::CrashFinding)>,
     /// 术语表搜索关键字
     glossary_query: String,
+    /// 配置已修改、等待落盘（去抖，避免拖拽时每帧整文件写盘）
+    cfg_dirty: bool,
+    /// 去抖到期时间点
+    cfg_save_at: Option<std::time::Instant>,
+    /// 日志页缓存：时间戳/条数/行（避免每帧查 SQLite）
+    log_cache_at: Option<std::time::Instant>,
+    log_cache_count: i64,
+    log_cache_rows: Vec<logdb::LogRow>,
     /// 日志页：搜索关键字
     log_query: String,
     /// 日志页：级别筛选（全部/信息/警告/错误）
@@ -1913,6 +1921,11 @@ impl App {
             tray_cleanup_done: false,
             crash_report: None,
             glossary_query: String::new(),
+            log_cache_at: None,
+            log_cache_count: 0,
+            log_cache_rows: Vec::new(),
+            cfg_dirty: false,
+            cfg_save_at: None,
             log_query: String::new(),
             log_level: "全部".to_string(),
             log_src: "全部".to_string(),
@@ -2101,12 +2114,50 @@ impl App {
         }
     }
 
+    /// 标记配置已修改，延迟落盘（600ms 去抖）。拖动滑块/输入框时每帧都会调用它，
+    /// 此前每次都整文件重写：既伤磁盘，又提高“写一半崩溃”的概率。真正的写在 flush_config。
     fn save_config(&mut self) {
-        let json = serde_json::to_string_pretty(&self.cfg).unwrap_or_default();
+        self.cfg_dirty = true;
+        self.cfg_save_at = Some(std::time::Instant::now() + std::time::Duration::from_millis(600));
+    }
+
+    /// 立即原子落盘：临时文件 → 保留上一份为 .bak → 原子替换。
+    /// 序列化失败绝不写空文件（旧实现写空字符串会把配置清空，用户实测丢过多次配置）。
+    fn flush_config(&mut self) {
+        if !self.cfg_dirty {
+            return;
+        }
+        let json = match serde_json::to_string_pretty(&self.cfg) {
+            Ok(j) => j,
+            Err(e) => {
+                self.cfg_save_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+                self.set_toast(format!("配置序列化失败，未写盘（避免清空配置）：{e}"));
+                return;
+            }
+        };
         if let Some(parent) = self.config_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::write(&self.config_path, json);
+        let tmp = self.config_path.with_extension("json.tmp");
+        let bak = self.config_path.with_extension("json.bak");
+        if std::fs::write(&tmp, json.as_bytes()).is_err() {
+            self.cfg_save_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+            self.set_toast("配置写入失败（无法创建临时文件）".to_string());
+            return;
+        }
+        if self.config_path.exists() {
+            let _ = std::fs::copy(&self.config_path, &bak);
+        }
+        match std::fs::rename(&tmp, &self.config_path) {
+            Ok(()) => {
+                self.cfg_dirty = false;
+                self.cfg_save_at = None;
+            }
+            Err(e) => {
+                self.cfg_save_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+                self.set_toast(format!("配置替换失败：{e}"));
+            }
+        }
     }
 
     fn set_toast(&mut self, msg: String) {
@@ -2563,6 +2614,8 @@ impl App {
 
     /// 处理关闭请求：返�?true 表示放行关闭（退出程序），false 表示已拦�?
     fn handle_close_request(&mut self, ctx: &egui::Context) -> bool {
+        // 关闭前把去抖中的配置立刻落盘（避免丢改动）
+        self.flush_config();
         // 已确认退出且全部服务器已停止：放�?
         if self.ctx_close_pending {
             return true;
@@ -4209,7 +4262,7 @@ impl App {
                     .ok_or("最新版本无 jar 文件")?;
                 Ok(format!("new:{pid}:{nver}:{url}:{fname}:{ver}"))
             })();
-            *shared.lock().unwrap() = Some(res);
+            *shared.lock().unwrap_or_else(|e| e.into_inner()) = Some(res);
         });
     }
 
@@ -4258,7 +4311,7 @@ impl App {
                 std::fs::rename(&tmp, &new_p).map_err(|e| format!("替换文件失败: {e}"))?;
                 Ok(format!("done:{new_ver}:{final_name}"))
             })();
-            *shared.lock().unwrap() = Some(res);
+            *shared.lock().unwrap_or_else(|e| e.into_inner()) = Some(res);
         });
     }
 
@@ -4507,7 +4560,26 @@ fn load_config(path: &Path) -> GlobalConfig {
         GlobalConfig::default()
     } else {
         match std::fs::read_to_string(path) {
-            Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+            Ok(s) => match serde_json::from_str::<GlobalConfig>(&s) {
+                Ok(c) => c,
+                Err(e) => {
+                    // ★ 解析失败绝不静默丢弃：坏文件留档 → 尝试 .bak → 最后默认值。
+                    let bak_bad = path.with_extension(format!(
+                        "broken_{}.json",
+                        Local::now().format("%Y%m%d_%H%M%S")
+                    ));
+                    let _ = std::fs::rename(path, &bak_bad);
+                    let bak = path.with_extension("json.bak");
+                    if let Ok(bs) = std::fs::read_to_string(&bak) {
+                        if let Ok(c) = serde_json::from_str::<GlobalConfig>(&bs) {
+                            eprintln!("配置解析失败（{e}），已从 .bak 恢复；坏文件存为 {}", bak_bad.display());
+                            return c;
+                        }
+                    }
+                    eprintln!("配置解析失败（{e}），坏文件存为 {}，本次用默认配置", bak_bad.display());
+                    GlobalConfig::default()
+                }
+            },
             Err(_) => GlobalConfig::default(),
         }
     };
@@ -5881,6 +5953,30 @@ fn reveal_in_explorer(p: &Path) {
 
 /// 目录体积（人类可读，如 "1.2 GB"）；不存在返回 "—"。
 fn dir_size_mb(p: &Path) -> String {
+    // ★ 30 秒记忆化：此前它在概览页渲染路径里被**每帧**调用，
+    //   实测 world/ = 5352 文件 / 7.9GB / 单次遍历 282ms（审计 high 项）。
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (std::time::Instant, String)>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Ok(g) = cache.lock() {
+        if let Some((at, v)) = g.get(p) {
+            if at.elapsed() < std::time::Duration::from_secs(30) {
+                return v.clone();
+            }
+        }
+    }
+    let v = dir_size_mb_uncached(p);
+    if let Ok(mut g) = cache.lock() {
+        if g.len() > 64 {
+            g.clear();
+        }
+        g.insert(p.to_path_buf(), (std::time::Instant::now(), v.clone()));
+    }
+    v
+}
+
+fn dir_size_mb_uncached(p: &Path) -> String {
     if !p.exists() {
         return "—".to_string();
     }
@@ -7687,6 +7783,12 @@ impl eframe::App for App {
         // “打开目录”失败提示（错误经静态槽从 open_folder 带回）
         if let Some(e) = take_open_error() {
             self.set_toast(e);
+        }
+        // 配置去抖落盘（拖拽/输入停止 600ms 后写一次；关闭/托盘路径会强制 flush）
+        if let Some(at) = self.cfg_save_at {
+            if std::time::Instant::now() >= at {
+                self.flush_config();
+            }
         }
     }
 }
@@ -15277,7 +15379,7 @@ impl App {
         let cctx = self.egui_ctx.clone();
         std::thread::spawn(move || {
             let res = server_download::fetch_versions(kind);
-            *shared.lock().unwrap() = Some(res);
+            *shared.lock().unwrap_or_else(|e| e.into_inner()) = Some(res);
             cctx.request_repaint();
         });
     }
@@ -16267,7 +16369,7 @@ impl App {
                 Some(e) => Err(e),
                 None => Ok(out),
             };
-            *shared.lock().unwrap() = Some(res);
+            *shared.lock().unwrap_or_else(|e| e.into_inner()) = Some(res);
         });
     }
 
@@ -16296,7 +16398,7 @@ impl App {
         let client = download::new_client();
         std::thread::spawn(move || {
             let r = modrinth::search_mods(&q2, &pt2, &mc2, &l2, &tags2, &sort2, limit, offset);
-            *shared.lock().unwrap() = Some(r);
+            *shared.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
         });
     }
 
@@ -16321,7 +16423,7 @@ impl App {
         dl.mod_ver_shared = Some(std::sync::Arc::clone(&shared));
         std::thread::spawn(move || {
             let r = modrinth::project_versions(&pid2);
-            *shared.lock().unwrap() = Some(r);
+            *shared.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
         });
     }
 
@@ -16880,6 +16982,24 @@ impl App {
     ///
     /// 这是 **XMST 工具自己的运行日志**（服务器输出也汇总进同一个库，以来源标记区分），
     /// 因此不按服务器拆页签，筛选靠「来源」下拉完成。原「设置 → 日志」整段已并入本页。
+    /// 日志库查询（500ms 节流缓存）：此前在日志页渲染路径里每帧执行
+    /// SELECT COUNT(*) + 取 800 行（审计 high 项）。
+    fn log_rows_cached(&mut self) -> (i64, Vec<logdb::LogRow>) {
+        let stale = self
+            .log_cache_at
+            .map(|t| t.elapsed() > std::time::Duration::from_millis(500))
+            .unwrap_or(true);
+        if stale {
+            let (c, r) = match &self.logdb {
+                Some(db) => self.log_rows_cached(),
+                None => (0, Vec::new()),
+            };
+            self.log_cache_count = c;
+            self.log_cache_rows = r;
+            self.log_cache_at = Some(std::time::Instant::now());
+        }
+        (self.log_cache_count, self.log_cache_rows.clone())
+    }
     fn ui_logs_page(&mut self, ctx: &egui::Context) {
         let mut query = self.log_query.clone();
         let mut level = self.log_level.clone();
@@ -16916,7 +17036,7 @@ impl App {
                 ui.separator();
                 // ---- 统计卡 ----
                 let (count, rows) = match &self.logdb {
-                    Some(db) => (db.count(), db.recent(800, None)),
+                    Some(db) => self.log_rows_cached(),
                     None => (0, Vec::new()),
                 };
                 let sources: Vec<String> = {
@@ -17240,7 +17360,7 @@ impl App {
                 let bytes = resp.bytes().map_err(|e| e.to_string())?;
                 Ok(bytes.to_vec())
             })();
-            *shared2.lock().unwrap() = Some(r);
+            *shared2.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
         });
         dl.mod_icon_shared.insert(id.clone(), shared);
         dl.mod_icon_pending.insert(id);
@@ -17330,7 +17450,7 @@ impl App {
         let t2 = t.clone();
         std::thread::spawn(move || {
             let r = modrinth::fetch_mcmod_name(&t2);
-            *shared2.lock().unwrap() = Some(r);
+            *shared2.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
         });
         dl.mod_mcmod_shared.insert(t.clone(), shared);
         dl.mod_mcmod_pending.insert(t);
@@ -17348,7 +17468,7 @@ impl App {
         let t2 = t.clone();
         std::thread::spawn(move || {
             let r = modrinth::translate_best(&t2);
-            *shared2.lock().unwrap() = Some(r);
+            *shared2.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
         });
         dl.mod_cn_shared.insert(t.clone(), shared);
         dl.mod_cn_pending.insert(t);
@@ -17739,7 +17859,7 @@ impl App {
                     let shared2 = std::sync::Arc::clone(&shared);
                     std::thread::spawn(move || {
                         let r = modrinth::translate_best(&text);
-                        *shared2.lock().unwrap() = Some(r);
+                        *shared2.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
                     });
                     let d = self.dl.as_mut().unwrap();
                     d.mod_translate_shared = Some(shared);
@@ -18170,7 +18290,7 @@ impl App {
                 }
                 Err(e) => Err(e.to_string()),
             };
-            *shared2.lock().unwrap() = Some(r);
+            *shared2.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
         });
         let d = self.dl.as_mut().unwrap();
         d.mod_open_shared = Some(shared);

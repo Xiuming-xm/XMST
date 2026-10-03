@@ -98,7 +98,7 @@ pub fn system_cpu_usage_pct() -> f32 {
         (i, k, u)
     };
     let (idle_t, kernel_t, user_t) = (ft(&idle), ft(&kernel), ft(&user));
-    let mut guard = PREV.lock().unwrap();
+    let mut guard = PREV.lock().unwrap_or_else(|e| e.into_inner());
     match *guard {
         Some((p_idle, p_kernel, p_user)) => {
             let total = (kernel_t + user_t).saturating_sub(p_kernel + p_user);
@@ -165,7 +165,7 @@ fn proc_tree_stats(root_pid: u32) -> (f32, u64) {
     let mut total_ticks: u64 = 0;
     for pid in targets {
         unsafe {
-            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            let h = OpenProcess(winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION | winapi::um::winnt::PROCESS_VM_READ, 0, pid);
             if h.is_null() {
                 continue;
             }

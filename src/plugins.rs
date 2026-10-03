@@ -602,7 +602,8 @@ impl PluginManager {
         configs: std::sync::Arc<std::sync::Mutex<HashMap<String, HashMap<String, String>>>>,
     ) -> (Engine, Arc<AtomicU64>) {
         let mut engine = Engine::new();
-        let max_ops = manifest.max_operations.unwrap_or(DEFAULT_MAX_OPS);
+        // 上限保护：清单填 1e12 会让 rhai 长时间占满 UI 线程（审计 high）
+    let max_ops = manifest.max_operations.unwrap_or(DEFAULT_MAX_OPS).min(200_000);
         // Official operation cap first (rhai aborts with ErrorTooManyOperations).
         engine.set_max_operations(max_ops);
         let op_count = Arc::new(AtomicU64::new(0));
@@ -700,7 +701,7 @@ impl PluginManager {
                 }
                 let name = CURRENT_PLUGIN.with(|c| c.borrow().clone());
                 if !name.is_empty() {
-                    cfg.lock().unwrap().entry(name).or_default().insert(key, value);
+                    cfg.lock().unwrap_or_else(|e| e.into_inner()).entry(name).or_default().insert(key, value);
                     let _ = tx.send(PluginMsg::ConfigDirty);
                 }
             });

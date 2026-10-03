@@ -657,12 +657,20 @@ pub fn version_by_sha1(
         return Err(format!("HTTP {}", resp.status()));
     }
     let v: Value = resp.json().map_err(|e| format!("JSON 解析失败: {e}"))?;
-    let arr = v.as_array().ok_or("version_files 响应异常")?;
+    // ★ 修正（审计 high）：POST /v2/version_files 返回的是
+    //   {"sha1:<hash>": {版本对象}} 的**对象 map**，不是数组；且版本对象的
+    //   id 字段名是 `id`（旧代码读 version_id 永远为空）→ "检查更新"此前从未成功过。
+    let obj = v.as_object().ok_or("version_files 响应异常")?;
+    let key = format!("sha1:{sha1}");
+    let ver = obj
+        .get(&key)
+        .ok_or("该文件不在 Modrinth 上（可能来自第三方源或已下架）")?;
+    let arr: Vec<Value> = vec![ver.clone()];
     if arr.is_empty() {
         return Err("该文件不在 Modrinth 上（可能来自第三方源或已下架）".to_string());
     }
     let project_id = arr[0]["project_id"].as_str().unwrap_or_default().to_string();
-    let version_id = arr[0]["version_id"].as_str().unwrap_or_default().to_string();
+    let version_id = arr[0]["id"].as_str().unwrap_or_default().to_string();
     if project_id.is_empty() || version_id.is_empty() {
         return Err("version_files 响应缺少项目/版本 ID".to_string());
     }

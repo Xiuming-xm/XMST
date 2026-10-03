@@ -160,7 +160,7 @@ pub fn write_stdin(proc: &ManagedProcess, line: &str) -> std::io::Result<()> {
             "stdin 未启用",
         ));
     }
-    let mut child = proc.child.lock().unwrap();
+    let mut child = proc.child.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(stdin) = child.stdin.as_mut() {
         writeln!(stdin, "{}", line)?;
         stdin.flush()?;
@@ -180,7 +180,7 @@ pub fn stop_gracefully(proc: &ManagedProcess, timeout_secs: u64) -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
         {
-            let mut child = proc.child.lock().unwrap();
+            let mut child = proc.child.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(status) = child.try_wait().unwrap_or(None) {
                 let _ = status;
                 return true;
@@ -200,7 +200,7 @@ pub fn kill_tree(proc: &ManagedProcess) -> bool {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let pid = {
-        let mut child = proc.child.lock().unwrap();
+        let mut child = proc.child.lock().unwrap_or_else(|e| e.into_inner());
         child.id()
     };
     // taskkill /PID <pid> /T /F：终止进程树，避免残留 java 进程
@@ -213,7 +213,7 @@ pub fn kill_tree(proc: &ManagedProcess) -> bool {
         .stderr(Stdio::null())
         .status();
     // reap 主进程（可能已被 taskkill 结束）
-    let mut child = proc.child.lock().unwrap();
+    let mut child = proc.child.lock().unwrap_or_else(|e| e.into_inner());
     let _ = child.kill();
     let _ = child.wait();
     true
@@ -226,7 +226,7 @@ pub fn kill(proc: &ManagedProcess) -> bool {
 
 /// 检查进程是否还活着
 pub fn is_running(proc: &ManagedProcess) -> bool {
-    let mut child = proc.child.lock().unwrap();
+    let mut child = proc.child.lock().unwrap_or_else(|e| e.into_inner());
     match child.try_wait() {
         Ok(Some(_)) => false,
         Ok(None) => true,
@@ -251,7 +251,7 @@ pub fn drain_to_string(proc: &ManagedProcess, max_lines: usize) -> String {
 
 /// 读取子进程退出码（若已退出）
 pub fn exit_code(proc: &ManagedProcess) -> Option<i32> {
-    let mut child = proc.child.lock().unwrap();
+    let mut child = proc.child.lock().unwrap_or_else(|e| e.into_inner());
     match child.try_wait() {
         Ok(Some(status)) => status.code(),
         _ => None,

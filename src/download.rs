@@ -154,7 +154,7 @@ pub fn download_file_parallel(
                                     done_bytes.fetch_add(len, Ordering::Relaxed);
                                 }
                                 Err(e) => {
-                                    *err.lock().unwrap() = Some(e);
+                                    *err.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
                                 }
                             }
                             done_parts.fetch_add(1, Ordering::Relaxed);
@@ -164,7 +164,7 @@ pub fn download_file_parallel(
                     let mut last = Instant::now() - PROGRESS_THROTTLE;
                     loop {
                         let finished = done_parts.load(Ordering::Relaxed);
-                        let has_err = err.lock().unwrap().is_some();
+                        let has_err = err.lock().unwrap_or_else(|e| e.into_inner()).is_some();
                         if finished >= parts as usize || has_err {
                             break;
                         }
@@ -175,7 +175,7 @@ pub fn download_file_parallel(
                         std::thread::sleep(Duration::from_millis(50));
                     }
                 });
-                if let Some(e) = err.lock().unwrap().clone() {
+                if let Some(e) = err.lock().unwrap_or_else(|e| e.into_inner()).clone() {
                     for p in &part_paths {
                         let _ = std::fs::remove_file(p);
                     }
