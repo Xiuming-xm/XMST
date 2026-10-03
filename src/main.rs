@@ -5955,6 +5955,18 @@ fn rename_with_retry(old: &Path, new: &Path) -> Result<(), String> {
         )),
     }
 }
+/// 按字节下标安全切片：下标落在多字节字符中间时向后对齐到字符边界。
+///
+/// 日志缓冲区由多帧累积拼接，上一帧记录的字节下标可能正好落在汉字中间，
+/// 此时 `&buf[i..]` 会 panic（release 为 panic=abort → 工具直接闪退）。
+/// 2026-10-03 的 `0xc0000409` 崩溃即由此引起。
+fn safe_from(s: &str, i: usize) -> &str {
+    let mut i = i.min(s.len());
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    &s[i..]
+}
 /// 给子进程显式指定一个一定存在的工作目录。
 ///
 /// 关键修复：本程序可能被从"之后被删除的目录"启动（例如从 dist\backup\<时间戳> 运行，
@@ -6972,7 +6984,7 @@ impl eframe::App for App {
                     plugin_evts.push(PluginEvt::ServerStarted(srv_name.clone()));
                 }
                 if buf.len() > old_len {
-                    let new_part = &buf[old_len..];
+                    let new_part = safe_from(&buf, old_len);
                     for line in new_part.split('\n') {
                         let line = line.trim_end();
                         if line.is_empty() {
