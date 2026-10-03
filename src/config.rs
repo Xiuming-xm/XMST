@@ -161,6 +161,10 @@ pub struct GlobalConfig {
     /// 模组社区收藏（Modrinth project_id 列表，图2 收藏夹导航）
     #[serde(default)]
     pub mod_favorites: Vec<String>,
+    /// 服务器详情 → 文件浏览 → mods 页的启用状态过滤（全局一项，切换服务器/重启后保持）：
+    /// "all" = 全部 / "enabled" = 已启用（不含 .disabled）/ "disabled" = 已禁用（.disabled）
+    #[serde(default = "default_mod_filter")]
+    pub mod_filter: String,
 }
 
 fn default_max_log_lines() -> usize {
@@ -225,6 +229,11 @@ fn default_plugin_bg_alpha() -> f32 {
 
 fn default_toast_style() -> String {
     "slide".to_string()
+}
+
+/// mods 页启用状态过滤默认「全部」（与旧版行为一致：不隐藏任何文件）
+fn default_mod_filter() -> String {
+    "all".to_string()
 }
 
 fn default_toast_duration() -> f32 {
@@ -303,7 +312,59 @@ impl Default for GlobalConfig {
             nav_collapsed: false,
             translate_glossary: Vec::new(),
             mod_favorites: Vec::new(),
+            mod_filter: "all".to_string(),
         }
+    }
+}
+
+/// 规范化 mods 页的启用状态过滤值：非法/空值一律当作「全部」。
+/// 配置文件里的值可能来自手改或被旧版本写入，不能直接拿去比较。
+pub fn normalize_mod_filter(v: &str) -> &'static str {
+    match v {
+        "enabled" => "enabled",
+        "disabled" => "disabled",
+        _ => "all",
+    }
+}
+
+/// mods 目录里可启用/禁用的模组文件（.jar / .jar.disabled；大小写不敏感）。
+/// 每帧过滤会调用它，故只做后缀比较而不 to_lowercase（避免每行一次分配）。
+pub fn is_mod_jar(name: &str) -> bool {
+    has_ext_ci(name, "jar") || is_disabled_mod(name)
+}
+
+/// 是否为「已禁用」的模组文件：文件名以 .jar.disabled 结尾（mods 页禁用态后缀）。
+/// 与「启用/禁用」按钮的判定保持一致，避免列表把别的 .disabled 文件当成可启用的模组。
+pub fn is_disabled_mod(name: &str) -> bool {
+    strip_ext_ci(name, "disabled")
+        .map(|stem| has_ext_ci(stem, "jar"))
+        .unwrap_or(false)
+}
+
+/// 去扩展名（扩展名大小写不敏感），返回主干
+fn strip_ext_ci<'a>(name: &'a str, ext: &str) -> Option<&'a str> {
+    let (stem, got) = name.rsplit_once('.')?;
+    got.eq_ignore_ascii_case(ext).then_some(stem)
+}
+
+/// 扩展名判断（大小写不敏感）
+fn has_ext_ci(name: &str, ext: &str) -> bool {
+    name.rsplit_once('.')
+        .map(|(_, got)| got.eq_ignore_ascii_case(ext))
+        .unwrap_or(false)
+}
+
+/// 某文件是否通过当前的启用状态过滤。
+/// 过滤只作用于 .jar / .jar.disabled：其它文件在「全部」下保留，
+/// 在「已启用 / 已禁用」下隐藏（它们和模组启用状态无关）。
+pub fn mod_filter_matches(filter: &str, name: &str, is_dir: bool) -> bool {
+    if is_dir || !is_mod_jar(name) {
+        return filter == "all";
+    }
+    match filter {
+        "enabled" => !is_disabled_mod(name),
+        "disabled" => is_disabled_mod(name),
+        _ => true,
     }
 }
 

@@ -18,7 +18,10 @@ mod spark_analysis;
 mod theme;
 
 use chrono::Local;
-use config::{GlobalConfig, JavaHome, ServerConfig, TunnelConfig, CONFIG_FILE, OLD_CONFIG_FILE};
+use config::{
+    is_disabled_mod as file_is_disabled_mod, is_mod_jar as file_is_mod_jar, mod_filter_matches,
+    GlobalConfig, JavaHome, ServerConfig, TunnelConfig, CONFIG_FILE, OLD_CONFIG_FILE,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use rhai::Dynamic;
@@ -5767,6 +5770,16 @@ impl App {
 
     /// 右下角自绘通知（替代系统气泡）：按配置的弹出方式与滞留时间渲染
     fn push_toast(&mut self, title: &str, body: &str) {
+        // 同类通知合并：标题与正文完全相同（例如后台线程连续报同一个错误）时只保留最新一条，
+        // 并把它的滞留时间重新计时，避免刷屏式堆叠把界面挡满。
+        if let Some(old) = self
+            .toasts
+            .iter_mut()
+            .find(|t| t.cancel_server.is_none() && t.title == title && t.body == body)
+        {
+            old.born = std::time::Instant::now();
+            return;
+        }
         self.next_toast_id += 1;
         self.toasts.push(ToastMsg {
             id: self.next_toast_id,
@@ -5775,15 +5788,16 @@ impl App {
             born: std::time::Instant::now(),
             cancel_server: None,
         });
-        // 最多同时保�?4 条，超出丢弃最旧的
-        if self.toasts.len() > 4 {
-            self.toasts.remove(0);
-        }
+        self.trim_toasts();
     }
 
     /// 崩溃自动重启通知：与普通通知一样弹出，但附带「取消自动重启」按钮，
     /// 并且在待执行重启期间不自动消失（否则倒计时只有几秒，用户根本来不及点）。
     fn push_toast_cancel_restart(&mut self, idx: usize, title: &str, body: &str) {
+        // 同一台服务器的「即将重启」只保留最新一条：重启倒计时会被重置（可能多次计划），
+        // 旧卡片的倒计时秒数已经过时，留着既占位置又会和新卡片挤在一起。
+        self.toasts
+            .retain(|t| t.cancel_server != Some(idx));
         self.next_toast_id += 1;
         self.toasts.push(ToastMsg {
             id: self.next_toast_id,
@@ -5792,8 +5806,19 @@ impl App {
             born: std::time::Instant::now(),
             cancel_server: Some(idx),
         });
-        if self.toasts.len() > 4 {
-            self.toasts.remove(0);
+        self.trim_toasts();
+    }
+
+    /// 通知数量上限：超出时丢弃最旧的；带「取消自动重启」按钮的通知（用户必须有机会操作）
+    /// 优先保留，先丢普通通知；若全是待取消的重启通知则丢最旧的，保证列表不会无限增长。
+    fn trim_toasts(&mut self) {
+        while self.toasts.len() > TOAST_MAX {
+            let pos = self
+                .toasts
+                .iter()
+                .position(|t| t.cancel_server.is_none())
+                .unwrap_or(0);
+            self.toasts.remove(pos);
         }
     }
 
@@ -5913,15 +5938,25 @@ $timer.Start(); \
         let now = std::time::Instant::now();
         let screen = ctx.screen_rect();
         let margin = 12.0_f32;
-        let card_w = 320.0_f32.min(screen.width() - 2.0 * margin).max(200.0);
-        let card_h = 62.0_f32;
-        // 带「取消自动重启」按钮的通知要更高：正文下面多一行倒计时 + 按钮
-        let card_h_btn = card_h + 32.0;
+        // 宽度自适应：长文案不横向溢出窗口（屏幕越窄卡片越窄，正文用换行占更多行高）
+        let card_w = (screen.width() - 2.0 * margin).min(TOAST_MAX_W).max(160.0);
+        let frame = egui::Frame::window(&ctx.style())
+            .fill(egui::Color32::from_rgba_unmultiplied(32, 34, 42, 240))
+            .rounding(egui::Rounding::same(10.0))
+            .shadow(egui::epaint::Shadow {
+                offset: egui::vec2(0.0, 4.0),
+                blur: 18.0,
+                spread: 0.0,
+                color: egui::Color32::from_black_alpha(90),
+            });
+        // 卡片左右内边距（下方还要再减去左侧强调条与该条的间距），用于反推正文的换行宽度
+        let frame_pad = frame.inner_margin.sum().x;
+        let text_w = (card_w - frame_pad - TOAST_BAR_W - TOAST_BAR_GAP).max(40.0);
         let gap = 8.0_f32;
         let anim = if self.cfg.ui_animations { 0.25_f32 } else { 0.001_f32 }; // 进出动画时长（秒）；关闭动效时近似瞬时
         let total = hold + 2.0 * anim;
         // 逐条计算位置与透明度，渲染后移除过期项
-        // (id, 标题, 正文, 取消按钮目标服务器, 倒计时秒数, 位置, 透明度)
+        // (id, 标题, 正文, 取消按钮目标服务器, 倒计时秒数, 位置, 透明度, 实测卡片高度)
         let mut render: Vec<(
             u64,
             String,
@@ -5930,9 +5965,14 @@ $timer.Start(); \
             Option<u64>,
             egui::Pos2,
             f32,
+            f32,
         )> = Vec::new();
         let mut alive: Vec<ToastMsg> = Vec::new();
-        // 卡片自下往上堆叠：每张高度可能不同（是否带取消按钮），逐张累加而不是按下标乘固定高度
+        // 卡片自下往上堆叠。为什么不能再用固定卡片高度：通知卡的实际高度取决于
+        // 标题/正文换行后的行数、是否带「倒计时 + 取消自动重启」按钮 —— 崩溃原因分析正文
+        // 可能占 3~6 行，取消重启卡片还要多一行按钮。一旦按下标乘固定高度，后面的卡片就会
+        // 压在先画的卡片上（多类型通知同屏时严重重叠）。这里改成先用字体度量量出每条卡片的
+        // 真实高度，再逐条累加 y 坐标，任何高度组合都不会重叠。
         let mut y_bottom = screen.bottom() - margin;
         for t in self.toasts.iter() {
             let el = now.duration_since(t.born).as_secs_f32();
@@ -5963,8 +6003,17 @@ $timer.Start(); \
             } else {
                 1.0
             };
-            let h = if pending { card_h_btn } else { card_h };
+            // 同一时刻最多画 TOAST_MAX 条；多出来的留到下一帧（列表仍保留，不会丢通知）
+            if render.len() >= TOAST_MAX {
+                continue;
+            }
+            // 按本条卡片的真实高度计算它的位置（y_bottom 逐条累加，任何高度组合都不会重叠）
+            let h = measure_toast_card_height(ctx, &t.title, &t.body, pending, text_w);
             let y = y_bottom - h;
+            if y < screen.top() {
+                // 屏幕高度实在放不下：本条本帧不画也不丢，等上面的通知消失后自然出现
+                continue;
+            }
             let x = match style.as_str() {
                 "fade" => screen.right() - margin - card_w,
                 _ => {
@@ -5989,20 +6038,22 @@ $timer.Start(); \
                 countdown,
                 egui::pos2(x, y),
                 alpha,
+                h,
             ));
             y_bottom = y - gap;
         }
         self.toasts = alive;
         // 点击取消只记录，渲染循环结束后统一处理（避免与 self.toasts 的借用冲突）
         let mut cancel_clicked: Option<usize> = None;
-        for (id, title, body, cancel_server, countdown, pos, alpha) in render {
+        for (id, title, body, cancel_server, countdown, pos, alpha, card_h) in render {
             let mut clicked_here = false;
-            let bar_h = if cancel_server.is_some() { card_h_btn - 16.0 } else { card_h - 16.0 };
+            // 左侧强调条按卡片实际高度铺满（上下各留 8px），不再用固定高度推算
+            let bar_h = (card_h - 16.0).max(24.0);
             egui::Area::new(egui::Id::new(("toast", id)))
                 .order(egui::Order::Foreground)
                 .fixed_pos(pos)
                 .show(ctx, |ui| {
-                    let frame = egui::Frame::window(&ctx.style())
+                    let card_frame = egui::Frame::window(&ctx.style())
                         .fill(egui::Color32::from_rgba_unmultiplied(32, 34, 42, (alpha * 240.0) as u8))
                         .rounding(egui::Rounding::same(10.0))
                         .shadow(egui::epaint::Shadow {
@@ -6011,7 +6062,7 @@ $timer.Start(); \
                             spread: 0.0,
                             color: egui::Color32::from_black_alpha(90),
                         });
-                    frame.show(ui, |ui| {
+                    card_frame.show(ui, |ui| {
                         ui.set_width(card_w);
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 8.0;
@@ -6025,13 +6076,16 @@ $timer.Start(); \
                             }
                             painter.rect_filled(resp.rect, 2.0, fill);
                             ui.vertical(|ui| {
-                                ui.set_width(card_w - 24.0);
+                                ui.set_width(text_w);
+                                // 标题与正文都按 text_w 截断/换行：与高度测量用的是同一个宽度，
+                                // 保证「量出来的高度」不小于「实际画出来的高度」
                                 ui.add(
                                     egui::Label::new(
                                         egui::RichText::new(&title)
                                             .strong()
                                             .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, (alpha * 255.0) as u8)),
-                                    ),
+                                    )
+                                    .truncate(),
                                 );
                                 ui.add(
                                     egui::Label::new(
@@ -6056,7 +6110,7 @@ $timer.Start(); \
                                                 )),
                                         );
                                         if ui
-                                            .add(egui::Button::new(RichText::new("取消自动重启").size(12.0)))
+                                            .add(egui::Button::new(RichText::new(TOAST_CANCEL_BTN_TEXT).size(12.0)))
                                             .clicked()
                                         {
                                             clicked_here = true;
@@ -11493,6 +11547,57 @@ impl App {
                 self.runtimes[idx].file_search.clear();
             }
         });
+        // mods 页：启用/禁用过滤（沿用页面的 selectable_label 小分段风格），
+        // 与搜索、排序互不冲突 —— 处理顺序固定为「类型过滤 → 搜索 → 排序」。
+        // 选择记在全局配置里（cfg.mod_filter），切换服务器、切换页签、重启程序都保持。
+        if self.runtimes[idx].file_tab == "mods" {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("显示:").weak());
+                let cur = config::normalize_mod_filter(&self.cfg.mod_filter);
+                let mut choice = cur;
+                for (key, label) in [("all", "全部"), ("enabled", "已启用"), ("disabled", "已禁用")] {
+                    if ui
+                        .selectable_label(choice == key, label)
+                        .on_hover_text(match key {
+                            "enabled" => "只显示未禁用的模组（文件名不含 .disabled）",
+                            "disabled" => "只显示已禁用的模组（文件名以 .jar.disabled 结尾）",
+                            _ => "显示全部文件",
+                        })
+                        .clicked()
+                    {
+                        choice = key;
+                    }
+                }
+                if choice != cur {
+                    self.cfg.mod_filter = choice.to_string();
+                    self.save_config();
+                }
+                // 统计小字：按「类型过滤 → 搜索」之后的结果计数（只看 .jar / .jar.disabled，与列表一致）
+                let (all_n, dis_n) = {
+                    let q = self.runtimes[idx].file_search.trim().to_lowercase();
+                    let mut all_n = 0usize;
+                    let mut dis_n = 0usize;
+                    for (n, _, is_dir) in self.runtimes[idx].file_list.iter() {
+                        if *is_dir || !file_is_mod_jar(n) {
+                            continue;
+                        }
+                        if !q.is_empty() && !n.to_lowercase().contains(&q) {
+                            continue;
+                        }
+                        all_n += 1;
+                        if file_is_disabled_mod(n) {
+                            dis_n += 1;
+                        }
+                    }
+                    (all_n, dis_n)
+                };
+                ui.label(
+                    RichText::new(format!("共 {all_n} · 启用 {} · 禁用 {dis_n}", all_n - dis_n))
+                        .weak()
+                        .small(),
+                );
+            });
+        }
         ui.separator();
 
         // 若首次进入，刷新列表
@@ -11535,11 +11640,38 @@ impl App {
                                 ui.label("目录为空或不存在（datapack 页签指向 world\\datapacks");
                             }
                             let q = self.runtimes[idx].file_search.trim().to_lowercase();
+                            // 过滤链：类型过滤（mods 页的 全部/已启用/已禁用）→ 搜索 → 排序。
+                            // mods 页的启用状态过滤只作用于 .jar / .jar.disabled；其它文件（配置、
+                            // 说明文档等）在「全部」下照常显示，在「已启用/已禁用」下隐藏 —— 避免
+                            // 「已禁用」列表里混进一堆和启用状态无关的文件。
+                            let mod_filter = if self.runtimes[idx].file_tab == "mods" {
+                                config::normalize_mod_filter(&self.cfg.mod_filter)
+                            } else {
+                                "all"
+                            };
                             let mut shown: Vec<(String, u64, bool)> = list
                                 .iter()
-                                .filter(|(n, _, _)| q.is_empty() || n.to_lowercase().contains(&q))
+                                .filter(|(n, _, is_dir)| {
+                                    mod_filter_matches(&mod_filter, n, *is_dir)
+                                        && (q.is_empty() || n.to_lowercase().contains(&q))
+                                })
                                 .cloned()
                                 .collect();
+                            // 空结果弱化提示（区分「被启用状态过滤掉」与「搜索没命中」）
+                            if shown.is_empty() && !list.is_empty() {
+                                let hint = if !q.is_empty() {
+                                    None
+                                } else {
+                                    match mod_filter {
+                                        "enabled" => Some("没有已启用的模组"),
+                                        "disabled" => Some("没有已禁用的模组"),
+                                        _ => None,
+                                    }
+                                };
+                                if let Some(t) = hint {
+                                    ui.label(RichText::new(t).weak());
+                                }
+                            }
                             // 收藏的文件置顶；其后客户端模组置顶（优先级低于收藏）；再按名称列头方向排序
                             let favs = self.runtimes[idx].file_favs.clone();
                             let client_mods = self.runtimes[idx]
@@ -21301,4 +21433,95 @@ fn render_analysis_text(ui: &mut egui::Ui, text: &str) {
         }
         ui.label(rt);
     }
+}
+
+// ---------- 右下角通知的尺寸常量与高度测量 ----------
+
+/// 同一时刻最多显示的通知条数（超出丢弃最旧的；待取消的重启通知优先保留）
+const TOAST_MAX: usize = 4;
+/// 通知卡片最大宽度（长文案在卡片内换行，不横向溢出窗口）
+const TOAST_MAX_W: f32 = 360.0;
+/// 卡片左侧强调条宽度与其右侧间距（与 draw_toasts 里的 allocate_painter/item_spacing 一致）
+const TOAST_BAR_W: f32 = 4.0;
+const TOAST_BAR_GAP: f32 = 8.0;
+/// 倒计时行与正文之间的额外间距
+const TOAST_EXTRA_ROW_SPACE: f32 = 4.0;
+/// 高度余量：字体度量与最终布局的取整差异，留一点避免边界上贴太紧
+const TOAST_MARGIN_EPS: f32 = 3.0;
+/// 「取消自动重启」按钮文案（高度测量与渲染共用，改文案不会让高度失配）
+const TOAST_CANCEL_BTN_TEXT: &str = "取消自动重启";
+
+/// 估算一条通知卡片的真实高度（标题换行行数 + 正文换行行数 + 可选的倒计时/按钮一行）。
+///
+/// 为什么需要它：卡片高度随文案长短变化很大 —— 崩溃原因分析的正文可能有 3~6 行，
+/// 带「取消自动重启」的卡片还要多出一行倒计时 + 按钮。若仍按固定高度（历史实现是 62px）
+/// 累加 y 坐标，后面的卡片就会画在先画的卡片上面，多条通知同屏时严重重叠。
+/// 这里用 egui 的字体度量按内容量出高度，调用方据此逐条累加，任何高度组合都不会重叠。
+fn measure_toast_card_height(
+    ctx: &egui::Context,
+    title: &str,
+    body: &str,
+    with_cancel_row: bool,
+    text_w: f32,
+) -> f32 {
+    let style = ctx.style();
+    let text_w = text_w.max(40.0);
+    let title_font = style
+        .text_styles
+        .get(&egui::TextStyle::Body)
+        .cloned()
+        .unwrap_or_else(|| egui::FontId::proportional(14.0));
+    let mut body_font = title_font.clone();
+    body_font.size = 13.0;
+    let small_font = egui::FontId::proportional(12.0);
+    // 标题按截断渲染（单行），正文按 text_w 换行；两者用同一个宽度测量
+    let title_h = ctx.fonts(|fonts| {
+        fonts
+            .layout(title.to_string(), title_font.clone(), egui::Color32::WHITE, f32::INFINITY)
+            .size()
+            .y
+    });
+    let body_h = ctx.fonts(|fonts| {
+        fonts
+            .layout(body.to_string(), body_font.clone(), egui::Color32::WHITE, text_w)
+            .size()
+            .y
+    });
+    let cancel_h = if with_cancel_row {
+        // 按钮高度：文本行高 + 上下内边距（+ 描边），与 egui 按钮的取高方式一致
+        let label_h = ctx.fonts(|fonts| {
+            fonts
+                .layout(
+                    "999 秒后自动重启（取消）".to_string(),
+                    small_font.clone(),
+                    egui::Color32::WHITE,
+                    f32::INFINITY,
+                )
+                .size()
+                .y
+        });
+        let btn_h = ctx.fonts(|fonts| {
+            fonts
+                .layout(
+                    TOAST_CANCEL_BTN_TEXT.to_string(),
+                    small_font.clone(),
+                    egui::Color32::WHITE,
+                    f32::INFINITY,
+                )
+                .size()
+                .y
+        }) + 2.0 * style.spacing.button_padding.y
+            + 2.0;
+        TOAST_EXTRA_ROW_SPACE + label_h.max(btn_h)
+    } else {
+        0.0
+    };
+    let item_gap = if with_cancel_row || !body.is_empty() {
+        style.spacing.item_spacing.y
+    } else {
+        0.0
+    };
+    let frame_pad_y = egui::Frame::window(&style).inner_margin.sum().y;
+    // 留足余量：宁可多算几像素，也不让下一张卡片压上来
+    frame_pad_y + title_h + item_gap + body_h + cancel_h + TOAST_MARGIN_EPS
 }
