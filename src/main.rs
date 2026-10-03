@@ -5539,6 +5539,7 @@ pub fn run_open_diag(target: &str) {
             Ok(c) => w(format!("① cmd start: spawn OK pid={}", c.id())),
             Err(e) => w(format!("① cmd start: 失败 {e} (raw={:?})", e.raw_os_error())),
         }
+        std::thread::sleep(std::time::Duration::from_millis(1200));
     }
     // ② explorer.exe <目标>
     {
@@ -5553,6 +5554,23 @@ pub fn run_open_diag(target: &str) {
             Ok(c) => w(format!("② explorer.exe: spawn OK pid={}", c.id())),
             Err(e) => w(format!("② explorer.exe: 失败 {e} (raw={:?})", e.raw_os_error())),
         }
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+    }
+    // ③ .NET 风格：ShellExecuteEx/W 且 **lpVerb = NULL**（默认动词）——PCL 等 .NET 启动器
+    //    就是这么打开的（ProcessStartInfo.UseShellExecute = true）
+    w(format!(
+        "③ ShellExecute(默认动词) 返回={}",
+        shell_exec_default_raw(target)
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    // ④ powershell Invoke-Item（等价于在干净进程里做 ShellExecute）
+    {
+        let ps = format!("Invoke-Item -LiteralPath '{}'", target.replace('\'', "''"));
+        match powershell_status(&ps, 8) {
+            Some(c) => w(format!("④ powershell Invoke-Item: 退出码={c}")),
+            None => w("④ powershell Invoke-Item: 启动失败/超时".to_string()),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1200));
     }
     // ③ ShellExecuteW explore
     w(format!("③ ShellExecute(explore) 返回={}", shell_explore_raw(target)));
@@ -5574,6 +5592,42 @@ pub fn run_open_diag(target: &str) {
     eprintln!("{log}");
 }
 
+/// ShellExecuteW 且 lpVerb = NULL（默认动词，等价于 .NET UseShellExecute=true）。
+fn shell_exec_default_raw(s: &str) -> isize {
+    use winapi::um::shellapi::ShellExecuteW;
+    use winapi::um::winuser::SW_SHOWNORMAL;
+    let f: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            f.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        ) as isize
+    }
+}
+
+/// 用 COM 枚举资源管理器窗口，判断某个路径的窗口是否真的存在（校验"是否真打开了"）。
+fn window_exists(path: &str) -> bool {
+    let ps = format!(
+        "$s=New-Object -ComObject Shell.Application; ($s.Windows() | Where-Object {{ try {{ $_.Document.Folder.Self.Path -eq '{}' }} catch {{ $false }} }} | Measure-Object).Count",
+        path.replace('\'', "''")
+    );
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &ps])
+        .current_dir(sane_cwd())
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .output();
+    match out {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).trim() != "0",
+        Err(_) => false,
+    }
+}
 /// ShellExecuteW("explore", s) 的原始返回值（诊断用）。
 /// 写"打开目录"诊断日志到 <exe目录>\data\open_diag.log。
 fn write_open_log(s: &str) {
