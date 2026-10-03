@@ -587,10 +587,31 @@ fn file_sig(p: &Path) -> Option<(u64, u64)> {
 /// FNV-1a 64 位内容哈希
 /// 判断路径中是否包含名为 backup 的目录段（不区分大小写）。
 /// 用于备份遍历时整棵跳过：避免把模组/工具自身生成的 backup 文件夹再次打进备份。
-fn has_backup_dir_segment(path: &Path) -> bool {
-    path.components()
-        .filter_map(|c| c.as_os_str().to_str())
-        .any(|seg| seg.to_ascii_lowercase().contains("backup"))
+fn has_backup_dir_segment(p: &Path) -> bool {
+    // ★ 只检查路径的**最后两段**，且只认精确的保留目录名。
+    //
+    // 旧实现用 `seg.to_ascii_lowercase().contains("backup")` 扫描**绝对路径的所有段**，
+    // 而快照目录本身叫 `.mcsrv_backups`（含 "backup"）→ 遍历快照时把所有子目录剪掉，
+    // 镜像里只剩第一层文件，对比时每个嵌套文件都算"新增" →
+    // **每次备份都退化成全量**（用户实测"存储暴增"的直接原因）；
+    // 另外服务器路径里任一级含 "backup"（如 D:\Backups\srv）会导致正式备份把
+    // world 数据整棵剪掉、只打包顶层文件，却报告成功（静默丢数据）。
+    //
+    // 只看结尾两段即可正确区分：
+    //   .../.mcsrv_backups/snap/x/world/region  → ["world","region"] 不是保留目录 ✓ 不剪
+    //   D:\Backups\srv\world\region             → ["world","region"] ✓ 不剪
+    //   <server>/world/backup/                  → ["world","backup"] ✓ 正确剪掉
+    let mut segs: Vec<String> = p
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s.to_string_lossy().to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect();
+    let keep_from = segs.len().saturating_sub(2);
+    let tail = segs.split_off(keep_from);
+    tail.iter()
+        .any(|s| s == ".mcsrv_backups" || s == "backup" || s == "backups")
 }
 
 /// 判断是否为运行时临时/锁文件（服务器运行期间高频变化或处于锁定状态，不应进入备份）：

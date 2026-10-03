@@ -1,6 +1,6 @@
 [package]
 name = "xmst"
-version = "0.1.0-alpha"
+version = "0.1.1-alpha"
 edition = "2021"
 description = "Xiuming's Minecraft Server Tool - Minecraft 服务器运行管理工具"
 default-run = "xmst"
