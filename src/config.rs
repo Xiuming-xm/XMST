@@ -509,6 +509,74 @@ pub struct BackupConfig {
     /// gives up at 0; tick_backup retries pending entries on later ticks)
     #[serde(default = "default_remote_retry")]
     pub remote_retry: u32,
+    /// 快照排除表：目录名 / 文件名 / `*.后缀`（同样不参与变化对比）
+    #[serde(default = "default_backup_exclude")]
+    pub exclude: Vec<String>,
+    /// 正常关服后自动做一份快照
+    #[serde(default = "default_backup_on_stop")]
+    pub backup_on_stop: bool,
+    /// 崩溃/强杀后也做快照（默认关闭：崩溃瞬间的世界文件可能是写坏的）
+    #[serde(default)]
+    pub backup_on_crash: bool,
+    /// 两次自动快照（关服/定时）之间的最小间隔（分钟），用于防抖
+    #[serde(default = "default_auto_min_interval")]
+    pub auto_min_interval_min: u64,
+    /// 保留策略：最近 N 份
+    #[serde(default = "default_keep_recent")]
+    pub keep_recent: usize,
+    /// 保留策略：每天 N 份
+    #[serde(default = "default_keep_daily")]
+    pub keep_daily: usize,
+    /// 保留策略：每周 N 份
+    #[serde(default = "default_keep_weekly")]
+    pub keep_weekly: usize,
+    /// 上次自动（关服/定时）快照时间（ISO 字符串），防抖用
+    #[serde(default)]
+    pub last_snapshot_time: Option<String>,
+    /// 回退范围：all / world / config / mods
+    #[serde(default = "default_restore_scope")]
+    pub restore_scope: String,
+}
+
+/// 快照排除表默认值（与 backup::default_excludes 保持一致）
+fn default_backup_exclude() -> Vec<String> {
+    [
+        "logs",
+        "crash-reports",
+        "session.lock",
+        "*.lock",
+        "cache",
+        "debug",
+        ".mcsrv_backups",
+        ".mcsrv_trash",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+fn default_backup_on_stop() -> bool {
+    true
+}
+
+fn default_auto_min_interval() -> u64 {
+    10
+}
+
+fn default_keep_recent() -> usize {
+    24
+}
+
+fn default_keep_daily() -> usize {
+    7
+}
+
+fn default_keep_weekly() -> usize {
+    4
+}
+
+fn default_restore_scope() -> String {
+    "all".to_string()
 }
 
 fn default_mem_threshold() -> u8 {
@@ -547,6 +615,15 @@ impl Default for BackupConfig {
             remote_user: String::new(),
             remote_password: String::new(),
             remote_retry: 2,
+            exclude: default_backup_exclude(),
+            backup_on_stop: true,
+            backup_on_crash: false,
+            auto_min_interval_min: 10,
+            keep_recent: 24,
+            keep_daily: 7,
+            keep_weekly: 4,
+            last_snapshot_time: None,
+            restore_scope: "all".to_string(),
         }
     }
 }

@@ -29,7 +29,7 @@ Rust 桌面端 Minecraft 服务器管理工具：**egui/eframe 0.29 + glow(OpenG
 | `backdrop.rs` | **桌面捕获式材质**（半透明/毛玻璃/亚克力）：worker 线程 BitBlt → 模糊 → 纹理 |
 | `process.rs` | 服务器进程启动/停止/stdout 采集（Job Object kill-on-close、日志尾读） |
 | `perf.rs` | 进程树 CPU/内存采样 |
-| `backup.rs` | 世界/配置备份（快照 + 增量镜像 + zip + 回退） |
+| `backup.rs` | 世界/配置备份（**硬链接快照** + 清单/元信息 + 完整性校验 + 保留策略 + 回退；兼容旧版全量/增量 zip） |
 | `config.rs` | 配置结构体与默认值（读写实现在 `main.rs::save_config/flush_config/load_config`） |
 | `theme.rs` | 调色板、`auto_contrast`、egui `Visuals` 展开 |
 | `modrinth.rs` | Modrinth API（搜索/版本/下载地址/**翻译**/**SHA1 指纹**） |
@@ -141,7 +141,10 @@ egui 的 `ui_*` 每帧执行。曾出现（已修/部分修）：
 ### 4.5 数据安全：配置与备份
 - `save_config` 必须是**原子写**（tmp → `.bak` → `rename`），**序列化失败绝不写空文件**（曾把配置清空，用户丢过多次）；拖拽滑块要**去抖**（曾每帧整文件重写）。
 - `load_config` 解析失败要**先留档坏文件**（`xmst_config.broken_*.json`）再从 `.bak` 恢复，**不要**静默默认值然后覆盖。
-- 备份系统已知问题（**待修，用户会补需求**）：快照遍历被"含 backup 的路径"误剪枝 → 增量退化为全量、检测不到删除；`.mcsrv_trash` 的 `rename` 未检查结果；回退在 UI 线程执行。
+- 备份系统（2026-10-04 改造完成）：新格式是 `.mcsrv_backups/snapshots/<yyyyMMdd_HHmmss>/` 的**硬链接快照**——与上一份相比 size + **100ns 精度 mtime** 未变的文件用 `fs::hard_link` 指过去（不占新空间），变化文件才复制；每份带 `meta.json` + `manifest.json`，写完做完整性校验（失败删除该份）；变化判定不再用内容全量哈希（慢）与秒级 mtime（同秒改写漏检）。排除表默认 `logs`/`crash-reports`/`session.lock`/`*.lock`/`cache`/`debug`/`.mcsrv_backups`/`.mcsrv_trash`，既不备份也不参与对比。触发：手动 / **正常关服**（日志 `Stopping server`/`Saving worlds` 或退出码 0，且无新增崩溃报告；有最小间隔防抖）/ 定时；**崩溃默认不备份**（`backup_on_crash`，默认 false）。快照与回退都在后台线程（`spawn_backup`/`spawn_restore` + mpsc），回退前自动生成一份快照、`.mcsrv_trash` 改名失败立即中止、失败文件清单回传界面。旧版全量/增量 zip 仍可列表与链式回退（`build_zip_chain`/`apply_zip`），且不在清理范围内。
+  - ★ **硬链接的固有代价**：若源文件被"原地改写"（长度不变、mtime 变），旧快照里指向同一份数据的硬链接也会跟着变。MC 正常保存会重写 region 文件，所以不要把快照目录本身当成防篡改归档；`manifest.json` 的 size 校验只能发现长度变化。
+  - ★ 界面每帧不得解析清单：`list_snapshots` 走 `SNAP_TOTAL_CACHE`（按清单大小 + mtime 记忆化），`ui_backup` 另有 2 秒 TTL 列表/总览缓存。
+- 备份系统历史坑（已修，勿回退）：快照遍历被"含 backup 的路径"误剪枝 → 增量退化为全量（`has_backup_dir_segment` 只看最后两段 + 精确目录名）。
 
 ### 4.6 稳定性
 - release 是 **`panic=abort`**：任何 `unwrap()` panic = 进程直接消失。**锁访问一律** `lock().unwrap_or_else(|e| e.into_inner())`（已完成 22 处）。
@@ -165,7 +168,7 @@ egui 的 `ui_*` 每帧执行。曾出现（已修/部分修）：
 
 ## 6. 已知问题 / 待办（按建议优先级）
 
-1. **备份三连**（等用户补需求）：增量剪枝误伤自身、`.mcsrv_trash` rename 未校验即覆盖、回退阻塞 UI 30 s+、`apply_zip` 整文件读入内存。
+1. **备份**（2026-10-04 已改造，见 §4.5）：剩余项 —— 远端转存（`BETA_REMOTE_BACKUP`）目前只对旧版 zip 生效，快照是目录、未做远端同步；硬链接快照在"源文件原地改写"时会使旧快照内容同步变化（见 §4.5 的代价说明），若要做防篡改归档需改为复制或加写时校验。
 2. **模组"检查更新"**：现已在 `设置 → 测试功能 → 模组检查更新`（`beta.server.mod_update`，**默认禁用**）。重做方案：读 jar 内 `fabric.mod.json`/`mods.toml` 取 **modid** → 查 Modrinth 项目/版本（按 MC 版本+加载器过滤）→ 与本地版本比对；交互改为**只检查并在弹窗里报告可更新版本**（用户选择，不自动替换）。
 3. **启动自检 Low IL**：检测到低完整性时直接提示修复命令（避免再次误判）。
 4. **插件缓存 key**：`plugins.rs::cache_key` 把所有非 ASCII 字符替换成 `_` → 两个中文名插件共用目录且互相 `remove_dir_all`，需追加名称哈希。

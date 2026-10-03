@@ -1482,6 +1482,22 @@ struct App {
     backup_inflight: HashSet<usize>,
     backup_tx: std::sync::mpsc::Sender<(usize, Result<backup::BackupResult, String>)>,
     backup_rx: std::sync::mpsc::Receiver<(usize, Result<backup::BackupResult, String>)>,
+    /// 回退（关服 + 恢复前快照 + 复制回写）全程后台执行，通过该通道回传
+    restore_tx: std::sync::mpsc::Sender<(usize, Result<backup::RestoreReport, String>)>,
+    restore_rx: std::sync::mpsc::Receiver<(usize, Result<backup::RestoreReport, String>)>,
+    restore_inflight: HashSet<usize>,
+    /// 关服退出时发起的快照（退出前必须等它写完，否则进程退出会打断线程）
+    exit_snapshot_inflight: HashSet<usize>,
+    /// 备份维护（删除单份 / 保留策略清理）后台回传：(服务器序号, 结果消息)
+    maint_tx: std::sync::mpsc::Sender<(usize, Result<String, String>)>,
+    maint_rx: std::sync::mpsc::Receiver<(usize, Result<String, String>)>,
+    /// 备份列表缓存：避免每帧读盘解析 meta/manifest
+    backup_cache: Option<(usize, std::time::Instant, Vec<backup::BackupInfo>)>,
+    /// 存储总览缓存（同样避免每帧解析清单）
+    backup_stats_cache: Option<(usize, std::time::Instant, backup::StorageStats)>,
+    /// 排除表编辑缓冲（TextEdit 需要跨帧持久文本；切换服务器时重置）
+    backup_exclude_text: String,
+    backup_exclude_for: Option<usize>,
     /// 优雅停止后台线程回传�?(服务器下�? 是否优雅完成)
     stop_tx: std::sync::mpsc::Sender<(usize, bool)>,
     stop_rx: std::sync::mpsc::Receiver<(usize, bool)>,
@@ -1530,7 +1546,7 @@ struct App {
     /// 诊断（只取一次）：GL 默认帧缓冲的 (红位数, alpha 位数)；None = 取不到 GL 上下文。
     /// alpha=0 说明像素格式根本没有 alpha 通道 —— 逐像素窗口透明不可能生效。
     gl_fb_bits: Option<(i32, i32)>,
-    confirm_restore: Option<(usize, PathBuf, String)>, // (server_idx, zip, name)
+    confirm_restore: Option<(usize, PathBuf, String, Vec<String>)>, // (server_idx, 备份路径, 名称, 恢复范围)
     confirm_delete_backup: Option<(usize, PathBuf, String)>, // (server_idx, zip, name)
     /// 右键重命名弹窗： (server_idx, 当前�?
     rename_server: Option<(usize, String)>,
@@ -1831,6 +1847,8 @@ impl App {
             }
         }
         let (backup_tx, backup_rx) = std::sync::mpsc::channel();
+        let (restore_tx, restore_rx) = std::sync::mpsc::channel();
+        let (maint_tx, maint_rx) = std::sync::mpsc::channel();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel();
         let (rathole_tx, rathole_rx) = std::sync::mpsc::channel();
         let (remote_tx, remote_rx) = std::sync::mpsc::channel();
@@ -1872,6 +1890,16 @@ impl App {
             backup_inflight: HashSet::new(),
             backup_tx,
             backup_rx,
+            restore_tx,
+            restore_rx,
+            restore_inflight: HashSet::new(),
+            exit_snapshot_inflight: HashSet::new(),
+            maint_tx,
+            maint_rx,
+            backup_cache: None,
+            backup_stats_cache: None,
+            backup_exclude_text: String::new(),
+            backup_exclude_for: None,
             stop_tx,
             stop_rx,
             stop_inflight: HashSet::new(),
@@ -2467,15 +2495,26 @@ impl App {
                 "XMST - 服务器已停止",
                 &format!("{name} 已{}", if ok { "优雅停止" } else { "超时强制结束" }),
             );
+            // 正常关服（等待到进程退出）→ 自动做一份 reason=stop 的快照；超时强杀不算正常关闭
+            if ok {
+                let tail = self
+                    .runtimes
+                    .get(idx)
+                    .map(|rt| rt.log_buf.clone())
+                    .unwrap_or_default();
+                let new_crash = self.server_new_crash_report(idx);
+                self.try_exit_snapshot(idx, true, None, &tail, new_crash);
+            }
         }
-        // 确认退出模式：所有服务器均已停止且无停止中任务，放行退出（由关闭检查发�?Close�?
+        // 确认退出模式：所有服务器均已停止、无停止中任务、且关服快照已写完，放行退出
+        // （只等退出时触发的快照，耗时的手动备份不阻塞退出；否则进程退出会打断线程、丢掉最后一份快照）
         if self.closing_exit {
             let any_active = self
                 .runtimes
                 .iter()
                 .enumerate()
                 .any(|(i, rt)| rt.proc.is_some() || self.stop_inflight.contains(&i));
-            if !any_active {
+            if !any_active && self.exit_snapshot_inflight.is_empty() {
                 self.closing_exit = false;
                 self.ctx_close_pending = true;
             }
@@ -2709,13 +2748,78 @@ impl App {
             }
         }
 
-        // 处理后台线程回传的结�?
-        while let Ok((i, res)) = self.backup_rx.try_recv() {
-            self.backup_inflight.remove(&i);
+        // 回退后台回传（关服 + 恢复前快照 + 复制回写）
+        while let Ok((i, res)) = self.restore_rx.try_recv() {
+            self.restore_inflight.remove(&i);
+            self.backup_cache = None;
+            self.backup_stats_cache = None;
+            if let Some(rt) = self.runtimes.get_mut(i) {
+                rt.stopping = false;
+                rt.proc = None;
+                rt.last_msg = match &res {
+                    Ok(rep) => format!("回退完成，共恢复 {} 个文件", rep.restored),
+                    Err(e) => format!("回退失败: {e}"),
+                };
+            }
             match res {
-                Ok(r) => {
+                Ok(rep) => {
+                    let mut msg = format!(
+                        "回退完成，恢复 {} 个文件（原数据已移到 .mcsrv_trash/）",
+                        rep.restored
+                    );
+                    if !rep.failed.is_empty() {
+                        msg.push_str(&format!(
+                            "；{} 个文件恢复失败（多为被占用/无权限），原文件仍在 .mcsrv_trash/",
+                            rep.failed.len()
+                        ));
+                    }
+                    if let Some(p) = &rep.pre_snapshot {
+                        let n = p
+                            .file_name()
+                            .map(|x| x.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        msg.push_str(&format!("；已先生成恢复前快照 {n}"));
+                    }
+                    if let Some(w) = &rep.warning {
+                        msg.push_str(&format!("；{w}"));
+                    }
+                    self.set_toast(msg);
                     if let Some(sc) = self.cfg.servers.get_mut(i) {
                         sc.backup.last_backup = Some(Local::now().to_rfc3339());
+                    }
+                    self.save_config();
+                }
+                Err(e) => {
+                    self.set_toast(format!("回退失败: {e}"));
+                }
+            }
+        }
+
+        // 备份维护（删除单份 / 保留策略清理）后台回传
+        while let Ok((_i, res)) = self.maint_rx.try_recv() {
+            self.backup_cache = None;
+            self.backup_stats_cache = None;
+            match res {
+                Ok(m) => self.set_toast(m),
+                Err(e) => self.set_toast(format!("备份维护失败: {e}")),
+            }
+        }
+
+        // 处理后台线程回传的备份结果
+        while let Ok((i, res)) = self.backup_rx.try_recv() {
+            self.backup_inflight.remove(&i);
+            self.exit_snapshot_inflight.remove(&i);
+            self.backup_cache = None;
+            self.backup_stats_cache = None;
+            match res {
+                Ok(r) => {
+                    let now_s = Local::now().to_rfc3339();
+                    if let Some(sc) = self.cfg.servers.get_mut(i) {
+                        sc.backup.last_backup = Some(now_s.clone());
+                        // 关服/定时快照记录时间，用于自动快照防抖（手动备份不参与）
+                        if r.reason != backup::BackupReason::Manual {
+                            sc.backup.last_snapshot_time = Some(now_s);
+                        }
                     }
                     if r.changed {
                         let kind = r.kind.label();
@@ -2724,17 +2828,19 @@ impl App {
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_default();
-                        // 与备份列表口径一致：显示压缩后 zip 文件大小；若原始字节差异明显则附带说明
-                        let zip_size = std::fs::metadata(&r.path)
-                            .map(|m| m.len())
-                            .unwrap_or(r.bytes);
-                        let mut msg = format!("{kind}备份完成: {name} ({})", fmt_size(zip_size));
-                        if zip_size != r.bytes && r.bytes > 0 {
-                            msg.push_str(&format!("，原始数据 {}", fmt_size(r.bytes)));
+                        let mut msg = format!(
+                            "{kind}完成: {name}（共 {} 个文件 / {}，本次变化 {} 个、新增 {}）",
+                            r.files,
+                            fmt_size(r.total_bytes),
+                            r.copied,
+                            fmt_size(r.bytes)
+                        );
+                        if r.linked > 0 {
+                            msg.push_str(&format!("，其中 {} 个未变文件用硬链接（不占新空间）", r.linked));
                         }
                         if r.skipped > 0 {
                             msg.push_str(&format!(
-                                "，{} 个文件被占用已跳过（服务器运行时常见，关服后下次备份自动补上）",
+                                "，{} 个文件被占用已跳过（服务器运行时常见，关服后下次快照自动补上）",
                                 r.skipped
                             ));
                         }
@@ -2756,12 +2862,18 @@ impl App {
                                 ],
                             );
                         }
-                        // 阶段5：远端备份转存（配置了远端目标且开关开启时）
-                        if features::is_enabled(&self.cfg.features, features::BETA_REMOTE_BACKUP) {
+                        // 阶段5：远端备份转存（仅旧版 zip 结果；快照是目录，不做远端复制）
+                        if r.kind != backup::BackupKind::Snapshot
+                            && features::is_enabled(&self.cfg.features, features::BETA_REMOTE_BACKUP)
+                        {
                             self.try_remote_upload(i, r.path.clone());
                         }
                     } else {
-                        self.set_toast("备份检查完成：无变化，跳过本次备份".to_string());
+                        self.set_toast("自动快照检查完成：与上一份无变化，已跳过".to_string());
+                    }
+                    // 每次生成快照后按保留策略自动清理（后台执行；硬链接下删除是安全的）
+                    if r.changed {
+                        self.spawn_retention(i);
                     }
                     self.save_config();
                 }
@@ -2828,6 +2940,10 @@ impl App {
                 None => true,
             };
             if due {
+                // 防抖：距上次自动快照（关服/定时）不足最小间隔则跳过
+                if !self.auto_snapshot_allowed(i) {
+                    continue;
+                }
                 to_backup.push(i);
             }
         }
@@ -2835,7 +2951,7 @@ impl App {
             self.set_toast(msg);
         }
         for i in to_backup {
-            self.spawn_backup(i);
+            self.spawn_backup(i, backup::BackupReason::Auto, false);
         }
     }
 
@@ -2973,59 +3089,264 @@ impl App {
         }
     }
 
-    /// 在后台线程执行备份（低优先级 + 限速），完成后通过 channel 回传
-    fn spawn_backup(&mut self, idx: usize) {
-        if self.backup_inflight.contains(&idx) {
+    /// 在后台线程生成硬链接快照（低优先级 + 限速），完成后通过 channel 回传。
+    /// force=true（手动备份）时即使与上一份无差异也会生成一份新快照。返回是否真的发起了任务。
+    fn spawn_backup(&mut self, idx: usize, reason: backup::BackupReason, force: bool) -> bool {
+        if self.backup_inflight.contains(&idx)
+            || self.restore_inflight.contains(&idx)
+            || self.stop_inflight.contains(&idx)
+        {
+            return false;
+        }
+        let Some(sc) = self.cfg.servers.get(idx) else { return false };
+        if sc.dir.as_os_str().is_empty() || !sc.dir.exists() {
+            return false;
+        }
+        self.backup_inflight.insert(idx);
+        let dir = sc.dir.clone();
+        let server_name = sc.name.clone();
+        let folders = sc.backup.folders.clone();
+        let exclude = sc.backup.exclude.clone();
+        let throttle = sc.backup.throttle_mbps;
+        let tx = self.backup_tx.clone();
+        std::thread::spawn(move || {
+            backup::set_thread_low_priority();
+            let req = backup::SnapshotRequest {
+                server_dir: &dir,
+                server_name: &server_name,
+                folders: &folders,
+                exclude: &exclude,
+                throttle_mbps: throttle,
+                reason,
+                force,
+            };
+            let r = backup::create_snapshot(&req);
+            let _ = tx.send((idx, r));
+        });
+        true
+    }
+
+    /// 后台执行回退：先优雅关服 → 恢复前自动快照 → 原数据移入回收站 → 复制回写。
+    /// 全流程不占用 UI 线程（此前关服与解压都在 UI 线程，最坏冻结 30 秒以上）。
+    fn spawn_restore(&mut self, idx: usize, target: PathBuf, scope: Vec<String>) {
+        if self.backup_inflight.contains(&idx)
+            || self.restore_inflight.contains(&idx)
+            || self.stop_inflight.contains(&idx)
+        {
+            self.set_toast("已有备份/回退任务在执行，请稍后再试".to_string());
             return;
         }
         let Some(sc) = self.cfg.servers.get(idx) else { return };
         if sc.dir.as_os_str().is_empty() || !sc.dir.exists() {
             return;
         }
-        self.backup_inflight.insert(idx);
         let dir = sc.dir.clone();
+        let server_name = sc.name.clone();
         let folders = sc.backup.folders.clone();
+        let exclude = sc.backup.exclude.clone();
         let throttle = sc.backup.throttle_mbps;
-        let tx = self.backup_tx.clone();
+        // 进程句柄移交后台线程（与优雅停止同一套模式），避免 UI 线程等待关服
+        let proc = match self.runtimes.get_mut(idx) {
+            Some(rt) if rt.proc.is_some() => {
+                rt.stopping = true;
+                rt.proc.take()
+            }
+            _ => None,
+        };
+        if let Some(rt) = self.runtimes.get_mut(idx) {
+            rt.last_msg = "正在停止服务器并回退备份…".to_string();
+        }
+        self.restore_inflight.insert(idx);
+        self.backup_cache = None;
+        self.backup_stats_cache = None;
+        let tx = self.restore_tx.clone();
         std::thread::spawn(move || {
             backup::set_thread_low_priority();
-            let r = backup::create_backup(&dir, &folders, throttle);
+            let mut warns: Vec<String> = Vec::new();
+            // 1) 等服务器保存世界并退出（超时会被强制结束，需要如实告诉用户）
+            if let Some(p) = proc.as_ref() {
+                if !process::stop_gracefully(p, 60) {
+                    warns.push("服务器未在 60 秒内优雅退出，已强制结束进程".to_string());
+                }
+            }
+            // 2) 恢复前自动快照；失败不阻断回退（原数据另有 .mcsrv_trash 兜底）
+            let pre = backup::create_snapshot(&backup::SnapshotRequest {
+                server_dir: &dir,
+                server_name: &server_name,
+                folders: &folders,
+                exclude: &exclude,
+                throttle_mbps: throttle,
+                reason: backup::BackupReason::Manual,
+                force: false,
+            });
+            let pre_snapshot = match pre {
+                Ok(r) if r.changed => Some(r.path),
+                Ok(_) => None,
+                Err(e) => {
+                    warns.push(format!("恢复前快照未生成（{e}）"));
+                    None
+                }
+            };
+            // 3) 应用备份内容
+            let res = backup::restore_backup(&dir, &target, &scope).map(|mut rep| {
+                rep.pre_snapshot = pre_snapshot;
+                if !warns.is_empty() {
+                    rep.warning = Some(warns.join("；"));
+                }
+                rep
+            });
+            let _ = tx.send((idx, res));
+        });
+    }
+
+    /// 后台按保留策略清理快照（删除整目录只减少链接数，安全）
+    fn spawn_retention(&mut self, idx: usize) {
+        let Some(sc) = self.cfg.servers.get(idx) else { return };
+        let dir = sc.dir.clone();
+        let policy = backup::RetentionPolicy {
+            keep_recent: sc.backup.keep_recent.max(1),
+            keep_daily: sc.backup.keep_daily,
+            keep_weekly: sc.backup.keep_weekly,
+        };
+        let tx = self.maint_tx.clone();
+        self.backup_cache = None;
+        self.backup_stats_cache = None;
+        std::thread::spawn(move || {
+            let r = backup::apply_retention(&dir, &policy).map(|n| {
+                if n == 0 {
+                    "没有需要清理的快照".to_string()
+                } else {
+                    format!("已按保留策略清理 {n} 份快照（其它快照的数据仍完整）")
+                }
+            });
             let _ = tx.send((idx, r));
         });
     }
 
-    fn do_restore(&mut self) {
-        if let Some((idx, zip, _name)) = self.confirm_restore.take() {
-            let folders = self
-                .cfg
-                .servers
-                .get(idx)
-                .map(|s| s.backup.folders.clone())
-                .unwrap_or_default();
-            let dir = self
-                .cfg
-                .servers
-                .get(idx)
-                .map(|s| s.dir.clone())
-                .unwrap_or_default();
-            // 先停止服务器
-            if let Some(rt) = self.runtimes.get(idx) {
-                if let Some(p) = &rt.proc {
-                    let _ = process::stop_gracefully(p, 30);
-                }
-            }
-            if let Some(rt) = self.runtimes.get_mut(idx) {
-                rt.proc = None;
-            }
-            match backup::restore_backup(&dir, &zip, &folders) {
-                Ok(n) => {
-                    self.set_toast(format!("回退完成，恢复 {n} 个文件（旧内容在 .mcsrv_trash/）"));
-                }
-                Err(e) => {
-                    self.set_toast(format!("回退失败: {e}"));
-                }
+    /// 备份列表缓存（2 秒 TTL，避免每帧解析清单）
+    fn backup_list_cached(&mut self, idx: usize) -> Vec<backup::BackupInfo> {
+        let ttl = std::time::Duration::from_secs(2);
+        if let Some((i, at, list)) = &self.backup_cache {
+            if *i == idx && at.elapsed() < ttl {
+                return list.clone();
             }
         }
+        let dir = self
+            .cfg
+            .servers
+            .get(idx)
+            .map(|s| s.dir.clone())
+            .unwrap_or_default();
+        let list = backup::list_backups(&dir);
+        self.backup_cache = Some((idx, std::time::Instant::now(), list.clone()));
+        list
+    }
+
+    /// 存储总览缓存（2 秒 TTL）
+    fn storage_stats_cached(&mut self, idx: usize) -> backup::StorageStats {
+        let ttl = std::time::Duration::from_secs(2);
+        let Some(sc) = self.cfg.servers.get(idx) else {
+            return backup::StorageStats::default();
+        };
+        let dir = sc.dir.clone();
+        let policy = backup::RetentionPolicy {
+            keep_recent: sc.backup.keep_recent.max(1),
+            keep_daily: sc.backup.keep_daily,
+            keep_weekly: sc.backup.keep_weekly,
+        };
+        if let Some((i, at, st)) = &self.backup_stats_cache {
+            if *i == idx && at.elapsed() < ttl {
+                return st.clone();
+            }
+        }
+        let st = backup::storage_stats(&dir, &policy);
+        self.backup_stats_cache = Some((idx, std::time::Instant::now(), st.clone()));
+        st
+    }
+
+    /// 当前选择的回退范围 → 顶层目录列表（"all" = 备份内容里配置的目录）
+    fn restore_scope_folders(&self, idx: usize) -> Vec<String> {
+        let Some(sc) = self.cfg.servers.get(idx) else {
+            return Vec::new();
+        };
+        match sc.backup.restore_scope.as_str() {
+            "world" => vec!["world".to_string()],
+            "config" => vec!["config".to_string()],
+            "mods" => vec!["mods".to_string()],
+            _ => sc.backup.folders.clone(),
+        }
+    }
+
+    /// 自动快照防抖：距上次自动（关服/定时）快照不足最小间隔则跳过
+    fn auto_snapshot_allowed(&self, idx: usize) -> bool {
+        let Some(sc) = self.cfg.servers.get(idx) else {
+            return false;
+        };
+        let min = sc.backup.auto_min_interval_min;
+        if min == 0 {
+            return true;
+        }
+        let Some(s) = &sc.backup.last_snapshot_time else {
+            return true;
+        };
+        match chrono::DateTime::parse_from_rfc3339(s) {
+            Ok(t) => {
+                let t = t.with_timezone(&chrono::Local);
+                Local::now() >= t + chrono::Duration::minutes(min as i64)
+            }
+            Err(_) => true,
+        }
+    }
+
+    /// 退出后的快照判定统一入口：
+    /// 正常关服（三重信号）→ reason=stop；异常退出/新崩溃报告 → 仅在显式开启时才备份。
+    fn try_exit_snapshot(
+        &mut self,
+        idx: usize,
+        graceful: bool,
+        exit_code: Option<i32>,
+        log_tail: &str,
+        new_crash_report: bool,
+    ) {
+        let Some(sc) = self.cfg.servers.get(idx) else { return };
+        if !sc.backup.enabled || !features::is_enabled(&self.cfg.features, features::BETA_BACKUP) {
+            return;
+        }
+        // 三重信号取或：正常停止流程 / 日志出现关服标志 / 退出码为 0；但存在新崩溃报告即视为异常
+        let normal = !new_crash_report
+            && (graceful || backup::looks_normal_shutdown(log_tail, exit_code, false));
+        if normal {
+            if !sc.backup.backup_on_stop {
+                return;
+            }
+            if !self.auto_snapshot_allowed(idx) {
+                return;
+            }
+            if self.spawn_backup(idx, backup::BackupReason::Stop, false) {
+                self.exit_snapshot_inflight.insert(idx);
+            }
+        } else if sc.backup.backup_on_crash {
+            if !self.auto_snapshot_allowed(idx) {
+                return;
+            }
+            if self.spawn_backup(idx, backup::BackupReason::Auto, false) {
+                self.exit_snapshot_inflight.insert(idx);
+            }
+        }
+    }
+
+    /// 判断某服务器自本次启动以来是否出现了新的崩溃报告
+    fn server_new_crash_report(&self, idx: usize) -> bool {
+        let Some(sc) = self.cfg.servers.get(idx) else {
+            return false;
+        };
+        let since = self
+            .runtimes
+            .get(idx)
+            .and_then(|rt| rt.started_at)
+            .and_then(|t| std::time::SystemTime::now().checked_sub(t.elapsed()))
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        backup::has_new_crash_report(&sc.dir, since)
     }
 
     fn do_rename(&mut self) {
@@ -3042,22 +3363,18 @@ impl App {
         }
     }
 
+    /// 后台删除单份备份（快照目录可能包含上万文件，不在 UI 线程删）
     fn do_delete_backup(&mut self) {
-        if let Some((idx, zip, name)) = self.confirm_delete_backup.take() {
-            let dir = self
-                .cfg
-                .servers
-                .get(idx)
-                .map(|s| s.dir.clone())
-                .unwrap_or_default();
-            match backup::delete_backup(&dir, &zip) {
-                Ok(()) => {
-                    self.set_toast(format!("已删除备份 {name}"));
-                }
-                Err(e) => {
-                    self.set_toast(format!("删除备份失败: {e}"));
-                }
-            }
+        if let Some((idx, path, name)) = self.confirm_delete_backup.take() {
+            let Some(sc) = self.cfg.servers.get(idx) else { return };
+            let dir = sc.dir.clone();
+            let tx = self.maint_tx.clone();
+            self.backup_cache = None;
+            self.backup_stats_cache = None;
+            std::thread::spawn(move || {
+                let r = backup::delete_backup(&dir, &path).map(|_| format!("已删除备份 {name}"));
+                let _ = tx.send((idx, r));
+            });
         }
     }
 
@@ -6848,6 +7165,8 @@ impl eframe::App for App {
         let mut notify_queue: Vec<(String, String)> = Vec::new();
         // 插件事件收集（本帧待分发；BETA_PLUGINS 关闭时保持空 Vec，零开销）
         let mut plugin_evts: Vec<PluginEvt> = Vec::new();
+        // 本帧检测到的服务器退出事件：(序号, 退出码, 日志尾部, 是否有新崩溃报告)
+        let mut exit_events: Vec<(usize, Option<i32>, String, bool)> = Vec::new();
         let plugins_active = self
             .plugins
             .as_ref()
@@ -6901,72 +7220,101 @@ impl eframe::App for App {
                         plugin_evts.push(PluginEvt::ServerStarted(name));
                     }
                 }
-                // 非用户主动停止时进程消失：视为异常退出（崩溃/强杀/断电�?
+                // 非用户主动停止时进程消失：先判定是否属于"正常关闭"（控制台输入 /stop 等），
+                // 只有确认异常才当作崩溃处理，并触发崩溃相关提示/重启/备份策略。
                 if !rt.stopping && !process::is_running(p) {
-                    let code = process::exit_code(p)
+                    let code_opt = process::exit_code(p);
+                    let code = code_opt
                         .map(|c| c.to_string())
                         .unwrap_or_else(|| "?".to_string());
                     let name = self.cfg.servers.get(idx).map(|s| s.name.clone()).unwrap_or_default();
-                    notify_queue.push(("XMST - 服务器异常退出".to_string(), format!("{name} 进程已退出（code {code}），未经过正常停止")));
-                    // 崩溃根因分析：从日志/crash-report 里提取可操作的原因（缺少前置、Java 版本、
-                    // 内存、端口、Mixin 冲突…），随后弹出小窗提示，而不是只丢一句"异常退出"。
-                    let sdir = self.cfg.servers.get(idx).map(|s| s.dir.clone());
-                    if let Some(sdir) = sdir {
-                        if let Some(finding) = crashscan::analyze(&sdir) {
-                            let first = finding
-                                .causes
-                                .first()
-                                .map(|c| c.title.clone())
-                                .unwrap_or_else(|| "疑似启动失败".to_string());
-                            notify_queue.push((
-                                "XMST - 崩溃原因分析".to_string(),
-                                format!("{name}：{first}（详见「崩溃分析」窗口）"),
-                            ));
-                            self.crash_report = Some((idx, name.clone(), finding));
-                        }
-                    }
-                    rt.proc = None;
-                    // 插件事件：异常退出视为 server_stopped("crashed")
-                    if plugins_active {
-                        plugin_evts.push(PluginEvt::ServerStopped(name.clone(), "crashed".to_string()));
-                    }
-                    // 崩溃自动重启：窗口内计数 -> 计划重启 / 熔断
-                    let cr = self
+                    // 三重信号取或：日志出现 Stopping server/Saving worlds 或 退出码为 0，
+                    // 且自本次启动以来没有新增崩溃报告
+                    let since = rt
+                        .started_at
+                        .and_then(|t| std::time::SystemTime::now().checked_sub(t.elapsed()))
+                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                    let new_crash = self
                         .cfg
                         .servers
                         .get(idx)
-                        .map(|s| s.crash_restart.clone())
-                        .unwrap_or_default();
-                    if cr.enabled {
-                        let now = std::time::Instant::now();
-                        let win_secs = cr.circuit_minutes.saturating_mul(60);
-                        let in_window = rt
-                            .crash_first_at
-                            .map(|t| now.duration_since(t).as_secs() <= win_secs)
-                            .unwrap_or(false);
-                        if !in_window {
-                            rt.crash_first_at = Some(now);
-                            rt.crash_count = 0;
-                        }
-                        rt.crash_count += 1;
-                        let n = rt.crash_count;
-                        if n <= cr.max_restarts {
-                            let wait = std::time::Duration::from_secs(cr.wait_secs);
-                            rt.crash_restart_at = Some(now + wait);
-                            rt.last_msg = format!(
-                                "⚠️ 服务器进程已退出（exit code {code}），将在 {} 秒后自动重启（第 {n}/{} 次）",
-                                cr.wait_secs, cr.max_restarts
-                            );
-                        } else {
-                            rt.last_msg = format!(
-                                "⚠️ 服务器进程已退出（exit code {code}）。{} 分钟内连续崩溃达到上限（{n} 次），已熔断停止自动重启；可手动启动或等待窗口重置",
-                                cr.circuit_minutes
-                            );
+                        .map(|s| backup::has_new_crash_report(&s.dir, since))
+                        .unwrap_or(false);
+                    let tail: String = {
+                        let n = buf.chars().count();
+                        buf.chars().skip(n.saturating_sub(4000)).collect()
+                    };
+                    let normal = backup::looks_normal_shutdown(&tail, code_opt, new_crash);
+                    // 关服/崩溃快照统一入口（本帧先登记，循环结束后再起线程）
+                    exit_events.push((idx, code_opt, tail, new_crash));
+                    if normal {
+                        rt.proc = None;
+                        rt.last_msg = format!("服务器已退出（exit code {code}），按正常关服处理");
+                        if plugins_active {
+                            plugin_evts.push(PluginEvt::ServerStopped(name.clone(), "graceful".to_string()));
                         }
                     } else {
-                        rt.last_msg = format!(
-                            "⚠️ 服务器进程已退出（exit code {code}），未经过正常停止。如遇数据异常，可在「自动功能」页回滚")
-                        ;
+                        notify_queue.push(("XMST - 服务器异常退出".to_string(), format!("{name} 进程已退出（code {code}），未经过正常停止")));
+                        // 崩溃根因分析：从日志/crash-report 里提取可操作的原因（缺少前置、Java 版本、
+                        // 内存、端口、Mixin 冲突…），随后弹出小窗提示，而不是只丢一句"异常退出"。
+                        let sdir = self.cfg.servers.get(idx).map(|s| s.dir.clone());
+                        if let Some(sdir) = sdir {
+                            if let Some(finding) = crashscan::analyze(&sdir) {
+                                let first = finding
+                                    .causes
+                                    .first()
+                                    .map(|c| c.title.clone())
+                                    .unwrap_or_else(|| "疑似启动失败".to_string());
+                                notify_queue.push((
+                                    "XMST - 崩溃原因分析".to_string(),
+                                    format!("{name}：{first}（详见「崩溃分析」窗口）"),
+                                ));
+                                self.crash_report = Some((idx, name.clone(), finding));
+                            }
+                        }
+                        rt.proc = None;
+                        // 插件事件：异常退出视为 server_stopped("crashed")
+                        if plugins_active {
+                            plugin_evts.push(PluginEvt::ServerStopped(name.clone(), "crashed".to_string()));
+                        }
+                        // 崩溃自动重启：窗口内计数 -> 计划重启 / 熔断
+                        let cr = self
+                            .cfg
+                            .servers
+                            .get(idx)
+                            .map(|s| s.crash_restart.clone())
+                            .unwrap_or_default();
+                        if cr.enabled {
+                            let now = std::time::Instant::now();
+                            let win_secs = cr.circuit_minutes.saturating_mul(60);
+                            let in_window = rt
+                                .crash_first_at
+                                .map(|t| now.duration_since(t).as_secs() <= win_secs)
+                                .unwrap_or(false);
+                            if !in_window {
+                                rt.crash_first_at = Some(now);
+                                rt.crash_count = 0;
+                            }
+                            rt.crash_count += 1;
+                            let n = rt.crash_count;
+                            if n <= cr.max_restarts {
+                                let wait = std::time::Duration::from_secs(cr.wait_secs);
+                                rt.crash_restart_at = Some(now + wait);
+                                rt.last_msg = format!(
+                                    "⚠️ 服务器进程已退出（exit code {code}），将在 {} 秒后自动重启（第 {n}/{} 次）",
+                                    cr.wait_secs, cr.max_restarts
+                                );
+                            } else {
+                                rt.last_msg = format!(
+                                    "⚠️ 服务器进程已退出（exit code {code}）。{} 分钟内连续崩溃达到上限（{n} 次），已熔断停止自动重启；可手动启动或等待窗口重置",
+                                    cr.circuit_minutes
+                                );
+                            }
+                        } else {
+                            rt.last_msg = format!(
+                                "⚠️ 服务器进程已退出（exit code {code}），未经过正常停止。如遇数据异常，可在「自动功能」页回滚")
+                            ;
+                        }
                     }
                 }
             }
@@ -7067,6 +7415,10 @@ impl eframe::App for App {
         // 统一投递本次收集的通知（循环结束后避免借用冲突）桌面弹窗 + 工具内通知同步
         for (title, body) in notify_queue {
             self.notify(&title, &body);
+        }
+        // 退出后的快照判定（正常关服 → reason=stop；异常退出 → 仅在显式开启崩溃备份时才做）
+        for (i, code_opt, tail, new_crash) in exit_events {
+            self.try_exit_snapshot(i, false, code_opt, &tail, new_crash);
         }
 
         // Frp 集中管理：后台回�?+ 异常退出检�?
@@ -7610,7 +7962,7 @@ impl eframe::App for App {
             self.ui_force_stop_confirm(ctx);
         }
 
-        // 回退确认弹窗
+        // 回退确认弹窗（二次确认；回退全程在后台线程执行）
         if self.confirm_restore.is_some() {
             let mut do_it = false;
             egui::Window::new("确认回退")
@@ -7618,9 +7970,14 @@ impl eframe::App for App {
                 .collapsible(false)
                 .resizable(false)
                 .show(ctx, |ui| {
-                    if let Some((_, _, name)) = &self.confirm_restore {
-                        ui.label(format!("将从备份 [{name}] 恢复 world/config"));
-                        ui.label(RichText::new("服务器将被停止，当前 world/config 会移动到 .mcsrv_trash/）").color(Color32::YELLOW));
+                    if let Some((_, _, name, scope)) = &self.confirm_restore {
+                        let scope_txt = if scope.is_empty() {
+                            "全部".to_string()
+                        } else {
+                            scope.join(" / ")
+                        };
+                        ui.label(format!("将从备份 [{name}] 恢复：{scope_txt}"));
+                        ui.label(RichText::new("服务器会先被停止，回退前自动生成一份当前快照，原数据移动到 .mcsrv_trash/").color(Color32::YELLOW));
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             if ui.button("确认回退").clicked() {
@@ -7633,7 +7990,15 @@ impl eframe::App for App {
                     }
                 });
             if do_it {
-                self.do_restore();
+                if let Some((idx, path, _name, scope)) = self.confirm_restore.take() {
+                    let folders = if scope.is_empty() {
+                        self.restore_scope_folders(idx)
+                    } else {
+                        scope
+                    };
+                    self.spawn_restore(idx, path, folders);
+                    self.set_toast("回退已开始（后台执行：关服 → 生成恢复前快照 → 恢复）".to_string());
+                }
             }
         }
 
@@ -7647,7 +8012,7 @@ impl eframe::App for App {
                 .show(ctx, |ui| {
                     if let Some((_, _, name)) = &self.confirm_delete_backup {
                         ui.label(format!("确定删除备份 [{name}] 吗？"));
-                        ui.label(RichText::new("该操作不可撤销。若删除的是全量备份，下次备份会自动补做全量）").color(Color32::YELLOW));
+                        ui.label(RichText::new("该操作不可撤销。硬链接快照删除某一份只减少链接数，其它快照的数据仍然完整。").color(Color32::YELLOW));
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             if ui.button("确认删除").clicked() {
@@ -8279,7 +8644,7 @@ impl App {
         if let Some(i) = to_backup_now {
             if self.cfg.servers.get(i).is_some() {
                 let nm = self.cfg.servers[i].name.clone();
-                self.spawn_backup(i);
+                self.spawn_backup(i, backup::BackupReason::Manual, true);
                 self.set_toast(format!("已对「{nm}」发起立即备份"));
             }
         }
@@ -11261,11 +11626,11 @@ impl App {
         ui.separator();
 
         if features::is_enabled(&self.cfg.features, features::BETA_BACKUP) {
-            ui.label(RichText::new("自动备份").strong());
+            ui.label(RichText::new("快照备份").strong());
             ui.separator();
     
             let mut b = sc.backup.clone();
-            ui.checkbox(&mut b.enabled, "启用自动备份（仅服务器运行时触发）");
+            ui.checkbox(&mut b.enabled, "启用自动备份（仅服务器运行时触发定时快照）");
             ui.horizontal(|ui| {
                 ui.label("间隔(分钟):");
                 ui.add(egui::DragValue::new(&mut b.interval_min).range(1..=10080));
@@ -11273,6 +11638,14 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label("备份限速 (MB/s, 0=不限):");
                 ui.add(egui::DragValue::new(&mut b.throttle_mbps).range(0.0..=1024.0).speed(1.0));
+            });
+            ui.horizontal(|ui| {
+                ui.label("备份内容: ");
+                let folders_str = b.folders.join(", ");
+                let mut fs = folders_str;
+                if ui.add(TextEdit::singleline(&mut fs).desired_width(240.0)).changed() {
+                    b.folders = fs.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                }
             });
             ui.horizontal(|ui| {
                 ui.label("备份列表分组:");
@@ -11284,6 +11657,69 @@ impl App {
                         ui.selectable_value(&mut b.view_mode, "month".to_string(), "按月");
                     });
             });
+
+            // ---------- 触发时机 ----------
+            ui.add_space(4.0);
+            ui.label(RichText::new("触发时机").strong());
+            ui.checkbox(&mut b.backup_on_stop, "正常关服后自动快照（推荐）");
+            ui.checkbox(&mut b.backup_on_crash, "崩溃后也自动快照");
+            ui.label(
+                RichText::new("⚠ 不建议开启：崩溃瞬间的世界文件可能是写坏的，混入后会污染后续所有增量")
+                    .color(self.fg(Color32::from_rgb(240, 176, 96)))
+                    .small(),
+            );
+            ui.horizontal(|ui| {
+                ui.label("自动快照最小间隔 (分钟, 0=不限制):");
+                ui.add(egui::DragValue::new(&mut b.auto_min_interval_min).range(0..=1440));
+            });
+
+            // ---------- 排除表 ----------
+            ui.add_space(4.0);
+            ui.label(RichText::new("排除表（每行一条：目录名 / 文件名 / *.后缀；既不备份也不参与对比）").strong());
+            if self.backup_exclude_for != Some(idx) {
+                self.backup_exclude_for = Some(idx);
+                self.backup_exclude_text = b.exclude.join("\n");
+            }
+            let mut ex = std::mem::take(&mut self.backup_exclude_text);
+            let ex_resp = ui.add(
+                TextEdit::multiline(&mut ex)
+                    .desired_rows(4)
+                    .desired_width(320.0)
+                    .hint_text("logs\ncrash-reports\n*.lock"),
+            );
+            if ex_resp.changed() {
+                b.exclude = ex
+                    .lines()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+            self.backup_exclude_text = ex;
+            if ui.button("恢复默认排除表").clicked() {
+                b.exclude = backup::default_excludes();
+                self.backup_exclude_text = b.exclude.join("\n");
+            }
+
+            // ---------- 保留策略 ----------
+            ui.add_space(4.0);
+            ui.label(RichText::new("保留策略（自动清理超出部分）").strong());
+            ui.horizontal(|ui| {
+                ui.label("保留最近");
+                ui.add(egui::DragValue::new(&mut b.keep_recent).range(1..=500));
+                ui.label("份 ｜ 每天");
+                ui.add(egui::DragValue::new(&mut b.keep_daily).range(0..=90));
+                ui.label("份 ｜ 每周");
+                ui.add(egui::DragValue::new(&mut b.keep_weekly).range(0..=52));
+                ui.label("份");
+            });
+            ui.label(
+                RichText::new("硬链接快照下删除某份只减少链接数，其它快照的数据仍然完整，清理是安全的")
+                    .weak()
+                    .small(),
+            );
+
+            // ---------- 内存风险（紧急备份） ----------
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label("内存风险阈值 (%):");
                 ui.add(egui::DragValue::new(&mut b.mem_threshold_percent).range(50..=100));
@@ -11292,18 +11728,11 @@ impl App {
                 ui.label("紧急备份间隔 (分钟):");
                 ui.add(egui::DragValue::new(&mut b.mem_interval_min).range(1..=120));
             });
-            ui.horizontal(|ui| {
-                ui.label("备份内容: ");
-                let folders_str = b.folders.join(", ");
-                let mut fs = folders_str;
-                if ui.add(TextEdit::singleline(&mut fs).desired_width(240.0)).changed() {
-                    b.folders = fs.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-                }
-            });
+
             // 阶段5：远端备份目标（本地目录 / UNC / WebDAV URL）
             ui.add_space(4.0);
             ui.label(RichText::new("远端备份目标（可选）").strong());
-            ui.label("留空 = 仅本地备份；填本地目录 / UNC 网络共享（如 D:\\backup 或 \\\\nas\\share）自动复制，或 WebDAV URL（http(s)://...）自动上传");
+            ui.label("留空 = 仅本地备份；填本地目录 / UNC 网络共享（如 D:\\backup 或 \\\\nas\\share）自动复制，或 WebDAV URL（http(s)://...）自动上传。注意：仅对旧版 zip 备份生效，快照是目录、不做远端复制");
             ui.horizontal(|ui| {
                 ui.label("目标:");
                 ui.add(
@@ -11343,16 +11772,60 @@ impl App {
             }
             ui.separator();
     
-            if ui.button("🔄 立即备份一次").clicked() {
-                self.spawn_backup(idx);
-                self.set_toast("备份已开始（后台执行，完成后提示".to_string());
-            }
+            ui.horizontal(|ui| {
+                if ui.button("🔄 立即备份一次").clicked() {
+                    self.spawn_backup(idx, backup::BackupReason::Manual, true);
+                    self.set_toast("快照已开始在后台生成（完成后提示）".to_string());
+                }
+                if ui.button("🧹 立即按保留策略清理").clicked() {
+                    self.spawn_retention(idx);
+                    self.set_toast("正在后台清理超出保留策略的快照…".to_string());
+                }
+            });
             if self.backup_inflight.contains(&idx) {
-                ui.label(RichText::new("🔄 备份进行中").color(self.fg(Color32::from_rgb(255, 200, 80))));
+                ui.label(RichText::new("🔄 快照进行中").color(self.fg(Color32::from_rgb(255, 200, 80))));
+            }
+            if self.restore_inflight.contains(&idx) {
+                ui.label(RichText::new("♻ 回退进行中（关服 → 恢复前快照 → 恢复）").color(self.fg(Color32::from_rgb(255, 200, 80))));
             }
             if let Some(lb) = &self.cfg.servers[idx].backup.last_backup {
                 ui.label(format!("上次备份: {lb}"));
             }
+
+            // ---------- 存储总览 ----------
+            ui.add_space(4.0);
+            ui.label(RichText::new("存储总览").strong());
+            let stats = self.storage_stats_cached(idx);
+            ui.label(format!(
+                "快照 {} 份（旧版 zip {} 份）｜ 占用 {} ｜ 最新快照 {} 个文件 / {}",
+                stats.snapshot_count,
+                stats.legacy_zip_count,
+                fmt_size(stats.used_bytes),
+                stats.latest_files,
+                fmt_size(stats.latest_total_bytes)
+            ));
+            let range = match (&stats.oldest, &stats.newest) {
+                (Some(a), Some(b)) => format!("{a} ~ {b}"),
+                (Some(a), None) => a.clone(),
+                _ => "—".to_string(),
+            };
+            ui.label(format!("可回滚时间范围: {range}"));
+            let space_txt = if stats.free_bytes > 0 {
+                format!("，备份盘剩余 {}", fmt_size(stats.free_bytes))
+            } else {
+                String::new()
+            };
+            let est_txt = if stats.estimated_days >= 3650 {
+                "10 年以上（变化极小）".to_string()
+            } else {
+                format!("约 {} 天", stats.estimated_days)
+            };
+            ui.label(format!(
+                "平均新增 {} / 天 ｜ 预计可保留 {est_txt}（保留策略覆盖约 {} 天{}）",
+                fmt_size(stats.bytes_per_day),
+                stats.retention_days,
+                space_txt
+            ));
             ui.separator();
         }
 
@@ -11505,14 +11978,40 @@ impl App {
         ui.separator();
 
         if features::is_enabled(&self.cfg.features, features::BETA_BACKUP) {
-        ui.label(RichText::new("已备份列表").strong());
-        let dir = self.cfg.servers[idx].dir.clone();
-        let backups = backup::list_backups(&dir);
+        ui.label(RichText::new("快照 / 备份列表").strong());
+        // 恢复范围选择：只恢复 world / config / mods / 全部（= 备份内容里配置的目录）
+        {
+            let mut scope = self.cfg.servers[idx].backup.restore_scope.clone();
+            ui.horizontal(|ui| {
+                ui.label("回退范围:");
+                let label = match scope.as_str() {
+                    "world" => "仅 world",
+                    "config" => "仅 config",
+                    "mods" => "仅 mods",
+                    _ => "全部（备份内容）",
+                };
+                egui::ComboBox::from_id_salt("backup_restore_scope")
+                    .selected_text(label)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut scope, "all".to_string(), "全部（备份内容）");
+                        ui.selectable_value(&mut scope, "world".to_string(), "仅 world");
+                        ui.selectable_value(&mut scope, "config".to_string(), "仅 config");
+                        ui.selectable_value(&mut scope, "mods".to_string(), "仅 mods");
+                    });
+            });
+            if scope != self.cfg.servers[idx].backup.restore_scope {
+                self.cfg.servers[idx].backup.restore_scope = scope;
+                self.save_config();
+            }
+        }
+        let backups = self.backup_list_cached(idx);
         if backups.is_empty() {
             ui.label("（暂无备份）");
         } else {
+            let restore_scope = self.restore_scope_folders(idx);
             let mut restore_target: Option<(PathBuf, String)> = None;
             let mut delete_target: Option<(PathBuf, String)> = None;
+            let mut open_target: Option<PathBuf> = None;
             // 按日/月分组折叠显示（mtime 格式 %Y-%m-%d %H:%M:%S，取前 10/7 位）
             let view_mode = self.cfg.servers[idx].backup.view_mode.clone();
             let group_key = |b: &backup::BackupInfo| -> String {
@@ -11542,25 +12041,47 @@ impl App {
                                 let kind_color = match b.kind {
                                     backup::BackupKind::Full => self.fg(Color32::from_rgb(80, 200, 120)),
                                     backup::BackupKind::Incremental => self.fg(Color32::from_rgb(120, 180, 255)),
+                                    backup::BackupKind::Snapshot => self.fg(Color32::from_rgb(120, 200, 255)),
                                 };
                                 ui.label(RichText::new(format!("[{}]", b.kind.label())).color(kind_color));
-                                ui.label(format!("{}  ({}, {})", b.name, fmt_size(b.size), b.mtime));
+                                ui.label(RichText::new(format!("[{}]", b.reason)).weak().small());
+                                let detail = if b.is_snapshot {
+                                    format!(
+                                        "{} ｜ 共 {} 个文件、变化 {} 个、新增 {} ｜ 总 {} ｜ {}",
+                                        b.name,
+                                        b.files_total,
+                                        b.files_copied,
+                                        fmt_size(b.bytes_copied),
+                                        fmt_size(b.size),
+                                        b.mtime
+                                    )
+                                } else {
+                                    format!("{}  ({}, {})", b.name, fmt_size(b.size), b.mtime)
+                                };
+                                ui.label(detail);
                                 if ui.button("回退").clicked() {
                                     restore_target = Some((b.path.clone(), b.name.clone()));
                                 }
                                 if ui.button("删除").clicked() {
                                     delete_target = Some((b.path.clone(), b.name.clone()));
                                 }
+                                if ui.button("打开目录").clicked() {
+                                    open_target = Some(b.path.clone());
+                                }
                             });
                         }
                     });
                 }
             });
-            if let Some((zip, name)) = restore_target {
-                self.confirm_restore = Some((idx, zip, name));
+            if let Some((path, name)) = restore_target {
+                // 回退范围在点击瞬间固化，避免用户中途改设置导致提示与实际不符
+                self.confirm_restore = Some((idx, path, name, restore_scope.clone()));
             }
-            if let Some((zip, name)) = delete_target {
-                self.confirm_delete_backup = Some((idx, zip, name));
+            if let Some((path, name)) = delete_target {
+                self.confirm_delete_backup = Some((idx, path, name));
+            }
+            if let Some(path) = open_target {
+                reveal_in_explorer(&path);
             }
         }
         }
