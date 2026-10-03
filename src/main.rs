@@ -5161,6 +5161,14 @@ fn spawn_reveal(p: &std::path::Path) -> bool {
     //    导致 0xc0000142。这是目录/文件打开的正常行为，保持与旧版一致。
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // ⓪ 首选 COM：目录用 Explore；文件用 Explore + SelectItem
+    if p.is_dir() {
+        if open_folder_com(&p_str) {
+            return true;
+        }
+    } else if reveal_com(p) {
+        return true;
+    }
     let ok = if p.is_dir() {
         std::process::Command::new("cmd")
             .args(["/C", "start", "", &p_str])
@@ -5415,6 +5423,69 @@ fn open_url(url: &str) {
         .spawn();
 }
 /// 用资源管理器打开目录（`ShellExecuteW("explore")`，不创建新进程）。成功返回 true。
+/// 用 **COM `Shell.Application.Explore`** 打开目录：由已在运行的资源管理器执行，
+/// 不经过 ShellExecute、也不需要 spawn explorer.exe。
+/// 实测本机 173ms 成功（而 ShellExecuteW 对目录返回 5=拒绝访问），
+/// 因此把它作为「打开目录」的首选方式。
+fn open_folder_com(dir: &str) -> bool {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let ps = format!(
+        "$ErrorActionPreference='Stop'; $s=New-Object -ComObject Shell.Application; $s.Explore('{}')",
+        dir.replace('\'', "''")
+    );
+    std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            &ps,
+        ])
+        .current_dir(sane_cwd())
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .is_ok()
+}
+
+/// 用 COM `Shell.Application` 打开目录并**选中**其中的文件（定位到文件用）。
+fn reveal_com(file: &std::path::Path) -> bool {
+    let Some(parent) = file.parent() else {
+        return false;
+    };
+    let name = file
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let ps = format!(
+        "$ErrorActionPreference='Stop'; $s=New-Object -ComObject Shell.Application; $s.Explore('{}'); Start-Sleep -Milliseconds 400; $w=$s.Windows() | Where-Object {{ $_.Document.Folder.Self.Path -eq '{}' }} | Select-Object -First 1; if ($w) {{ $w.Document.SelectItem('{}', 1) }}",
+        parent.to_string_lossy().replace('\'', "''"),
+        parent.to_string_lossy().replace('\'', "''"),
+        name.replace('\'', "''")
+    );
+    std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            &ps,
+        ])
+        .current_dir(sane_cwd())
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .is_ok()
+}
 /// 记录“打开目录”失败原因（静态槽；open_folder 只需 &self，错误由 update 弹出 toast）。
 /// 「打开目录」诊断模式：`set XMST_OPEN_TEST=<目录或文件>` 后启动本程序，
 /// 会依次尝试全部打开方式、把每一步的结果（含系统错误码）写入
@@ -5543,6 +5614,20 @@ fn sane_cwd() -> std::path::PathBuf {
     std::path::PathBuf::from("C:\\Windows")
 }
 fn set_open_error(msg: String) {
+    // 失败即写诊断日志（用户无需额外操作，直接发这个文件给我即可定位）
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent().map(|d| d.join("data")) {
+            let _ = std::fs::create_dir_all(&dir);
+            let mut body = format!("时间={}\n原因={}\n", chrono::Local::now(), msg);
+            body.push_str(&format!(
+                "进程当前目录={:?}（存在: {}）\n",
+                std::env::current_dir().ok(),
+                std::env::current_dir().map(|d| d.is_dir()).unwrap_or(false)
+            ));
+            body.push_str(&format!("sane_cwd={:?}\n", sane_cwd()));
+            let _ = std::fs::write(dir.join("open_diag.log"), body);
+        }
+    }
     static SLOT: std::sync::OnceLock<std::sync::Mutex<Option<String>>> = std::sync::OnceLock::new();
     if let Ok(mut g) = SLOT.get_or_init(|| std::sync::Mutex::new(None)).lock() {
         *g = Some(msg);
