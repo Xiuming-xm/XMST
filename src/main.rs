@@ -7547,15 +7547,17 @@ impl eframe::App for App {
                             egui::FontId::proportional(15.0),
                             self.theme_cur.text,
                         );
-                        ui.painter().text(
+                        // 版本号取自 Cargo.toml（形如 v0.1.1-alpha），不再是写死的字面量
+                        let ver_rect = ui.painter().text(
                             egui::pos2(logo_rect.right() + 7.0 + 44.0, logo_rect.center().y + 1.0),
                             egui::Align2::LEFT_CENTER,
-                            "v0.1alpha",
+                            concat!("v", env!("CARGO_PKG_VERSION")),
                             egui::FontId::proportional(10.0),
                             self.theme_cur.weak,
                         );
-                        // 占位：把后续内容推到品牌区右侧（不产生任何可交互控件）
-                        ui.add_space(logo_w + 7.0 + 44.0 + 46.0);
+                        // 占位：把后续内容推到品牌区右侧（不产生任何可交互控件）；
+                        // 版本号变长时按实际绘制宽度占位，避免压到中间状态区
+                        ui.add_space(ver_rect.right() - avail.left() + 46.0);
                     }
                     // 中区：状态区（toast 优先；否则显示当前服务器/就绪），预留右侧按钮区 132px
                     let mid_w = ui.available_width() - 132.0;
@@ -7767,7 +7769,7 @@ impl eframe::App for App {
                 ui.add_space(8.0);
                 ui.spacing_mut().item_spacing.y = 2.0;
                 // Stage 6：SeaLantern 风格导航分组（管理 / 系统），条件项并入对应分组。
-                // Bug7：顶部栏已绘制「XMST + v0.1alpha」，此处不再重复绘制标题。
+                // Bug7：顶部栏已绘制「XMST + 版本号」，此处不再重复绘制标题。
                 ui.separator();
                 let mut nav_items: Vec<(&str, &str, Nav)> = vec![];
                 // 分组一：管理
@@ -11630,352 +11632,393 @@ impl App {
             ui.separator();
     
             let mut b = sc.backup.clone();
-            ui.checkbox(&mut b.enabled, "启用自动备份（仅服务器运行时触发定时快照）");
-            ui.horizontal(|ui| {
-                ui.label("间隔(分钟):");
-                ui.add(egui::DragValue::new(&mut b.interval_min).range(1..=10080));
-            });
-            ui.horizontal(|ui| {
-                ui.label("备份限速 (MB/s, 0=不限):");
-                ui.add(egui::DragValue::new(&mut b.throttle_mbps).range(0.0..=1024.0).speed(1.0));
-            });
-            ui.horizontal(|ui| {
-                ui.label("备份内容: ");
-                let folders_str = b.folders.join(", ");
-                let mut fs = folders_str;
-                if ui.add(TextEdit::singleline(&mut fs).desired_width(240.0)).changed() {
-                    b.folders = fs.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("备份列表分组:");
-                let mode_label = if b.view_mode == "month" { "按月" } else { "按日" };
-                egui::ComboBox::from_id_salt("backup_view_mode")
-                    .selected_text(mode_label)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut b.view_mode, "day".to_string(), "按日");
-                        ui.selectable_value(&mut b.view_mode, "month".to_string(), "按月");
-                    });
+            egui::CollapsingHeader::new(RichText::new("备份基础").strong())
+                .id_salt(("backup_basic", idx))
+                .default_open(true)
+                .show(ui, |ui| {
+                ui.checkbox(&mut b.enabled, "启用自动备份（仅服务器运行时触发定时快照）");
+                ui.horizontal(|ui| {
+                    ui.label("间隔(分钟):");
+                    ui.add(egui::DragValue::new(&mut b.interval_min).range(1..=10080));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("备份限速 (MB/s, 0=不限):");
+                    ui.add(egui::DragValue::new(&mut b.throttle_mbps).range(0.0..=1024.0).speed(1.0));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("备份内容: ");
+                    let folders_str = b.folders.join(", ");
+                    let mut fs = folders_str;
+                    if ui.add(TextEdit::singleline(&mut fs).desired_width(240.0)).changed() {
+                        b.folders = fs.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("备份列表分组:");
+                    let mode_label = if b.view_mode == "month" { "按月" } else { "按日" };
+                    egui::ComboBox::from_id_salt("backup_view_mode")
+                        .selected_text(mode_label)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut b.view_mode, "day".to_string(), "按日");
+                            ui.selectable_value(&mut b.view_mode, "month".to_string(), "按月");
+                        });
+                });
             });
 
             // ---------- 触发时机 ----------
             ui.add_space(4.0);
-            ui.label(RichText::new("触发时机").strong());
-            ui.checkbox(&mut b.backup_on_stop, "正常关服后自动快照（推荐）");
-            ui.checkbox(&mut b.backup_on_crash, "崩溃后也自动快照");
-            ui.label(
-                RichText::new("⚠ 不建议开启：崩溃瞬间的世界文件可能是写坏的，混入后会污染后续所有增量")
-                    .color(self.fg(Color32::from_rgb(240, 176, 96)))
-                    .small(),
-            );
-            ui.horizontal(|ui| {
-                ui.label("自动快照最小间隔 (分钟, 0=不限制):");
-                ui.add(egui::DragValue::new(&mut b.auto_min_interval_min).range(0..=1440));
+            egui::CollapsingHeader::new(RichText::new("触发时机").strong())
+                .id_salt(("backup_trigger", idx))
+                .default_open(true)
+                .show(ui, |ui| {
+                ui.checkbox(&mut b.backup_on_stop, "正常关服后自动快照（推荐）");
+                ui.checkbox(&mut b.backup_on_crash, "崩溃后也自动快照");
+                ui.label(
+                    RichText::new("⚠ 不建议开启：崩溃瞬间的世界文件可能是写坏的，混入后会污染后续所有增量")
+                        .color(self.fg(Color32::from_rgb(240, 176, 96)))
+                        .small(),
+                );
+                ui.horizontal(|ui| {
+                    ui.label("自动快照最小间隔 (分钟, 0=不限制):");
+                    ui.add(egui::DragValue::new(&mut b.auto_min_interval_min).range(0..=1440));
+                });
             });
 
             // ---------- 排除表 ----------
             ui.add_space(4.0);
-            ui.label(RichText::new("排除表（每行一条：目录名 / 文件名 / *.后缀；既不备份也不参与对比）").strong());
-            if self.backup_exclude_for != Some(idx) {
-                self.backup_exclude_for = Some(idx);
-                self.backup_exclude_text = b.exclude.join("\n");
-            }
-            let mut ex = std::mem::take(&mut self.backup_exclude_text);
-            let ex_resp = ui.add(
-                TextEdit::multiline(&mut ex)
-                    .desired_rows(4)
-                    .desired_width(320.0)
-                    .hint_text("logs\ncrash-reports\n*.lock"),
-            );
-            if ex_resp.changed() {
-                b.exclude = ex
-                    .lines()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-            }
-            self.backup_exclude_text = ex;
-            if ui.button("恢复默认排除表").clicked() {
-                b.exclude = backup::default_excludes();
-                self.backup_exclude_text = b.exclude.join("\n");
-            }
-
-            // ---------- 保留策略 ----------
-            ui.add_space(4.0);
-            ui.label(RichText::new("保留策略（自动清理超出部分）").strong());
-            ui.horizontal(|ui| {
-                ui.label("保留最近");
-                ui.add(egui::DragValue::new(&mut b.keep_recent).range(1..=500));
-                ui.label("份 ｜ 每天");
-                ui.add(egui::DragValue::new(&mut b.keep_daily).range(0..=90));
-                ui.label("份 ｜ 每周");
-                ui.add(egui::DragValue::new(&mut b.keep_weekly).range(0..=52));
-                ui.label("份");
-            });
-            ui.label(
-                RichText::new("硬链接快照下删除某份只减少链接数，其它快照的数据仍然完整，清理是安全的")
-                    .weak()
-                    .small(),
-            );
-
-            // ---------- 内存风险（紧急备份） ----------
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label("内存风险阈值 (%):");
-                ui.add(egui::DragValue::new(&mut b.mem_threshold_percent).range(50..=100));
-            });
-            ui.horizontal(|ui| {
-                ui.label("紧急备份间隔 (分钟):");
-                ui.add(egui::DragValue::new(&mut b.mem_interval_min).range(1..=120));
-            });
-
-            // 阶段5：远端备份目标（本地目录 / UNC / WebDAV URL）
-            ui.add_space(4.0);
-            ui.label(RichText::new("远端备份目标（可选）").strong());
-            ui.label("留空 = 仅本地备份；填本地目录 / UNC 网络共享（如 D:\\backup 或 \\\\nas\\share）自动复制，或 WebDAV URL（http(s)://...）自动上传。注意：仅对旧版 zip 备份生效，快照是目录、不做远端复制");
-            ui.horizontal(|ui| {
-                ui.label("目标:");
-                ui.add(
-                    TextEdit::singleline(&mut b.remote_target)
-                        .desired_width(280.0)
-                        .hint_text("D:\\backup 或 \\\\nas\\share 或 https://dav.example.com/backup/"),
+            egui::CollapsingHeader::new(RichText::new("排除与保留").strong())
+                .id_salt(("backup_exclude_retention", idx))
+                .default_open(false)
+                .show(ui, |ui| {
+                ui.label(RichText::new("排除表（每行一条：目录名 / 文件名 / *.后缀；既不备份也不参与对比）").strong());
+                if self.backup_exclude_for != Some(idx) {
+                    self.backup_exclude_for = Some(idx);
+                    self.backup_exclude_text = b.exclude.join("\n");
+                }
+                let mut ex = std::mem::take(&mut self.backup_exclude_text);
+                let ex_resp = ui.add(
+                    TextEdit::multiline(&mut ex)
+                        .desired_rows(4)
+                        .desired_width(320.0)
+                        .hint_text("logs\ncrash-reports\n*.lock"),
                 );
-            });
-            let is_http = b.remote_target.trim().to_lowercase().starts_with("http://")
-                || b.remote_target.trim().to_lowercase().starts_with("https://");
-            if is_http {
+                if ex_resp.changed() {
+                    b.exclude = ex
+                        .lines()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                }
+                self.backup_exclude_text = ex;
+                if ui.button("恢复默认排除表").clicked() {
+                    b.exclude = backup::default_excludes();
+                    self.backup_exclude_text = b.exclude.join("\n");
+                }
+    
+                // ---------- 保留策略 ----------
+                ui.add_space(4.0);
+                ui.label(RichText::new("保留策略（自动清理超出部分）").strong());
                 ui.horizontal(|ui| {
-                    ui.label("账号:");
-                    ui.add(TextEdit::singleline(&mut b.remote_user).desired_width(160.0));
+                    ui.label("保留最近");
+                    ui.add(egui::DragValue::new(&mut b.keep_recent).range(1..=500));
+                    ui.label("份 ｜ 每天");
+                    ui.add(egui::DragValue::new(&mut b.keep_daily).range(0..=90));
+                    ui.label("份 ｜ 每周");
+                    ui.add(egui::DragValue::new(&mut b.keep_weekly).range(0..=52));
+                    ui.label("份");
                 });
-                ui.horizontal(|ui| {
-                    ui.label("密码:");
-                    ui.add(TextEdit::singleline(&mut b.remote_password).password(true).desired_width(160.0));
-                });
-            }
-            ui.horizontal(|ui| {
-                ui.label("失败重试次数:");
-                ui.add(egui::DragValue::new(&mut b.remote_retry).range(0..=5));
-            });
-            if self.remote_upload_busy.contains(&idx) {
-                ui.label(RichText::new("📤 远端转存进行中").color(self.fg(Color32::from_rgb(255, 200, 80))));
-            } else if let Some((_, left)) = self.remote_pending.get(&idx) {
                 ui.label(
-                    RichText::new(format!("📤 远端转存失败，待重试 {left} 次"))
-                        .color(self.fg(Color32::from_rgb(255, 160, 80))),
+                    RichText::new("硬链接快照下删除某份只减少链接数，其它快照的数据仍然完整，清理是安全的")
+                        .weak()
+                        .small(),
                 );
-            }
+            });
+
+            egui::CollapsingHeader::new(RichText::new("存储与远程").strong())
+                .id_salt(("backup_storage_remote", idx))
+                .default_open(false)
+                .show(ui, |ui| {
+                // ---------- 内存风险（紧急备份） ----------
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("内存风险阈值 (%):");
+                    ui.add(egui::DragValue::new(&mut b.mem_threshold_percent).range(50..=100));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("紧急备份间隔 (分钟):");
+                    ui.add(egui::DragValue::new(&mut b.mem_interval_min).range(1..=120));
+                });
+    
+                // 阶段5：远端备份目标（本地目录 / UNC / WebDAV URL）
+                ui.add_space(4.0);
+                ui.label(RichText::new("远端备份目标（可选）").strong());
+                ui.label("留空 = 仅本地备份；填本地目录 / UNC 网络共享（如 D:\\backup 或 \\\\nas\\share）自动复制，或 WebDAV URL（http(s)://...）自动上传。注意：仅对旧版 zip 备份生效，快照是目录、不做远端复制");
+                ui.horizontal(|ui| {
+                    ui.label("目标:");
+                    ui.add(
+                        TextEdit::singleline(&mut b.remote_target)
+                            .desired_width(280.0)
+                            .hint_text("D:\\backup 或 \\\\nas\\share 或 https://dav.example.com/backup/"),
+                    );
+                });
+                let is_http = b.remote_target.trim().to_lowercase().starts_with("http://")
+                    || b.remote_target.trim().to_lowercase().starts_with("https://");
+                if is_http {
+                    ui.horizontal(|ui| {
+                        ui.label("账号:");
+                        ui.add(TextEdit::singleline(&mut b.remote_user).desired_width(160.0));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("密码:");
+                        ui.add(TextEdit::singleline(&mut b.remote_password).password(true).desired_width(160.0));
+                    });
+                }
+                ui.horizontal(|ui| {
+                    ui.label("失败重试次数:");
+                    ui.add(egui::DragValue::new(&mut b.remote_retry).range(0..=5));
+                });
+                if self.remote_upload_busy.contains(&idx) {
+                    ui.label(RichText::new("📤 远端转存进行中").color(self.fg(Color32::from_rgb(255, 200, 80))));
+                } else if let Some((_, left)) = self.remote_pending.get(&idx) {
+                    ui.label(
+                        RichText::new(format!("📤 远端转存失败，待重试 {left} 次"))
+                            .color(self.fg(Color32::from_rgb(255, 160, 80))),
+                    );
+                }
+                ui.separator();
+        
+                ui.horizontal(|ui| {
+                    if ui.button("🔄 立即备份一次").clicked() {
+                        self.spawn_backup(idx, backup::BackupReason::Manual, true);
+                        self.set_toast("快照已开始在后台生成（完成后提示）".to_string());
+                    }
+                    if ui.button("🧹 立即按保留策略清理").clicked() {
+                        self.spawn_retention(idx);
+                        self.set_toast("正在后台清理超出保留策略的快照…".to_string());
+                    }
+                });
+                if self.backup_inflight.contains(&idx) {
+                    ui.label(RichText::new("🔄 快照进行中").color(self.fg(Color32::from_rgb(255, 200, 80))));
+                }
+                if self.restore_inflight.contains(&idx) {
+                    ui.label(RichText::new("♻ 回退进行中（关服 → 恢复前快照 → 恢复）").color(self.fg(Color32::from_rgb(255, 200, 80))));
+                }
+                if let Some(lb) = &self.cfg.servers[idx].backup.last_backup {
+                    ui.label(format!("上次备份: {lb}"));
+                }
+    
+                // ---------- 存储总览 ----------
+                // 无快照也无旧版 zip 时不显示空壳标题
+                let stats = self.storage_stats_cached(idx);
+                if stats.snapshot_count > 0 || stats.legacy_zip_count > 0 || stats.oldest.is_some() {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("存储总览").strong());
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("快照");
+                        ui.label(RichText::new(stats.snapshot_count.to_string()).strong());
+                        ui.label("份（旧版 zip");
+                        ui.label(RichText::new(stats.legacy_zip_count.to_string()).strong());
+                        ui.label("份）｜ 占用");
+                        ui.label(RichText::new(fmt_size(stats.used_bytes)).strong());
+                        ui.label("｜ 最新快照");
+                        ui.label(RichText::new(stats.latest_files.to_string()).strong());
+                        ui.label("个文件 /");
+                        ui.label(RichText::new(fmt_size(stats.latest_total_bytes)).strong());
+                    });
+                    let range = match (&stats.oldest, &stats.newest) {
+                        (Some(a), Some(b)) => format!("{a} ~ {b}"),
+                        (Some(a), None) => a.clone(),
+                        _ => "—".to_string(),
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label("可回滚时间范围:");
+                        ui.label(RichText::new(range).strong());
+                    });
+                    let space_txt = if stats.free_bytes > 0 {
+                        format!("，备份盘剩余 {}", fmt_size(stats.free_bytes))
+                    } else {
+                        String::new()
+                    };
+                    let est_txt = if stats.estimated_days >= 3650 {
+                        "10 年以上（变化极小）".to_string()
+                    } else {
+                        format!("约 {} 天", stats.estimated_days)
+                    };
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("平均新增");
+                        ui.label(RichText::new(fmt_size(stats.bytes_per_day)).strong());
+                        ui.label("/ 天 ｜ 预计可保留");
+                        ui.label(RichText::new(est_txt).strong());
+                        ui.label("（保留策略覆盖约");
+                        ui.label(RichText::new(stats.retention_days.to_string()).strong());
+                        ui.label(format!("天{space_txt}）"));
+                    });
+                }
+                ui.separator();
+            });
+            // 落盘放在分组之外：分组折叠时组内控件不会被绘制，前面几组的改动仍要保存
             if b != sc.backup {
                 self.cfg.servers[idx].backup = b;
                 self.save_config();
                 self.set_toast("备份设置已保存".to_string());
             }
-            ui.separator();
-    
-            ui.horizontal(|ui| {
-                if ui.button("🔄 立即备份一次").clicked() {
-                    self.spawn_backup(idx, backup::BackupReason::Manual, true);
-                    self.set_toast("快照已开始在后台生成（完成后提示）".to_string());
-                }
-                if ui.button("🧹 立即按保留策略清理").clicked() {
-                    self.spawn_retention(idx);
-                    self.set_toast("正在后台清理超出保留策略的快照…".to_string());
-                }
-            });
-            if self.backup_inflight.contains(&idx) {
-                ui.label(RichText::new("🔄 快照进行中").color(self.fg(Color32::from_rgb(255, 200, 80))));
-            }
-            if self.restore_inflight.contains(&idx) {
-                ui.label(RichText::new("♻ 回退进行中（关服 → 恢复前快照 → 恢复）").color(self.fg(Color32::from_rgb(255, 200, 80))));
-            }
-            if let Some(lb) = &self.cfg.servers[idx].backup.last_backup {
-                ui.label(format!("上次备份: {lb}"));
-            }
-
-            // ---------- 存储总览 ----------
-            ui.add_space(4.0);
-            ui.label(RichText::new("存储总览").strong());
-            let stats = self.storage_stats_cached(idx);
-            ui.label(format!(
-                "快照 {} 份（旧版 zip {} 份）｜ 占用 {} ｜ 最新快照 {} 个文件 / {}",
-                stats.snapshot_count,
-                stats.legacy_zip_count,
-                fmt_size(stats.used_bytes),
-                stats.latest_files,
-                fmt_size(stats.latest_total_bytes)
-            ));
-            let range = match (&stats.oldest, &stats.newest) {
-                (Some(a), Some(b)) => format!("{a} ~ {b}"),
-                (Some(a), None) => a.clone(),
-                _ => "—".to_string(),
-            };
-            ui.label(format!("可回滚时间范围: {range}"));
-            let space_txt = if stats.free_bytes > 0 {
-                format!("，备份盘剩余 {}", fmt_size(stats.free_bytes))
-            } else {
-                String::new()
-            };
-            let est_txt = if stats.estimated_days >= 3650 {
-                "10 年以上（变化极小）".to_string()
-            } else {
-                format!("约 {} 天", stats.estimated_days)
-            };
-            ui.label(format!(
-                "平均新增 {} / 天 ｜ 预计可保留 {est_txt}（保留策略覆盖约 {} 天{}）",
-                fmt_size(stats.bytes_per_day),
-                stats.retention_days,
-                space_txt
-            ));
-            ui.separator();
         }
 
 
         // ---------- 自动重启 ----------
-        ui.label(RichText::new("自动重启").strong());
-        ui.label("到点后使用 /stop 关服，进程退出后自动重新启动。手动停止/强杀会取消待执行的重启");
-        let mut ar = sc.auto_restart.clone();
-        let mut ar_changed = false;
-        if ui.checkbox(&mut ar.enabled, "启用自动重启").changed() {
-            ar_changed = true;
-        }
-        if ar.enabled {
-            ui.horizontal(|ui| {
-                ui.label("模式:");
-                let mode_label = if ar.mode == "daily" { "每天固定时刻" } else { "按间隔" };
-                egui::ComboBox::from_label("")
-                    .selected_text(mode_label)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut ar.mode, "interval".to_string(), "按间隔");
-                        ui.selectable_value(&mut ar.mode, "daily".to_string(), "每天固定时刻");
-                    });
-            });
-            if ar.mode == "daily" {
-                ui.horizontal(|ui| {
-                    ui.label("每天时刻 (HH:MM):");
-                    ui.add(TextEdit::singleline(&mut ar.daily_time).desired_width(70.0));
-                });
-            } else {
-                ui.horizontal(|ui| {
-                    ui.label("间隔(分钟):");
-                    ui.add(egui::DragValue::new(&mut ar.interval_min).range(1..=10080));
-                });
-            }
-            ui.horizontal(|ui| {
-                ui.label("重启前倒计时（秒）:");
-                ui.add(egui::DragValue::new(&mut ar.warn_secs).range(3..=300));
-            });
-            if ar != sc.auto_restart {
+        egui::CollapsingHeader::new(RichText::new("自动重启").strong())
+            .id_salt(("auto_restart_group", idx))
+            .default_open(false)
+            .show(ui, |ui| {
+            ui.label("到点后使用 /stop 关服，进程退出后自动重新启动。手动停止/强杀会取消待执行的重启");
+            let mut ar = sc.auto_restart.clone();
+            let mut ar_changed = false;
+            if ui.checkbox(&mut ar.enabled, "启用自动重启").changed() {
                 ar_changed = true;
             }
-        }
-        if ar_changed {
-            self.cfg.servers[idx].auto_restart = ar;
-            self.save_config();
-            self.set_toast("自动重启设置已保存".to_string());
-        }
-        let ar_cfg = &self.cfg.servers[idx].auto_restart;
-        if ar_cfg.enabled {
-            if let Some(lr) = &ar_cfg.last_restart {
-                ui.label(format!("上次自动重启: {lr}"));
-            } else {
-                ui.label("尚未自动重启过（下次启动服务器后开始计时）");
+            if ar.enabled {
+                ui.horizontal(|ui| {
+                    ui.label("模式:");
+                    let mode_label = if ar.mode == "daily" { "每天固定时刻" } else { "按间隔" };
+                    egui::ComboBox::from_label("")
+                        .selected_text(mode_label)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut ar.mode, "interval".to_string(), "按间隔");
+                            ui.selectable_value(&mut ar.mode, "daily".to_string(), "每天固定时刻");
+                        });
+                });
+                if ar.mode == "daily" {
+                    ui.horizontal(|ui| {
+                        ui.label("每天时刻 (HH:MM):");
+                        ui.add(TextEdit::singleline(&mut ar.daily_time).desired_width(70.0));
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label("间隔(分钟):");
+                        ui.add(egui::DragValue::new(&mut ar.interval_min).range(1..=10080));
+                    });
+                }
+                ui.horizontal(|ui| {
+                    ui.label("重启前倒计时（秒）:");
+                    ui.add(egui::DragValue::new(&mut ar.warn_secs).range(3..=300));
+                });
+                if ar != sc.auto_restart {
+                    ar_changed = true;
+                }
             }
-            if self.auto_restart_pending.contains(&idx) {
-                ui.label(RichText::new("⏳ 自动重启倒计时中").color(self.fg(Color32::from_rgb(255, 200, 80))));
-            } else if self.auto_restart_after_stop.contains(&idx) {
-                ui.label(RichText::new("⏳ 正在停止，准备自动重启").color(self.fg(Color32::from_rgb(255, 200, 80))));
+            if ar_changed {
+                self.cfg.servers[idx].auto_restart = ar;
+                self.save_config();
+                self.set_toast("自动重启设置已保存".to_string());
             }
-        }
-        ui.separator();
+            let ar_cfg = &self.cfg.servers[idx].auto_restart;
+            if ar_cfg.enabled {
+                if let Some(lr) = &ar_cfg.last_restart {
+                    ui.label(format!("上次自动重启: {lr}"));
+                } else {
+                    ui.label("尚未自动重启过（下次启动服务器后开始计时）");
+                }
+                if self.auto_restart_pending.contains(&idx) {
+                    ui.label(RichText::new("⏳ 自动重启倒计时中").color(self.fg(Color32::from_rgb(255, 200, 80))));
+                } else if self.auto_restart_after_stop.contains(&idx) {
+                    ui.label(RichText::new("⏳ 正在停止，准备自动重启").color(self.fg(Color32::from_rgb(255, 200, 80))));
+                }
+            }
+            ui.separator();
+        });
 
         // ---------- 崩溃重启 ----------
-        ui.label(RichText::new("崩溃重启").strong());
-        ui.label("进程异常退出（崩溃/强杀/断电，非手动停止）时自动重新拉起。熔断窗口内连续崩溃达到上限后停止，防止故障循环刷日志");
-        let mut cr = sc.crash_restart.clone();
-        let mut cr_changed = false;
-        if ui.checkbox(&mut cr.enabled, "启用崩溃自动重启").changed() {
-            cr_changed = true;
-        }
-        if cr.enabled {
-            ui.horizontal(|ui| {
-                ui.label("窗口内最大重启次数");
-                ui.add(egui::DragValue::new(&mut cr.max_restarts).range(1..=50));
-            });
-            ui.horizontal(|ui| {
-                ui.label("崩溃后等待（秒）:");
-                ui.add(egui::DragValue::new(&mut cr.wait_secs).range(1..=300));
-            });
-            ui.horizontal(|ui| {
-                ui.label("熔断窗口(分钟):");
-                ui.add(egui::DragValue::new(&mut cr.circuit_minutes).range(1..=240));
-            });
-            if cr != sc.crash_restart {
+        egui::CollapsingHeader::new(RichText::new("崩溃重启").strong())
+            .id_salt(("crash_restart_group", idx))
+            .default_open(false)
+            .show(ui, |ui| {
+            ui.label("进程异常退出（崩溃/强杀/断电，非手动停止）时自动重新拉起。熔断窗口内连续崩溃达到上限后停止，防止故障循环刷日志");
+            let mut cr = sc.crash_restart.clone();
+            let mut cr_changed = false;
+            if ui.checkbox(&mut cr.enabled, "启用崩溃自动重启").changed() {
                 cr_changed = true;
             }
-        }
-        if cr_changed {
-            self.cfg.servers[idx].crash_restart = cr;
-            self.save_config();
-            self.set_toast("崩溃重启设置已保存".to_string());
-        }
-        // run.bat 自带的 MAX_RESTARTS 重启循环与工具自重启会**叠加**（反馈"一直重启很多次"）。
-        // 这里读出来、明确告警，并提供一键同步按钮把 bat 里的上限改成工具的上限。
-        if let Some((bat, cur_max)) = read_bat_max_restarts(&sc.dir) {
-            let tool_max = self.cfg.servers[idx].crash_restart.max_restarts as i32;
-            egui::Frame::none()
-                .fill(self.theme_cur.widget_bg)
-                .stroke(egui::Stroke::new(1.0, self.theme_cur.stroke))
-                .rounding(6.0)
-                .inner_margin(egui::Margin::symmetric(10.0, 8.0))
-                .show(ui, |ui| {
-                    ui.label(
-                        RichText::new(format!("⚠ 检测到 {bat} 自带重启循环：MAX_RESTARTS={cur_max}"))
-                            .color(Color32::from_rgb(240, 176, 96)),
-                    );
-                    ui.label(
-                        RichText::new(
-                            "它与「崩溃自动重启」叠加时会导致反复重启：建议只保留一处。\
-                             可以把 bat 的上限同步为工具的上限（或把 bat 改成 1 等于只用工具重启）。",
-                        )
-                        .weak()
-                        .small(),
-                    );
-                    ui.horizontal(|ui| {
-                        if ui
-                            .button(format!("把 MAX_RESTARTS 同步为 {tool_max}"))
-                            .clicked()
-                        {
-                            match write_bat_max_restarts(&sc.dir, tool_max) {
-                                Ok(f) => self.set_toast(format!("已更新 {f} 的 MAX_RESTARTS={tool_max}")),
-                                Err(e) => self.set_toast(format!("写入失败：{e}")),
-                            }
-                        }
-                        if ui.button("设为 1（等于只用工具重启）").clicked() {
-                            match write_bat_max_restarts(&sc.dir, 1) {
-                                Ok(f) => self.set_toast(format!("已更新 {f} 的 MAX_RESTARTS=1")),
-                                Err(e) => self.set_toast(format!("写入失败：{e}")),
-                            }
-                        }
-                    });
+            if cr.enabled {
+                ui.horizontal(|ui| {
+                    ui.label("窗口内最大重启次数");
+                    ui.add(egui::DragValue::new(&mut cr.max_restarts).range(1..=50));
                 });
-        }
-        // 崩溃重启状态展�?
-        let rt = self.runtimes.get(idx);
-        if let Some(rt) = rt {
-            if rt.crash_count > 0 {
-                ui.label(format!(
-                    "本窗口已连续崩溃 {} 次（上限 {}），{}",
-                    rt.crash_count,
-                    self.cfg.servers[idx].crash_restart.max_restarts,
-                    if rt.crash_restart_at.is_some() {
-                        "等待自动重启中"
-                    } else {
-                        "已熔断停止自动重启"
-                    }
-                ));
+                ui.horizontal(|ui| {
+                    ui.label("崩溃后等待（秒）:");
+                    ui.add(egui::DragValue::new(&mut cr.wait_secs).range(1..=300));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("熔断窗口(分钟):");
+                    ui.add(egui::DragValue::new(&mut cr.circuit_minutes).range(1..=240));
+                });
+                if cr != sc.crash_restart {
+                    cr_changed = true;
+                }
             }
-        }
-        ui.separator();
+            if cr_changed {
+                self.cfg.servers[idx].crash_restart = cr;
+                self.save_config();
+                self.set_toast("崩溃重启设置已保存".to_string());
+            }
+            // run.bat 自带的 MAX_RESTARTS 重启循环与工具自重启会**叠加**（反馈"一直重启很多次"）。
+            // 这里读出来、明确告警，并提供一键同步按钮把 bat 里的上限改成工具的上限。
+            if let Some((bat, cur_max)) = read_bat_max_restarts(&sc.dir) {
+                let tool_max = self.cfg.servers[idx].crash_restart.max_restarts as i32;
+                egui::Frame::none()
+                    .fill(self.theme_cur.widget_bg)
+                    .stroke(egui::Stroke::new(1.0, self.theme_cur.stroke))
+                    .rounding(6.0)
+                    .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(format!("⚠ 检测到 {bat} 自带重启循环：MAX_RESTARTS={cur_max}"))
+                                .color(Color32::from_rgb(240, 176, 96)),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "它与「崩溃自动重启」叠加时会导致反复重启：建议只保留一处。\
+                                 可以把 bat 的上限同步为工具的上限（或把 bat 改成 1 等于只用工具重启）。",
+                            )
+                            .weak()
+                            .small(),
+                        );
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button(format!("把 MAX_RESTARTS 同步为 {tool_max}"))
+                                .clicked()
+                            {
+                                match write_bat_max_restarts(&sc.dir, tool_max) {
+                                    Ok(f) => self.set_toast(format!("已更新 {f} 的 MAX_RESTARTS={tool_max}")),
+                                    Err(e) => self.set_toast(format!("写入失败：{e}")),
+                                }
+                            }
+                            if ui.button("设为 1（等于只用工具重启）").clicked() {
+                                match write_bat_max_restarts(&sc.dir, 1) {
+                                    Ok(f) => self.set_toast(format!("已更新 {f} 的 MAX_RESTARTS=1")),
+                                    Err(e) => self.set_toast(format!("写入失败：{e}")),
+                                }
+                            }
+                        });
+                    });
+            }
+            // 崩溃重启状态展�?
+            let rt = self.runtimes.get(idx);
+            if let Some(rt) = rt {
+                if rt.crash_count > 0 {
+                    ui.label(format!(
+                        "本窗口已连续崩溃 {} 次（上限 {}），{}",
+                        rt.crash_count,
+                        self.cfg.servers[idx].crash_restart.max_restarts,
+                        if rt.crash_restart_at.is_some() {
+                            "等待自动重启中"
+                        } else {
+                            "已熔断停止自动重启"
+                        }
+                    ));
+                }
+            }
+            ui.separator();
+        });
 
         if features::is_enabled(&self.cfg.features, features::BETA_BACKUP) {
         ui.label(RichText::new("快照 / 备份列表").strong());
