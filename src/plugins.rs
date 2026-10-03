@@ -602,7 +602,7 @@ impl PluginManager {
         configs: std::sync::Arc<std::sync::Mutex<HashMap<String, HashMap<String, String>>>>,
     ) -> (Engine, Arc<AtomicU64>) {
         let mut engine = Engine::new();
-        // 上限保护：清单填 1e12 会让 rhai 长时间占满 UI 线程（审计 high）
+        // 上限保护：清单填 1e12 会让 rhai 长时间占满 UI 线程
     let max_ops = manifest.max_operations.unwrap_or(DEFAULT_MAX_OPS).min(200_000);
         // Official operation cap first (rhai aborts with ErrorTooManyOperations).
         engine.set_max_operations(max_ops);

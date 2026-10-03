@@ -203,7 +203,7 @@ pub fn detect(dir: &Path) -> PlatformInfo {
                 evidence.push(format!("forge 版本目录 {v}"));
             }
         }
-        // ★ 最可靠的 MC 版本来源：libraries/net/minecraft/server/<版本>/（Fabric/Quilt 安装必带）
+        // 最可靠的 MC 版本来源：libraries/net/minecraft/server/<版本>/（Fabric/Quilt 安装必带）
         let srv_p = libs.join("net/minecraft/server");
         if let Ok(mut rd) = std::fs::read_dir(&srv_p) {
             if let Some(Ok(e)) = rd.next() {

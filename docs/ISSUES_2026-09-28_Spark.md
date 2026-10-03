@@ -1,18 +1,7 @@
----
-AIGC:
-    Label: "1"
-    ContentProducer: 001191440300708461136T1XGW3
-    ProduceID: f60842f40542d18996ccf15309f5e3de_77b0e90dbaa011f1b172525400248c00
-    ReservedCode1: u/YZCgs1S5k7rAVdPSi4dH08XG44RPoFw6ugzBR0rKhx6mdD2LpVllm1did/jIxK2LNwsNOtrTkWX4waBWJd5uFyzn1/L7GLAfpZk8GXL/BrlbGvo1UCudn0GuFl8Z/29KmL139i81aSCLvQIecHcObagYOVigpBhkES5RI9ZctEHsS+0b+Qxi/tmTk=
-    ContentPropagator: 001191440300708461136T1XGW3
-    PropagateID: f60842f40542d18996ccf15309f5e3de_77b0e90dbaa011f1b172525400248c00
-    ReservedCode2: u/YZCgs1S5k7rAVdPSi4dH08XG44RPoFw6ugzBR0rKhx6mdD2LpVllm1did/jIxK2LNwsNOtrTkWX4waBWJd5uFyzn1/L7GLAfpZk8GXL/BrlbGvo1UCudn0GuFl8Z/29KmL139i81aSCLvQIecHcObagYOVigpBhkES5RI9ZctEHsS+0b+Qxi/tmTk=
----
-
 # Spark 相关问题记录（2026-09-28）
 
 > 状态：已记录，待交接文档传递完毕后统一修复。
-> 来源：用户反馈 + 截图 + 代码审阅（main.rs / spark_analysis.rs / features.rs）。
+> 来源：反馈 + 截图 + 代码审阅（main.rs / spark_analysis.rs / features.rs）。
 
 ## 问题 1：Spark 输出文件点击分析报错「解析文件失败 — 系统找不到指定路径 (os error 3)」
 

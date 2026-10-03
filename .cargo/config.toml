@@ -1,0 +1,12 @@
+[source.crates-io]
+replace-with = 'ustc-sparse'
+
+[source.ustc-sparse]
+registry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"
+
+[target.x86_64-pc-windows-gnu]
+linker = "C:\\Users\\xiumi\\dev\\tools\\mingw64\\bin\\gcc.exe"
+rustflags = [
+  "-C", "link-arg=-static",
+  "-C", "link-arg=-mwindows",
+]

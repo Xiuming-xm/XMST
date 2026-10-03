@@ -711,7 +711,7 @@ fn find_data_file(dir: &Path, mod_ids: &[String]) -> Option<(String, bool)> {
         for k in &keys {
             // 短/通用 id（如 "carpet"）只接受**完全相等**：否则会把
             // antideath-carpet-addition 这类"名字里恰好含 carpet"的无关模组错认成目标
-            // （用户实测到的错误跳转就是它）。
+            // （实测到的错误跳转就是它）。
             if k.len() < 10 && n != *k {
                 continue;
             }

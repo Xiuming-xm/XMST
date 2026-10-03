@@ -511,7 +511,7 @@ fn cache_key(text: &str) -> u64 {
     h ^ (text.len() as u64)
 }
 
-/// ★ 推荐入口：**并行竞速 + 缓存**的翻译。
+/// 推荐入口：**并行竞速 + 缓存**的翻译。
 ///
 /// 慢的根源：Google 免费接口经常被限流，先等它超时（原来 25s）再退到 MyMemory（再 25s），
 /// 最坏要等近 50s。现在改成：
@@ -657,7 +657,7 @@ pub fn version_by_sha1(
         return Err(format!("HTTP {}", resp.status()));
     }
     let v: Value = resp.json().map_err(|e| format!("JSON 解析失败: {e}"))?;
-    // ★ 修正（审计 high）：POST /v2/version_files 返回的是
+    // 修正：POST /v2/version_files 返回的是
     //   {"sha1:<hash>": {版本对象}} 的**对象 map**，不是数组；且版本对象的
     //   id 字段名是 `id`（旧代码读 version_id 永远为空）→ "检查更新"此前从未成功过。
     let obj = v.as_object().ok_or("version_files 响应异常")?;

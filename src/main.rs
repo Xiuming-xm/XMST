@@ -2122,7 +2122,7 @@ impl App {
     }
 
     /// 立即原子落盘：临时文件 → 保留上一份为 .bak → 原子替换。
-    /// 序列化失败绝不写空文件（旧实现写空字符串会把配置清空，用户实测丢过多次配置）。
+    /// 序列化失败绝不写空文件（旧实现写空字符串会把配置清空，实测丢过多次配置）。
     fn flush_config(&mut self) {
         if !self.cfg_dirty {
             return;
@@ -2270,7 +2270,7 @@ impl App {
                 rt.log_buf.clear();
                 rt.startup_notified = false;
                 rt.startup_warned = false;
-                // ★ 复位插件一次性门控：以前只在 ServerRuntime::default() 里初始化 false，
+                // 复位插件一次性门控：以前只在 ServerRuntime::default() 里初始化 false，
                 // 而 runtimes 每个服务器只建一次，导致 server_started 每个服务器每次程序运行
                 // 最多只发一次（第二次开服插件再也不触发，毛玻璃"只生效过一次"）。
                 rt.plugin_start_emitted = false;
@@ -2489,7 +2489,7 @@ impl App {
     /// 窗口隐藏后 eframe/winit 事件循环休眠，ViewportCommand 不会及时被消费，
     /// 这是此前多次「托盘后打不开/关不掉」的根因。Win32 调用不依赖事件循环，稳定生效。
     fn setup_tray_handlers(&mut self, _ctx: &egui::Context) {
-        // ★ 双击 exe 唤醒已有实例：命名事件 + 阻塞等待线程（零 CPU）。
+        // 双击 exe 唤醒已有实例：命名事件 + 阻塞等待线程（零 CPU）。
         // 第二个实例在 single_instance_check 里 SetEvent，这里被唤醒后恢复窗口。
         {
             let hidden = self.tray_hidden.clone();
@@ -4116,7 +4116,7 @@ impl App {
 
     /// 用系统默认关联程序打开文件（如 .jar → 7zip / 默认解压器）。
     ///
-    /// ★ 改为 `ShellExecuteW(open)`：这是 Windows 官方推荐的"用默认程序打开"方式，
+    /// 改为 `ShellExecuteW(open)`：这是 Windows 官方推荐的"用默认程序打开"方式，
     /// 不再 spawn `explorer.exe`。此前用 `explorer.exe <文件>` 在部分机器/文件类型上
     /// 会弹「explorer.exe 应用程序无法正常启动(0xc0000142)」且打不开
     /// （GUI 子系统进程没有有效标准句柄，子进程初始化失败）。`ShellExecuteW` 不创建
@@ -4167,7 +4167,7 @@ impl App {
             }
             // ⓪ **老版本的原始调用**：`Command::new("explorer.exe").arg(路径).spawn()`，
             //    不加 CREATE_NO_WINDOW、不覆盖标准句柄、不指定 current_dir ——
-            //    这正是"以前一直能打开"的那段代码（用户反馈是某版本开始的回归），
+            //    这正是"以前一直能打开"的那段代码（反馈是某版本开始的回归），
             //    所以先原样复现这条路径，再走后面的新方案。
             match std::process::Command::new("explorer.exe").arg(&p).spawn() {
                 Ok(c) => log.push_str(&format!("⓪ 原始 explorer.exe: spawn OK pid={}\n", c.id())),
@@ -4572,7 +4572,7 @@ fn load_config(path: &Path) -> GlobalConfig {
             Ok(s) => match serde_json::from_str::<GlobalConfig>(&s) {
                 Ok(c) => c,
                 Err(e) => {
-                    // ★ 解析失败绝不静默丢弃：坏文件留档 → 尝试 .bak → 最后默认值。
+                    // 解析失败绝不静默丢弃：坏文件留档 → 尝试 .bak → 最后默认值。
                     let bak_bad = path.with_extension(format!(
                         "broken_{}.json",
                         Local::now().format("%Y%m%d_%H%M%S")
@@ -4610,7 +4610,7 @@ fn load_config(path: &Path) -> GlobalConfig {
             let _ = std::fs::write(path, json);
         }
     }
-    // 内容衬底脏值自愈：旧版本滑杆曾把 bg_content_scrim 钳制成 0（第四轮复位 0.25 后又复发），
+    // 内容衬底脏值自愈：旧版本滑杆曾把 bg_content_scrim 钳制成 0（复位 0.25 后又复发），
     // 0 意味着内容面板完全无衬底、桌面细节直穿 UI（「半透明不够清晰」反馈的根因之一）。
     // <0.35 一律视为被误钳制的脏值，抬到新默认 0.5 并回写磁盘；用户显式调高的值保留。
     if cfg.bg_content_scrim < 0.35 {
@@ -4712,7 +4712,7 @@ impl App {
     ///
     /// 为什么不再用 emoji：📊 / 🗂 / ⬇️ / 🧩 / 🔗 / ⚙️ 来自不同字体（彩色 emoji 字体 vs
     /// 符号字体），字形宽度、基线、视觉重量都不同；即使按 CENTER_CENTER 居中，
-    /// 实际墨迹位置依然参差 —— 用户连续两轮反馈"图标错位"就是这个原因。
+    /// 实际墨迹位置依然参差 —— 反馈"图标错位"就是这个原因。
     /// 矢量图标统一画在 18×18 方框内居中，天生像素级对齐。
     fn nav_icon(&self, painter: &egui::Painter, center: egui::Pos2, kind: Nav, color: Color32) {
         let c = center;
@@ -5497,7 +5497,7 @@ fn shell_open_str(s: &str) -> bool {
 }
 
 /// 用系统默认浏览器打开网址。
-/// ★ 优先 ShellExecuteW：**不创建子进程**，因此不会出现 cmd 黑框一闪（用户反馈）。
+/// 优先 ShellExecuteW：**不创建子进程**，因此不会出现 cmd 黑框一闪（反馈）。
 /// 仅在 ShellExecute 失败时才退化为 cmd（带 CREATE_NO_WINDOW，同样不闪框）。
 fn open_url(url: &str) {
     if shell_open_str(url) {
@@ -5957,7 +5957,7 @@ fn rename_with_retry(old: &Path, new: &Path) -> Result<(), String> {
 }
 /// 给子进程显式指定一个一定存在的工作目录。
 ///
-/// ★ 关键修复：本程序可能被从"之后被删除的目录"启动（例如从 dist\backup\<时间戳> 运行，
+/// 关键修复：本程序可能被从"之后被删除的目录"启动（例如从 dist\backup\<时间戳> 运行，
 /// 或旧目录启动后目录被更新替换），此时本进程的当前目录已经失效；子进程继承这个无效目录
 /// 会在初始化阶段失败 —— 表现为 explorer.exe 应用程序错误 0xc0000142，或
 /// 「Windows 无法访问指定设备、路径或文件（你可能没有适当的权限）」，于是所有需要 spawn
@@ -6051,8 +6051,8 @@ fn reveal_in_explorer(p: &Path) {
 
 /// 目录体积（人类可读，如 "1.2 GB"）；不存在返回 "—"。
 fn dir_size_mb(p: &Path) -> String {
-    // ★ 30 秒记忆化：此前它在概览页渲染路径里被**每帧**调用，
-    //   实测 world/ = 5352 文件 / 7.9GB / 单次遍历 282ms（审计 high 项）。
+    // 30 秒记忆化：此前它在概览页渲染路径里被**每帧**调用，
+    //   实测 world/ = 5352 文件 / 7.9GB / 单次遍历 282ms。
     static CACHE: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (std::time::Instant, String)>>,
     > = std::sync::OnceLock::new();
@@ -6566,7 +6566,7 @@ impl eframe::App for App {
                 self.hide_sent = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             }
-            // ★ 托盘态的清理必须放在**窗口确实已经隐藏之后**：
+            // 托盘态的清理必须放在**窗口确实已经隐藏之后**：
             // 之前是在关闭帧里就丢纹理/清缓存，那一帧的交换缓冲可能还是黑的，
             // 而窗口又没真正隐藏（winit 命令未生效）→ 桌面上留着一个黑窗口。
             // 现在：先兜底用 Win32 真正隐藏窗口，再释放纹理与缓存 —— 黑屏在结构上不可能出现。
@@ -6589,7 +6589,7 @@ impl eframe::App for App {
             }
             return;
         }
-        // ★ 恢复窗口（托盘 → 显示）后的第一帧：全量重建渲染状态。
+        // 恢复窗口（托盘 → 显示）后的第一帧：全量重建渲染状态。
         //
         // 黑屏窗口的根因：进入托盘态后会清空 egui 缓存 + 重置字体 + EmptyWorkingSet（为了把
         // 工作集压到 ~2MB），这会让**背景材质纹理/壁纸纹理句柄失效**；而材质模式下内容面板
@@ -6717,7 +6717,7 @@ impl eframe::App for App {
         self.tick_theme(ctx);
         // 背景底图 / 背景材质：必须在**面板之前**绘制。egui 的 CentralPanel 内容就画在
         // background 层，而同一层内按插入顺序绘制；帧末追加底图会盖住中央内容
-        // （本轮「材质盖住整个 UI、按钮全不可见」的根因，也是历史「壁纸盖住按钮」的同源问题）。
+        // （本次「材质盖住整个 UI、按钮全不可见」的根因，也是历史「壁纸盖住按钮」的同源问题）。
         self.paint_bg(ctx);
         // 窗口隐藏到托盘后 egui 事件循环会休眠，托盘点击/菜单事件由全局回调（set_event_handler）处理；
         // 首次 update 注册回调（此时才持有有效 ctx），注册后不依赖事件循环也能响应托盘
@@ -6896,7 +6896,7 @@ impl eframe::App for App {
                         .unwrap_or_else(|| "?".to_string());
                     let name = self.cfg.servers.get(idx).map(|s| s.name.clone()).unwrap_or_default();
                     notify_queue.push(("XMST - 服务器异常退出".to_string(), format!("{name} 进程已退出（code {code}），未经过正常停止")));
-                    // ★ 崩溃根因分析：从日志/crash-report 里提取可操作的原因（缺少前置、Java 版本、
+                    // 崩溃根因分析：从日志/crash-report 里提取可操作的原因（缺少前置、Java 版本、
                     // 内存、端口、Mixin 冲突…），随后弹出小窗提示，而不是只丢一句"异常退出"。
                     let sdir = self.cfg.servers.get(idx).map(|s| s.dir.clone());
                     if let Some(sdir) = sdir {
@@ -7052,7 +7052,7 @@ impl eframe::App for App {
                 }
             }
         }
-        // 统一投递本轮收集的通知（循环结束后避免借用冲突）桌面弹窗 + 工具内通知同步
+        // 统一投递本次收集的通知（循环结束后避免借用冲突）桌面弹窗 + 工具内通知同步
         for (title, body) in notify_queue {
             self.notify(&title, &body);
         }
@@ -7118,8 +7118,8 @@ impl eframe::App for App {
         // 超长 repaint 请求休眠，托盘恢复由全局回调 request_repaint 唤醒。
 
         // 顶部栏（无背景标题：XMST + 小版本号；右侧为工具内窗口按钮：最小化/最大化/关闭）
-        // ★ 颜色必须跟随调色板：此前 Default 分支写死了近黑色 (22,25,32)，
-        // 于是**日间模式下顶栏依旧全黑**（用户截图反馈）。现在一律取当前调色板的 panel，
+        // 颜色必须跟随调色板：此前 Default 分支写死了近黑色 (22,25,32)，
+        // 于是**日间模式下顶栏依旧全黑**。现在一律取当前调色板的 panel，
         // 材质模式下取 window_fill（= 材质的近不透明版），保证与内容区同色系。
         egui::TopBottomPanel::top("top")
             .frame(
@@ -7143,14 +7143,14 @@ impl eframe::App for App {
                     if bar_resp.drag_started() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                     }
-                    // 双击标题栏 = 最大化/还原（与普通 Windows 窗口一致；用户反馈"窗口无法缩放"
+                    // 双击标题栏 = 最大化/还原（与普通 Windows 窗口一致；反馈"窗口无法缩放"
                     // 时往往正是窗口处于最大化状态，需要一条明显的退路）。
                     if bar_resp.double_clicked() {
                         let is_max = self.window_is_maximized();
                         ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
                     }
                     // 左上角品牌区：**全部用 painter 绘制**（不用 Label/富文本）。
-                    // 原因（用户反馈）：Label 是可选中文本，在标题栏左上角会吃掉鼠标按下事件
+                    // 原因（反馈）：Label 是可选中文本，在标题栏左上角会吃掉鼠标按下事件
                     // —— 想拖左上角缩放时变成"框选文字"，缩放失效。绘制出来的图形没有任何
                     // 交互命中，事件全都归标题栏拖拽/边缘缩放。
                     {
@@ -7351,7 +7351,7 @@ impl eframe::App for App {
                                         }
                                     }
                                     if moon_a > 0.01 {
-                                        // 用户要求：夜间图标就用**圆月**（一个实心圆）——不再追求月牙造型
+                                        // 需求：夜间图标就用**圆月**（一个实心圆）——不再追求月牙造型
                                         p.circle_filled(m, 4.6, ic.gamma_multiply(moon_a));
                                     }                                }
                             },
@@ -7378,7 +7378,7 @@ impl eframe::App for App {
             });
 
         // 左侧导航（带平滑滑块动画，可在设置中关闭；支持折叠成纯图标）
-        // 折叠/展开宽度做**动画插值**（此前是硬跳变，用户反馈"没有平滑效果"）。
+        // 折叠/展开宽度做**动画插值**（此前是硬跳变，反馈"没有平滑效果"）。
         let target_w = if self.nav_collapsed { 56.0 } else { 170.0 };
         if self.cfg.ui_animations {
             let sp = (0.25 * self.cfg.anim_speed.clamp(0.1, 2.0)).clamp(0.06, 0.6);
@@ -10210,14 +10210,14 @@ impl App {
                     PlayerTab::Whitelist => self.ui_players_wl(ui, idx),
                     PlayerTab::Banned => self.ui_players_banned(ui, idx),
                     PlayerTab::Ops => self.ui_players_ops(ui, idx),
-                    // 玩家属性功能暂时禁用（用户要求）：入口保留但只显示说明，
+                    // 玩家属性功能暂时禁用（需求）：入口保留但只显示说明，
                     // 不再渲染任何可操作控件（原实现 ui_players_props 仍保留在代码里备用）。
                     PlayerTab::Props => self.ui_players_props_disabled(ui, idx),
                 }
             });
     }
 
-    /// 玩家属性（阶段C）——**暂时禁用**（用户要求）。
+    /// 玩家属性（阶段C）——**暂时禁用**（需求）。
     ///
     /// 保留标签页入口与说明，但不渲染任何控件，避免误导用户以为可用。
     /// 恢复时把下面的提示替换回原实现即可（原实现见 git 历史 / 备份分支）。
@@ -11433,7 +11433,7 @@ impl App {
             self.save_config();
             self.set_toast("崩溃重启设置已保存".to_string());
         }
-        // ★ run.bat 自带的 MAX_RESTARTS 重启循环与工具自重启会**叠加**（用户反馈"一直重启很多次"）。
+        // run.bat 自带的 MAX_RESTARTS 重启循环与工具自重启会**叠加**（反馈"一直重启很多次"）。
         // 这里读出来、明确告警，并提供一键同步按钮把 bat 里的上限改成工具的上限。
         if let Some((bat, cur_max)) = read_bat_max_restarts(&sc.dir) {
             let tool_max = self.cfg.servers[idx].crash_restart.max_restarts as i32;
@@ -11576,7 +11576,7 @@ impl App {
                             ("📖 教程", TunnelSide::Tutorial),
                         ];
                         // 子页签切换动效：与主侧栏同款（滑块位置插值 + 悬停底色过渡），
-                        // 此前是 selectable_label 硬切换，用户反馈"内网穿透内部切换没有平滑动效"。
+                        // 此前是 selectable_label 硬切换，反馈"内网穿透内部切换没有平滑动效"。
                         let idx_of = |s: TunnelSide| items.iter().position(|(_, x)| *x == s).unwrap_or(0);
                         let target = idx_of(self.tunnel_side) as f32;
                         if self.cfg.ui_animations {
@@ -12996,7 +12996,7 @@ impl App {
 
         let open = sections[idx].open;
         // 头部：与隧道管理页（egui 内建 CollapsingHeader）**同款**：
-        // 三角箭头 + 标题（无分隔线、无自绘悬停块）——用户反馈"按钮、竖线之类的还是有区别"。
+        // 三角箭头 + 标题（无分隔线、无自绘悬停块）——反馈"按钮、竖线之类的还是有区别"。
         ui.horizontal(|ui| {
             let arrow = if anim > 0.5 { "⏷" } else { "⏵" };
             if ui
@@ -13022,7 +13022,7 @@ impl App {
         let last_h = sections[idx].last_h.max(8.0);
         let max_h = anim * last_h;
         let mut content_h = 0.0_f32;
-        // ★ 用与 egui 内建 `CollapsingHeader` 完全相同的做法（分配 + 裁剪子 UI），
+        // 用与 egui 内建 `CollapsingHeader` 完全相同的做法（分配 + 裁剪子 UI），
         // 不再用 ScrollArea —— ScrollArea 会随高度变化反复重排内容并参与滚动条布局，
         // 这正是"设置折叠始终卡一下、不如隧道管理那边顺滑"的原因。
         let (body_rect, _) = ui.allocate_exact_size(
@@ -13037,7 +13037,7 @@ impl App {
         child.set_clip_rect(body_rect.intersect(ui.clip_rect()));
         add(&mut child);
         content_h = child.min_rect().height();
-        // ★ 折叠"卡一下"的根因：动画期间 `content_h` 取到的是**被 max_height 裁剪后**的高度，
+        // 折叠"卡一下"的根因：动画期间 `content_h` 取到的是**被 max_height 裁剪后**的高度，
         // 若把它写回 last_h，下一帧的动画目标就变小，于是目标逐帧缩水 → 展开过程一顿一顿。
         // 只在"完全展开"时记录真实内容高度（或首次未知时取一次）。
         if anim >= 0.99 || sections[idx].last_h <= 0.0 {
@@ -13080,7 +13080,7 @@ impl App {
         // 材质浓度：默认跟滑杆走；关闭「配色跟随材质」时抬到 0.60 下限，
         // 保证固定深色主题在明亮桌面上依然可读（否则浅字 + 亮底 = 看不清）。
         let t = self.effective_bg_opacity();
-        // ★ 防御：材质模式要求「底图纹理必须存在」。
+        // 防御：材质模式要求「底图纹理必须存在」。
         // 材质模式下内容面板填充 alpha = 0（靠纹理透出桌面），一旦纹理不存在（刚从托盘恢复、
         // 纹理被丢弃、首帧抓取还没完成），整窗就只剩 clear 色 = **黑屏窗口**。
         // 这里在纹理缺失时把 material 置空 → 主题回落到常规不透明面板，绝不黑屏；
@@ -13274,7 +13274,7 @@ impl App {
             // 本机 DWM accent 不可用，所以在材质阶段把这一层差异画出来）。
             // blur_px 是在缩小后小图上的盒式模糊半径（点采样 StretchBlt 很快，
             // 质量由这一步补回来）。
-            // ★ 「半透明」= 把桌面**原样**透出来、只叠一层底色，所以 ds=1（原生分辨率 /
+            // 「半透明」= 把桌面**原样**透出来、只叠一层底色，所以 ds=1（原生分辨率 /
             //   完全不缩小）且不模糊 —— 这是唯一真正"清晰"的做法。抓屏 60~100ms 全部发生在
             //   工作线程上（见 backdrop.rs），不再卡 UI。
             //   毛玻璃/亚克力才有意缩小 + 盒式模糊；拖动/缩放期间完全冻结（见下方
@@ -13295,7 +13295,7 @@ impl App {
             if !hwnd.is_null() {
                 self.backdrop.ensure_exclusion(hwnd as isize, true);
             }
-            // ★ 拖动/缩放期间的底图策略（消除闪烁 + 保持跟手）：
+            // 拖动/缩放期间的底图策略（消除闪烁 + 保持跟手）：
             //   上一版拖动中每 ~200ms 重抓一次且切粗档（ds×6）——每次抓屏完成都会上传
             //   一张「清晰度跳变 + 内容滞后于窗口」的新纹理 → 视觉上表现为闪。
             //   改为：拖动/缩放期间**完全冻结**（零抓屏、零上传、无清晰度跳变），
@@ -13924,7 +13924,7 @@ impl App {
                                         }
                                     }
                                     // 高风险操作：与其它按钮同一行、同一高度对齐；
-                                    // 只用红色文字表达风险，不再套一个突兀的红框（用户反馈）。
+                                    // 只用红色文字表达风险，不再套一个突兀的红框（反馈）。
                                     let risk_red = self.fg(Color32::from_rgb(230, 120, 120));
                                     // 三个按钮统一用默认按钮尺寸（此前两个大按钮 add_sized 显得"一小两大"）
                                     if ui
@@ -13977,7 +13977,7 @@ impl App {
                                 });
                                 ui.checkbox(&mut self.cfg.ui_animations, "启用切换动效（导航页签 / 折叠 / 按钮过渡）");
                                 // 说明：原先此处另有一个「设置页内平滑动画」开关，已并入上面的总开关
-                                // （用户反馈：两个开关语义重复且设置页看起来"没有动效"）。
+                                // （反馈：两个开关语义重复且设置页看起来"没有动效"）。
                                 ui.label(RichText::new("关闭动效后所有过渡立即完成，后台以最低刷新率运行，进一步降低资源占用").weak().small());
                                 ui.label("平滑动画速度:");
                                 ui.horizontal(|ui| {
@@ -14187,7 +14187,7 @@ impl App {
                         SettingsSide::Notify => {
                             let sections = std::mem::take(&mut self.settings_sections);
                             let sections = Self::setting_section(ctx, ui, sections, "notify", "通知", None, true, use_anim, self.cfg.anim_speed, |ui| {
-                                // （已按用户要求删除原说明文本）
+                                // （已按需求删除原说明文本）
                                 ui.horizontal(|ui| {
                                     let mut v = self.cfg.sys_notify;
                                     if ui.checkbox(&mut v, "启用 Windows 系统气泡通知（窗口关闭时也显示）").changed() {
@@ -14687,12 +14687,12 @@ const MATERIAL_OWNER_FALLBACK: &str = "xmst-frosted-glass-demo";
         } else if let Some(name) = owner {
             self.plugin_bg_owner = Some(name.to_string());
         }
-        // ★ 关键：DWM accent 会重置窗口区域（SetWindowRgn 的结果被抹掉），而
+        // 关键：DWM accent 会重置窗口区域（SetWindowRgn 的结果被抹掉），而
         // apply_window_round_region 有 (r,w,h) 去重缓存，于是圆角永久变成「尖锐直角」。
         // 这里既失效缓存，也在同一步内立即用当前半径重设区域，不依赖下一帧。
         //
         // 但**只在模式/圆角真正变化时**才重设：SetWindowRgn 会让整窗重绘一次，
-        // 挪动不透明度滑杆时每帧都调用就会周期性地"闪一下"（用户反馈的闪烁根因之一）。
+        // 挪动不透明度滑杆时每帧都调用就会周期性地"闪一下"（反馈的闪烁根因之一）。
         if style_changed {
             self.last_win_rgn = (-1, -1, -1);
         }
@@ -15282,7 +15282,7 @@ const MATERIAL_OWNER_FALLBACK: &str = "xmst-frosted-glass-demo";
                             match res {
                                 Ok(()) => {
                                     msgs.push(format!("插件「{name}」已{}", if on { "启用" } else { "禁用" }));
-                                    // ★ 启用状态落盘（修复「每次重进插件都变回关闭、需要重新开启」）：
+                                    // 启用状态落盘（修复「每次重进插件都变回关闭、需要重新开启」）：
                                     // 以前只改了 PluginManager.states，cfg.plugin_states 从不写回，
                                     // reload_all 的 unwrap_or(false) 让插件每次启动都按禁用加载。
                                     if let Some(pm) = self.plugins.as_ref() {
@@ -17081,7 +17081,7 @@ impl App {
     /// 这是 **XMST 工具自己的运行日志**（服务器输出也汇总进同一个库，以来源标记区分），
     /// 因此不按服务器拆页签，筛选靠「来源」下拉完成。原「设置 → 日志」整段已并入本页。
     /// 日志库查询（500ms 节流缓存）：此前在日志页渲染路径里每帧执行
-    /// SELECT COUNT(*) + 取 800 行（审计 high 项）。
+    /// SELECT COUNT(*) + 取 800 行。
     fn log_rows_cached(&mut self) -> (i64, Vec<logdb::LogRow>) {
         let stale = self
             .log_cache_at

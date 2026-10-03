@@ -1,14 +1,3 @@
----
-AIGC:
-    Label: "1"
-    ContentProducer: 001191440300708461136T1XGW3
-    ProduceID: f60842f40542d18996ccf15309f5e3de_3f5f0fe4b5bf11f188f9525400248c00
-    ReservedCode1: QHTx0ZvacgGLMkJ2jxZxtUnXitu7UvTHG3l1gMzBF/AySeCmaqh0mReXXm8BtZCMjKyHAxmp/rfwIyu29ZtnbkjTXsVwce74Ro/xkauyiBXHnith4Cm7nBZ5qKCzu5p+BpbOBq9pFKG5iXCpe+T9YZt3ftPTMpjDlvhxcTQjw5+toeHYLFvOC8bBkFM=
-    ContentPropagator: 001191440300708461136T1XGW3
-    PropagateID: f60842f40542d18996ccf15309f5e3de_3f5f0fe4b5bf11f188f9525400248c00
-    ReservedCode2: QHTx0ZvacgGLMkJ2jxZxtUnXitu7UvTHG3l1gMzBF/AySeCmaqh0mReXXm8BtZCMjKyHAxmp/rfwIyu29ZtnbkjTXsVwce74Ro/xkauyiBXHnith4Cm7nBZ5qKCzu5p+BpbOBq9pFKG5iXCpe+T9YZt3ftPTMpjDlvhxcTQjw5+toeHYLFvOC8bBkFM=
----
-
 # 待办：frp 平台 API 接入（先准备，不正式做）
 
 > 状态：仅调研准备阶段，未进入实现。
