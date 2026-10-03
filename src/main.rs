@@ -5593,6 +5593,55 @@ pub fn run_open_diag(target: &str) {
     ));
     w(format!("sane_cwd={:?}", sane_cwd()));
     w(job_info());
+    // ---- 令牌与写权限诊断（定位"读得到、写不进"的根因）----
+    {
+        let ps = "whoami; whoami /groups | findstr /i \"Mandatory Label\\\"; whoami /priv | findstr /i \"SeTakeOwnership SeRestore SeBackup SeChangeNotify\"";
+        match std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", ps])
+            .current_dir(sane_cwd())
+            .stdin(std::process::Stdio::null())
+            .output()
+        {
+            Ok(o) => {
+                let txt = String::from_utf8_lossy(&o.stdout).replace(['\r', '\n'], " | ");
+                w(format!("令牌/权限: {txt}"));
+            }
+            Err(e) => w(format!("令牌查询失败: {e}")),
+        }
+        // 在**目标所在目录**里实测：创建 → 写入 → 改名 → 删除
+        let dir = if p.is_dir() {
+            p.clone()
+        } else {
+            p.parent().map(|d| d.to_path_buf()).unwrap_or_else(|| p.clone())
+        };
+        w(format!("写权限实测目录: {}", dir.display()));
+        let f1 = dir.join("_xmst_write_test.tmp");
+        let f2 = dir.join("_xmst_write_test2.tmp");
+        match std::fs::write(&f1, b"xmst") {
+            Ok(()) => w("  创建+写入: OK".to_string()),
+            Err(e) => w(format!("  创建+写入: 失败 {e}（os error {:?}）", e.raw_os_error())),
+        }
+        match std::fs::rename(&f1, &f2) {
+            Ok(()) => w("  改名: OK".to_string()),
+            Err(e) => w(format!("  改名: 失败 {e}（os error {:?}）", e.raw_os_error())),
+        }
+        match std::fs::copy(&f2, &f1) {
+            Ok(_) => w("  复制: OK".to_string()),
+            Err(e) => w(format!("  复制: 失败 {e}（os error {:?}）", e.raw_os_error())),
+        }
+        let _ = std::fs::remove_file(&f1);
+        let _ = std::fs::remove_file(&f2);
+        // 目标文件自身的 ACL 归属信息（只读属性）
+        if p.is_file() {
+            if let Ok(md) = std::fs::metadata(&p) {
+                w(format!(
+                    "  目标文件: 只读={} 大小={}",
+                    md.permissions().readonly(),
+                    md.len()
+                ));
+            }
+        }
+    }
     w(format!(
         "temp_dir={:?} 存在={}",
         std::env::temp_dir(),
