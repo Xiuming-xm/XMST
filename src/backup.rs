@@ -132,6 +132,9 @@ pub struct SnapshotMeta {
     pub folders: Vec<String>,
     #[serde(default = "default_snapshot_version")]
     pub version: u32,
+    /// 是否已锁定：锁定后快照内所有文件都是独立副本，内容不再随后续写入/其它快照变化
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 fn default_snapshot_version() -> u32 {
@@ -464,6 +467,7 @@ pub fn create_snapshot(req: &SnapshotRequest) -> Result<BackupResult, String> {
         bytes_copied,
         folders: req.folders.to_vec(),
         version: SNAPSHOT_VERSION,
+        pinned: false,
     };
     if let Err(e) = write_json(&dir.join(SNAPSHOT_META), &meta) {
         let _ = fs::remove_dir_all(&dir);
@@ -552,33 +556,8 @@ pub fn list_snapshots(server_dir: &Path) -> Vec<SnapshotInfo> {
         let meta = read_meta(&dir);
         // 清单可能很大（上万文件）：进程内按"清单大小 + 修改时间"缓存总字节，避免每次刷新都重新解析
         let total_bytes = cached_total_bytes(&dir);
-        let manifest_files = match &meta {
-            Some(m) => m.files_total,
-            None => read_manifest(&dir).map(|m| m.entries.len()).unwrap_or(0),
-        };
         // meta.json 缺失（中断/手工改动）：用目录时间退化出可用元信息，保证仍能列表与回退
-        let meta = meta.unwrap_or_else(|| {
-            let time = fs::metadata(&dir)
-                .and_then(|m| m.modified())
-                .ok()
-                .map(|t| {
-                    let dt: chrono::DateTime<Local> = t.into();
-                    dt.format("%Y-%m-%d %H:%M:%S").to_string()
-                })
-                .unwrap_or_default();
-            SnapshotMeta {
-                time,
-                reason: BackupReason::Auto.as_str().to_string(),
-                server_name: String::new(),
-                duration_ms: 0,
-                files_total: manifest_files,
-                files_linked: 0,
-                files_copied: 0,
-                bytes_copied: 0,
-                folders: Vec::new(),
-                version: SNAPSHOT_VERSION,
-            }
-        });
+        let meta = meta.unwrap_or_else(|| fallback_meta(&dir));
         out.push(SnapshotInfo { dir, name, meta, total_bytes });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -624,6 +603,33 @@ fn read_manifest(dir: &Path) -> Option<SnapshotManifest> {
 fn read_meta(dir: &Path) -> Option<SnapshotMeta> {
     let s = fs::read_to_string(dir.join(SNAPSHOT_META)).ok()?;
     serde_json::from_str::<SnapshotMeta>(&s).ok()
+}
+
+/// meta.json 缺失/损坏时的退化元信息：时间取目录修改时间，文件总数取清单条目数。
+/// 字段缺失一律走默认值（缺 pinned 视为未锁定），保证老快照仍可用。
+fn fallback_meta(dir: &Path) -> SnapshotMeta {
+    let time = fs::metadata(dir)
+        .and_then(|m| m.modified())
+        .ok()
+        .map(|t| {
+            let dt: chrono::DateTime<Local> = t.into();
+            dt.format("%Y-%m-%d %H:%M:%S").to_string()
+        })
+        .unwrap_or_default();
+    let files_total = read_manifest(dir).map(|m| m.entries.len()).unwrap_or(0);
+    SnapshotMeta {
+        time,
+        reason: BackupReason::Auto.as_str().to_string(),
+        server_name: String::new(),
+        duration_ms: 0,
+        files_total,
+        files_linked: 0,
+        files_copied: 0,
+        bytes_copied: 0,
+        folders: Vec::new(),
+        version: SNAPSHOT_VERSION,
+        pinned: false,
+    }
 }
 
 fn write_json<T: Serialize>(path: &Path, v: &T) -> Result<(), String> {
@@ -988,12 +994,195 @@ pub fn apply_retention(server_dir: &Path, policy: &RetentionPolicy) -> Result<us
         if keep.contains(&s.name) {
             continue;
         }
+        // ★ 已锁定的快照是"防篡改归档"（见 pin_snapshot）：保留策略一律跳过，不参与清理。
+        //    否则归档随时可能被自动清理删掉，锁定就失去意义。
+        if s.meta.pinned {
+            continue;
+        }
         match fs::remove_dir_all(&s.dir) {
             Ok(()) => removed += 1,
             Err(e) => return Err(format!("清理快照 {} 失败: {e}", s.name)),
         }
     }
     Ok(removed)
+}
+
+// ---------- 快照锁定（防篡改归档） ----------
+
+/// 复制 `src` 到 `dst`：先写同目录的 `<dst>.tmp`，保持修改时间后再改名覆盖。
+/// 用于①锁定快照时把硬链接实化为独立副本（此时 dst 就是快照内的原文件）
+/// ②同步到目标目录。改名覆盖而不是"删除 + 重建"，可保证任一瞬间目标路径上都是一个完整文件。
+fn copy_replace(src: &Path, dst: &Path) -> std::io::Result<u64> {
+    let mut tmp_name = dst.as_os_str().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = PathBuf::from(tmp_name);
+    // Windows 上目标带只读属性时"改名覆盖"会直接失败（ACCESS_DENIED），先临时去掉
+    let dst_was_readonly = readonly_attr(dst);
+    if dst_was_readonly {
+        set_readonly_attr(dst, false);
+    }
+    let n = match fs::copy(src, &tmp) {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            if dst_was_readonly {
+                set_readonly_attr(dst, true);
+            }
+            return Err(e);
+        }
+    };
+    // 保持 100ns 精度的修改时间：清单/远端同步都依赖这个时间戳判定"未变"
+    if let Ok(m) = fs::metadata(src) {
+        let ft = filetime::FileTime::from_last_modification_time(&m);
+        let _ = filetime::set_file_mtime(&tmp, ft);
+    }
+    if let Err(e) = fs::rename(&tmp, dst) {
+        let _ = fs::remove_file(&tmp);
+        if dst_was_readonly {
+            set_readonly_attr(dst, true);
+        }
+        return Err(e);
+    }
+    // 覆盖后与源文件保持一致的只读属性（硬链接共享属性，实化后必须显式对齐）
+    set_readonly_attr(dst, readonly_attr(src));
+    Ok(n)
+}
+
+/// 是否带只读属性（取不到按 false）
+fn readonly_attr(p: &Path) -> bool {
+    fs::metadata(p)
+        .map(|m| m.permissions().readonly())
+        .unwrap_or(false)
+}
+
+/// 设置只读属性。非 Windows 平台上 readonly() 表示"缺少写权限位"，
+/// 改写它会连带改变权限语义，因此只在 Windows 上实际执行
+#[cfg(windows)]
+fn set_readonly_attr(p: &Path, ro: bool) {
+    if let Ok(m) = fs::metadata(p) {
+        let mut perm = m.permissions();
+        if perm.readonly() != ro {
+            perm.set_readonly(ro);
+            let _ = fs::set_permissions(p, perm);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn set_readonly_attr(_p: &Path, _ro: bool) {}
+
+/// 读取某份快照是否已锁定（meta.json 不存在/损坏 → false）
+pub fn is_snapshot_pinned(snapshot_dir: &Path) -> bool {
+    read_meta(snapshot_dir).map(|m| m.pinned).unwrap_or(false)
+}
+
+/// 锁定快照：把快照目录中所有文件实化为独立副本（先写 `<name>.tmp` 再 rename 覆盖），
+/// 从而与源文件/其它快照解耦；已锁定则直接返回 Ok(0)。返回实际实化的文件数。
+///
+/// 说明：硬链接快照与源文件共享数据，源文件被"原地改写"（长度不变）时旧快照内容会跟着变；
+/// 锁定后每份文件都是独立数据块，快照从此成为防篡改归档（代价是占用空间）。
+pub fn pin_snapshot(snapshot_dir: &Path) -> Result<u64, String> {
+    if !snapshot_dir.is_dir() {
+        return Err(format!("快照目录不存在: {}", snapshot_dir.display()));
+    }
+    if is_snapshot_pinned(snapshot_dir) {
+        return Ok(0);
+    }
+    // 先把文件清单收集完再逐个实化：实化过程会在同目录生成 `*.tmp`，
+    // 边遍历边处理会把这些临时文件也当成快照内容。
+    let mut files: Vec<PathBuf> = Vec::new();
+    for entry in WalkDir::new(snapshot_dir).follow_links(false) {
+        match entry {
+            Ok(e) if e.file_type().is_file() => files.push(e.path().to_path_buf()),
+            Ok(_) => {}
+            Err(e) => return Err(format!("遍历快照目录失败: {e}")),
+        }
+    }
+    let mut done = 0u64;
+    for f in &files {
+        if let Err(e) = copy_replace(f, f) {
+            let rel = f.strip_prefix(snapshot_dir).unwrap_or(f);
+            // 失败时 pinned 仍为 false，重新调用即可续做（已实化的文件再实化一次也无害）
+            return Err(format!(
+                "锁定失败（{}）: {e}",
+                rel.to_string_lossy().replace('\\', "/")
+            ));
+        }
+        done += 1;
+    }
+    // meta.json 必须放在**文件实化之后**更新：否则刚写好的 pinned 可能又被当成普通文件实化一遍
+    let mut meta = read_meta(snapshot_dir).unwrap_or_else(|| fallback_meta(snapshot_dir));
+    meta.pinned = true;
+    write_json(&snapshot_dir.join(SNAPSHOT_META), &meta)
+        .map_err(|e| format!("快照内容已实化，但写入 meta.json 失败: {e}"))?;
+    Ok(done)
+}
+
+/// 取消锁定：仅把 meta.json 的 pinned 置 false（不回收空间；
+/// 说明：已实化的文件保持实化，直到该快照被删除或保留策略清理）。
+pub fn unpin_snapshot(snapshot_dir: &Path) -> Result<(), String> {
+    if !snapshot_dir.is_dir() {
+        return Err(format!("快照目录不存在: {}", snapshot_dir.display()));
+    }
+    let mut meta = read_meta(snapshot_dir)
+        .ok_or_else(|| "meta.json 缺失或损坏，无法取消锁定".to_string())?;
+    if !meta.pinned {
+        return Ok(());
+    }
+    meta.pinned = false;
+    write_json(&snapshot_dir.join(SNAPSHOT_META), &meta)
+        .map_err(|e| format!("写入 meta.json 失败: {e}"))
+}
+
+// ---------- 快照远端转存（本地目录 / UNC） ----------
+
+/// 把一份快照目录同步到目标根目录下：`<dest_root>\<snapshot_name>\`
+/// 逐文件按 "相对路径 + size + 100ns mtime" 判断是否需要复制（已存在且一致则跳过）。
+/// 返回本次复制的字节数。目标可为本地目录或 UNC（\\nas\share）；WebDAV 不在本函数范围内。
+///
+/// 不做超时/重试：网络盘断连等情况由调用方决定是否重跑（本函数可安全重复执行）。
+pub fn sync_snapshot_dir(snapshot_dir: &Path, dest_root: &Path) -> Result<u64, String> {
+    if !snapshot_dir.is_dir() {
+        return Err(format!("快照目录不存在: {}", snapshot_dir.display()));
+    }
+    let name = snapshot_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if name.is_empty() {
+        return Err("无法确定快照目录名".to_string());
+    }
+    let dest = dest_root.join(&name);
+    fs::create_dir_all(&dest).map_err(|e| format!("创建目标目录失败（{}）: {e}", dest.display()))?;
+
+    let mut copied = 0u64;
+    for entry in WalkDir::new(snapshot_dir).follow_links(false) {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => return Err(format!("遍历快照目录失败: {e}")),
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let src = entry.path();
+        let rel = src.strip_prefix(snapshot_dir).unwrap_or(src);
+        let rel_s = rel.to_string_lossy().replace('\\', "/");
+        let dst = dest.join(rel);
+        // 已存在且 size + 100ns mtime 一致 → 跳过（重跑时只补差量）
+        if let (Some((ssz, smt)), Some((dsz, dmt))) = (file_sig(src), file_sig(&dst)) {
+            if ssz == dsz && smt == dmt {
+                continue;
+            }
+        }
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("创建目录失败（{rel_s}）: {e}"))?;
+        }
+        if let Err(e) = copy_replace(src, &dst) {
+            return Err(format!("同步失败（{rel_s}）: {e}"));
+        }
+        copied = copied.saturating_add(fs::metadata(src).map(|m| m.len()).unwrap_or(0));
+    }
+    Ok(copied)
 }
 
 /// 存储总览：占用、份数、可回滚范围、按变化速度估算的可保留天数

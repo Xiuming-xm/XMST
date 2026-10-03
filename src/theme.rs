@@ -23,6 +23,24 @@ pub struct ThemeColors {
     pub widget_hover: Color32,
     pub widget_active: Color32,
     pub stroke: Color32,
+    /// 是否为浅色界面（显式标志）：true = 浅底深字。
+    /// 不用正文色亮度推断：自定义配色 / 材质自适应下正文色与背景的明暗可能反相
+    /// （深底浅字 / 亮材质深字），按 text 亮度推断会让滚动条、光标、选中色与底色重合。
+    pub is_light: bool,
+}
+
+/// 背景亮度阈值：> 此值视为浅色界面（正文转近黑），否则为深色界面。
+/// 只在这一处定义，保证 `auto_contrast` 与 `lerp` 的深浅结论完全一致。
+const LIGHT_LUMA_THRESHOLD: f32 = 140.0;
+
+/// Perceived luma (0-255) of a color; the same formula auto_contrast uses.
+fn luma_of(c: Color32) -> f32 {
+    0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32
+}
+
+/// 由背景色亮度决定深浅（阈值与 `auto_contrast` 相同）。
+fn is_light_bg(bg: Color32) -> bool {
+    luma_of(bg) > LIGHT_LUMA_THRESHOLD
 }
 
 impl ThemeColors {
@@ -37,6 +55,7 @@ impl ThemeColors {
             widget_hover: Color32::from_rgb(74, 74, 80),
             widget_active: Color32::from_rgb(52, 52, 58),
             stroke: Color32::from_rgb(84, 84, 92),
+            is_light: false,
         }
     }
 
@@ -55,6 +74,7 @@ impl ThemeColors {
             widget_hover: Color32::from_rgb(228, 231, 237),
             widget_active: Color32::from_rgb(217, 221, 228),
             stroke: Color32::from_rgb(217, 222, 230),
+            is_light: true,
         }
     }
 
@@ -64,8 +84,9 @@ impl ThemeColors {
             let c = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
             Color32::from_rgb(c(a.r(), b.r()), c(a.g(), b.g()), c(a.b(), b.b()))
         };
+        let bg = l(self.bg, other.bg);
         Self {
-            bg: l(self.bg, other.bg),
+            bg,
             panel: l(self.panel, other.panel),
             text: l(self.text, other.text),
             weak: l(self.weak, other.weak),
@@ -74,6 +95,8 @@ impl ThemeColors {
             widget_hover: l(self.widget_hover, other.widget_hover),
             widget_active: l(self.widget_active, other.widget_active),
             stroke: l(self.stroke, other.stroke),
+            // 过渡帧同样按插值后的背景亮度定深浅，与稳态判定规则一致
+            is_light: is_light_bg(bg),
         }
     }
 
@@ -169,15 +192,17 @@ fn shade(bg: Color32, delta: i32) -> Color32 {
 /// The caller passes the composited material color; here we decide the foreground
 /// colors and make control bases clearly darker/brighter than the material.
 pub fn auto_contrast(c: &mut ThemeColors, bg: Color32) {
-    let luma = 0.299 * bg.r() as f32 + 0.587 * bg.g() as f32 + 0.114 * bg.b() as f32;
+    let luma = luma_of(bg);
+    // 显式深浅标志：以「实际可见背景」的亮度为准（材质模式下传入的是合成后的材质色），
+    // 与下面 text 的分支严格对应，因此不会改变既有观感。
+    let light = luma > LIGHT_LUMA_THRESHOLD;
+    c.is_light = light;
     // Accent must follow too: custom accents are "bright colors designed for dark
     // backgrounds" (teal/green); on bright materials they have almost no contrast
     // (user feedback: "light mode unreadable" partly comes from this). Push the
     // accent the opposite way by material luminance so it stays visible.
-    let accent_luma = 0.299 * c.accent.r() as f32
-        + 0.587 * c.accent.g() as f32
-        + 0.114 * c.accent.b() as f32;
-    if luma > 140.0 {
+    let accent_luma = luma_of(c.accent);
+    if light {
         // Bright background -> dark foreground; controls darker than the bg. Body
         // text near-black, secondary text also high-contrast ("blurred texture +
         // small text" is harder to read than a plain background, so go more extreme).
@@ -290,24 +315,24 @@ pub fn apply(
         };
         v.faint_bg_color = c.widget_hover;
         v.override_text_color = Some(c.text);
-        // dark_mode tracks palette luminance: light theme sets false so egui's
-        // built-in controls (scroll bars, selection) render in light mode and the
-        // thumb does not melt into the light background.
-        v.dark_mode = c.text.r() > 128;
+        // 深浅由调色板的显式 `is_light` 决定（不再按正文色亮度推断：自定义配色 /
+        // 材质自适应下正文色与背景可能反相，会让滚动条、选中色与底色重合）。
+        // 浅色主题下 dark_mode=false，egui 内建控件（滚动条、选中态）才走浅色渲染。
+        v.dark_mode = !c.is_light;
         v.window_stroke.color = c.stroke;
         // Light mode uniformly darkens accent-derived text / selection / cursor to
         // avoid unreadable light accents on light backgrounds (same contrast issue).
-        let accent_fg = if c.text.r() > 128 {
-            c.accent
-        } else {
+        let accent_fg = if c.is_light {
             light_adapt(c.accent)
+        } else {
+            c.accent
         };
         // 选中态底色：**强调色的低透明叠加**，而不是直接用强调色本体。
         // 之前 `selection.bg_fill = accent_fg`，而浅色模式下 accent_fg 是"压暗后的强调色"
         // （近黑墨绿）→ 选中的页签/列表项变成一块**深底**，配近黑正文 = 完全看不清
         // （用户截图里的"模组 / 通用 / mods / Fabric1.21.11"这些黑块就是它）。
         // 现在浅色=淡彩底+深字，深色=暗彩底+浅字，两种主题都可读。
-        let sel_alpha = if c.text.r() > 128 { 46 } else { 56 };
+        let sel_alpha = if c.is_light { 56 } else { 46 };
         v.selection.bg_fill = Color32::from_rgba_unmultiplied(
             accent_fg.r(),
             accent_fg.g(),
@@ -323,10 +348,10 @@ pub fn apply(
         // use widgets.noninteractive.weak_bg_fill. In light mode the default 248
         // (near-white) makes weak text (group headers / captions) almost invisible
         // on light backgrounds; pressing to mid-gray reaches AA.
-        v.widgets.noninteractive.weak_bg_fill = if c.text.r() > 128 {
-            c.widget_bg
-        } else {
+        v.widgets.noninteractive.weak_bg_fill = if c.is_light {
             Color32::from_gray(120)
+        } else {
+            c.widget_bg
         };
         v.widgets.noninteractive.fg_stroke.color = c.weak;
         v.widgets.noninteractive.bg_stroke.color = c.stroke;

@@ -297,6 +297,128 @@ pub fn latest_file(
     Err(format!("未找到适配 {mc_version} + {loader} 的版本"))
 }
 
+/// 按项目 slug（通常等于 mod 的 id，如 "fabric-api"）查询项目基本信息。
+/// 返回 (project_id, title, slug, source_url)；404 等错误返回 Err(含状态码与 URL)。
+pub fn project_by_slug(slug: &str) -> Result<(String, String, String, String), String> {
+    let slug = slug.trim();
+    if slug.is_empty() {
+        return Err("项目 slug 为空".to_string());
+    }
+    let client = new_client();
+    let url = format!("https://api.modrinth.com/v2/project/{}", urlencode(slug));
+    let v = fetch_json(&client, &url).map_err(|e| format!("{e}（{url}）"))?;
+    let project_id = v["id"].as_str().unwrap_or_default().to_string();
+    if project_id.is_empty() {
+        return Err(format!("项目响应缺少 id 字段（{url}）"));
+    }
+    let title = v["title"].as_str().unwrap_or_default().to_string();
+    let got_slug = v["slug"].as_str().unwrap_or_default().to_string();
+    let source_url = v["source_url"].as_str().unwrap_or_default().to_string();
+    // slug 字段缺失时用查询用的 slug 兜底，调用方拿到的始终是非空值
+    let got_slug = if got_slug.is_empty() {
+        slug.to_string()
+    } else {
+        got_slug
+    };
+    Ok((project_id, title, got_slug, source_url))
+}
+
+/// 按 slug 查询**最新可用版本**，可按 MC 版本与加载器过滤（None = 不过滤）。
+/// include_beta=false 时优先 version_type == "release"，没有 release 才退回 beta/alpha。
+/// 返回 (version_number, date_published, version_id, project_id)。
+pub fn latest_version_for_slug(
+    slug: &str,
+    mc_version: Option<&str>,
+    loader: Option<&str>,
+    include_beta: bool,
+) -> Result<(String, String, String, String), String> {
+    let slug = slug.trim();
+    if slug.is_empty() {
+        return Err("项目 slug 为空".to_string());
+    }
+    let mc = mc_version.map(str::trim).filter(|s| !s.is_empty());
+    let ld = loader.map(str::trim).filter(|s| !s.is_empty());
+    // 服务端过滤：loaders/game_versions 为 JSON 数组，必须整体 URL 编码
+    let mut query: Vec<String> = Vec::new();
+    if let Some(l) = ld {
+        query.push(format!("loaders={}", urlencode(&format!("[\"{l}\"]"))));
+    }
+    if let Some(m) = mc {
+        query.push(format!("game_versions={}", urlencode(&format!("[\"{m}\"]"))));
+    }
+    let base = format!(
+        "https://api.modrinth.com/v2/project/{}/version",
+        urlencode(slug)
+    );
+    let url = if query.is_empty() {
+        base
+    } else {
+        format!("{base}?{}", query.join("&"))
+    };
+    let client = new_client();
+    let v = fetch_json(&client, &url).map_err(|e| format!("{e}（{url}）"))?;
+    let arr = v
+        .as_array()
+        .ok_or_else(|| format!("version 响应异常（{url}）"))?;
+    // 返回按发布时间倒序：第一个匹配项即最新。未开启测试版时先记下第一个非 release 作为兜底
+    let mut chosen: Option<&Value> = None;
+    let mut fallback: Option<&Value> = None;
+    for ver in arr {
+        if !version_matches(ver, mc, ld) {
+            continue;
+        }
+        let channel = ver["version_type"].as_str().unwrap_or_default();
+        if channel == "release" || include_beta {
+            chosen = Some(ver);
+            break;
+        }
+        if fallback.is_none() {
+            fallback = Some(ver);
+        }
+    }
+    let ver = chosen.or(fallback).ok_or_else(|| {
+        format!(
+            "未找到适配的版本（slug={slug}，MC={}，加载器={}）",
+            mc.unwrap_or("不限"),
+            ld.unwrap_or("不限")
+        )
+    })?;
+    let version_number = ver["version_number"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let version_id = ver["id"].as_str().unwrap_or_default().to_string();
+    if version_number.is_empty() || version_id.is_empty() {
+        return Err(format!("版本响应缺少 id/version_number（{url}）"));
+    }
+    let date_published = ver["date_published"].as_str().unwrap_or_default().to_string();
+    let mut project_id = ver["project_id"].as_str().unwrap_or_default().to_string();
+    if project_id.is_empty() {
+        // 缺 project_id 时降级再查一次项目，保证调用方能拿到后续下载所需的 ID
+        project_id = project_by_slug(slug)?.0;
+    }
+    Ok((version_number, date_published, version_id, project_id))
+}
+
+/// 版本是否匹配 MC 版本 / 加载器过滤（None = 不过滤；字段缺失视为不匹配）
+fn version_matches(ver: &Value, mc_version: Option<&str>, loader: Option<&str>) -> bool {
+    let gv_ok = match mc_version {
+        Some(m) => ver["game_versions"]
+            .as_array()
+            .map(|a| a.iter().any(|x| x.as_str() == Some(m)))
+            .unwrap_or(false),
+        None => true,
+    };
+    let ld_ok = match loader {
+        Some(l) => ver["loaders"]
+            .as_array()
+            .map(|a| a.iter().any(|x| x.as_str() == Some(l)))
+            .unwrap_or(false),
+        None => true,
+    };
+    gv_ok && ld_ok
+}
+
 /// 简单 URL 编码（仅转义查询串必要字符）
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());

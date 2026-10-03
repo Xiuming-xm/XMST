@@ -1,0 +1,35 @@
+name: Release
+
+# 推送 v* 标签即自动创建 GitHub Release，并把 versions/<版本>/ 下的产物作为附件上传。
+# 说明：宿主网络无法访问 GitHub 网页时，这是"零网页、零 Token"的发版通道
+# （Actions 自带 GITHUB_TOKEN 与写权限）。
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 创建/更新 Release 并上传产物
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          tag="${GITHUB_REF_NAME}"
+          ver="${tag#v}"
+          echo "标签=$tag 版本=$ver"
+          if [ -d "versions/$ver" ]; then
+            ls -l "versions/$ver"
+            gh release create "$tag" "versions/$ver"/*.exe "versions/$ver"/SHA256.txt \
+              --title "XMST $ver" --notes "见 CHANGELOG.md。产物校验值见附件 SHA256.txt。" --prerelease \
+              || gh release upload "$tag" "versions/$ver"/*.exe "versions/$ver"/SHA256.txt --clobber
+          else
+            gh release create "$tag" --title "XMST $ver" --notes "该标签没有对应产物目录 versions/$ver/。" --prerelease \
+              || true
+          fi

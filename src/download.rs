@@ -55,6 +55,36 @@ const PART_MIN_SIZE: u64 = 8 * 1024 * 1024;
 /// 单流下载读取缓冲
 const BUF_SIZE: usize = 64 * 1024;
 
+/// 文件名是否可安全落盘：非空、不是 `.` / `..`、不含路径分隔符 / 盘符(`:`) / 控制字符。
+fn is_safe_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains(':')
+        && !name.chars().any(|ch| ch.is_control())
+}
+
+/// 取远端文件名的**最后一段**并去掉危险成分：拒绝空/`.`/`..`/包含路径分隔符/盘符/控制字符；
+/// 非法时回退到调用方给的默认名（如 "download.bin"）。
+///
+/// 远端返回的文件名（Content-Disposition / 版本 JSON）完全由对方控制，
+/// 直接 `join` 到本地目录时 `..\..\x` 之类的名字会把文件写到目标目录之外（zip-slip）。
+pub fn sanitize_remote_filename(raw: &str, fallback: &str) -> String {
+    // 只取最后一段：同时兼容 `/` 与 `\`（远端可能返回 Windows 风格路径）
+    let last = raw.rsplit(['/', '\\']).next().unwrap_or("");
+    let name = last.trim();
+    if is_safe_file_name(name) {
+        return name.to_string();
+    }
+    let fb = fallback.trim();
+    if is_safe_file_name(fb) {
+        return fb.to_string();
+    }
+    "download.bin".to_string()
+}
+
 /// 创建统一的阻塞 HTTP 客户端（rustls-tls）
 pub fn new_client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
@@ -92,11 +122,15 @@ pub fn download_file_parallel(
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("创建目录失败: {e}"))?;
     }
-    let file_name = dest
+    // 远端文件名消毒（防 zip-slip）：只保留最后一段安全名字并据此重建落盘路径。
+    // 名字里已不含分隔符/盘符，因此 safe_dest 必定仍在 dest 的父目录内。
+    let raw_name = dest
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "download.bin".to_string());
-    let part_dir = dest.parent().unwrap_or(Path::new("."));
+        .unwrap_or_default();
+    let file_name = sanitize_remote_filename(&raw_name, "download.bin");
+    let part_dir = dest.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let safe_dest = part_dir.join(&file_name);
     let max_parts = if max_parts == 0 { DEFAULT_MAX_PARTS } else { max_parts };
 
     // ---- 探测 Range 支持与总大小 ----
@@ -119,7 +153,7 @@ pub fn download_file_parallel(
 
     // 空文件（416 / 0 长度）直接落空文件
     if total == Some(0) {
-        File::create(dest).map_err(|e| format!("创建文件失败: {e}"))?;
+        File::create(&safe_dest).map_err(|e| format!("创建文件失败: {e}"))?;
         on_progress(0, Some(0), "done");
         return Ok(());
     }
@@ -184,7 +218,7 @@ pub fn download_file_parallel(
                 // 合并分片
                 on_progress(total, Some(total), "merging");
                 {
-                    let mut out = File::create(dest).map_err(|e| format!("创建文件失败: {e}"))?;
+                    let mut out = File::create(&safe_dest).map_err(|e| format!("创建文件失败: {e}"))?;
                     for p in &part_paths {
                         let mut f = File::open(p).map_err(|e| format!("打开分片失败: {e}"))?;
                         let mut buf = vec![0u8; BUF_SIZE];
@@ -217,7 +251,7 @@ pub fn download_file_parallel(
     }
     let total = resp.content_length();
     on_progress(0, total, "downloading");
-    let mut out = File::create(dest).map_err(|e| format!("创建文件失败: {e}"))?;
+    let mut out = File::create(&safe_dest).map_err(|e| format!("创建文件失败: {e}"))?;
     let mut downloaded: u64 = 0;
     let mut last = Instant::now() - PROGRESS_THROTTLE;
     let mut buf = vec![0u8; BUF_SIZE];

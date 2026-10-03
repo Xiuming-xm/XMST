@@ -196,6 +196,9 @@ pub fn stop_gracefully(proc: &ManagedProcess, timeout_secs: u64) -> bool {
 
 /// 强制杀死整个进程树（cmd -> java 等子进程一并终止）
 /// 仅杀主进程会导致外壳(cmd)退出而子进程(java)继续存活
+///
+/// 返回值必须真实：taskkill 报告成功、或子进程句柄确认已退出才算成功，
+/// 否则返回 false（调用方会据此显示"结束失败"而不是假的"已强制结束"）。
 pub fn kill_tree(proc: &ManagedProcess) -> bool {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -205,18 +208,51 @@ pub fn kill_tree(proc: &ManagedProcess) -> bool {
     };
     // taskkill /PID <pid> /T /F：终止进程树，避免残留 java 进程
     // 必须隐藏窗口：taskkill 是控制台程序，直接 spawn 会闪现 cmd 窗口
-    let _ = Command::new("taskkill")
+    // 退出码 0 = 已终止目标（含整树）；128 = 进程已不存在；其余 = 失败（如权限不足）。
+    let taskkill_ok = Command::new("taskkill")
         .creation_flags(CREATE_NO_WINDOW)
         .stdin(Stdio::null())
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
-    // reap 主进程（可能已被 taskkill 结束）
-    let mut child = proc.child.lock().unwrap_or_else(|e| e.into_inner());
-    let _ = child.kill();
-    let _ = child.wait();
-    true
+        .status()
+        .map(|st| st.success())
+        .unwrap_or(false);
+
+    // 兜底直杀主进程（taskkill 定位不到或权限不足时它仍可能有效）。
+    // 临界区只做非阻塞操作：child 锁还要被 is_running / exit_code / try_wait 使用，
+    // 不能在这里长时间持有。
+    {
+        let mut child = proc.child.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = child.kill();
+    }
+
+    // 有上限地等待子进程真正退出（try_wait 轮询，最长 5 秒）。
+    // 不用 child.wait()：它没有超时，遇到卡死的进程会把调用方（UI 线程）永久挂住。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut exited = false;
+    loop {
+        {
+            let mut child = proc.child.lock().unwrap_or_else(|e| e.into_inner());
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    exited = true;
+                    break;
+                }
+                Ok(None) => {}
+                // 查询失败：不再死等，交给下面的返回值判定
+                Err(_) => break,
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // 只有真的成功才报成功：taskkill 报告成功，或子进程句柄确认已退出。
+    // 两者都不成立（如权限不足且进程卡住）时返回 false，句柄保留在 child 里不丢弃。
+    taskkill_ok || exited
 }
 
 /// 强制杀死（含整个进程树）
@@ -315,6 +351,10 @@ pub struct LogFileTail {
     offset: u64,
     /// 上一帧未闭合的行尾（文件中最后一段尚无 `\n` 的内容，下一帧拼上）
     pending: String,
+    /// 上帧尾部未构成完整 UTF-8 序列的残留字节（正常最多 3 字节），下帧与新字节拼接再解码
+    byte_tail: Vec<u8>,
+    /// 残留字节连续未能解码成功的帧数（用于"长期压着不输出"的保护阀）
+    undecoded_frames: u32,
     /// 连续打开失败次数
     fail_count: u32,
     /// 是否曾成功读到过数据（判定文件通道已生效）
@@ -328,6 +368,8 @@ impl LogFileTail {
             path: server_dir.join("logs").join("latest.log"),
             offset: 0,
             pending: String::new(),
+            byte_tail: Vec::new(),
+            undecoded_frames: 0,
             fail_count: 0,
             seen_data: false,
         })
@@ -342,6 +384,8 @@ impl LogFileTail {
     pub fn reset(&mut self) {
         self.offset = 0;
         self.pending.clear();
+        self.byte_tail.clear();
+        self.undecoded_frames = 0;
         self.fail_count = 0;
         self.seen_data = false;
     }
@@ -350,6 +394,8 @@ impl LogFileTail {
     /// 避免把上一次启动-关闭的旧日志重新拉进缓冲区（修复"重启不清空/假清空"）。
     pub fn seek_end(&mut self) {
         self.pending.clear();
+        self.byte_tail.clear();
+        self.undecoded_frames = 0;
         if let Ok(md) = std::fs::metadata(&self.path) {
             self.offset = md.len();
         } else {
@@ -385,8 +431,10 @@ impl LogFileTail {
             Err(_) => return Some(0),
         };
         if len < self.offset {
-            // 文件被轮转/重建：偏移归零，从头读新文件
+            // 文件被轮转/重建：偏移归零，从头读新文件；旧文件残留的不完整字节一并丢弃
             self.offset = 0;
+            self.byte_tail.clear();
+            self.undecoded_frames = 0;
         }
         if len == self.offset {
             return Some(0);
@@ -403,6 +451,8 @@ impl LogFileTail {
         if Read::read_to_end(&mut limited, &mut chunk).is_err() {
             return Some(0);
         }
+        // 偏移只按"真正从文件读走的字节数"推进：解码不完整的尾部字节留在 byte_tail，
+        // 不会因为 1MB 上限或写入时机正好切在多字节字符（中文）中间而永久损坏。
         self.offset += chunk.len() as u64;
 
         // pending 过长保护（如 `\r` 进度条长期不换行）：强制切行
@@ -412,9 +462,62 @@ impl LogFileTail {
             self.pending.clear();
         }
 
-        let mut text = self.pending.clone();
-        text.push_str(&String::from_utf8_lossy(&chunk));
-        self.pending.clear();
+        // 边界安全解码：上帧残留字节与本帧新字节拼接后一起解码，
+        // 未构成完整序列的尾部（最多 3 字节）留到下次读取再拼。
+        self.byte_tail.extend_from_slice(&chunk);
+        let mut text = std::mem::take(&mut self.pending);
+        let mut pos = 0usize;
+        loop {
+            let rest = match self.byte_tail.get(pos..) {
+                Some(r) if !r.is_empty() => r,
+                _ => break,
+            };
+            match std::str::from_utf8(rest) {
+                Ok(s) => {
+                    text.push_str(s);
+                    pos += s.len();
+                }
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    // valid_up_to 之前的字节由 from_utf8 保证是合法 UTF-8
+                    if let Some(s) = self
+                        .byte_tail
+                        .get(pos..pos + valid)
+                        .and_then(|b| std::str::from_utf8(b).ok())
+                    {
+                        text.push_str(s);
+                    }
+                    pos += valid;
+                    match e.error_len() {
+                        // 真正的非法字节（服务端输出了非 UTF-8 内容）：沿用旧行为替换成 � 后消费
+                        Some(n) => {
+                            text.push('\u{FFFD}');
+                            pos += n;
+                        }
+                        // 文件末尾停在多字节字符中间：留着下次和新字节一起解码
+                        None => break,
+                    }
+                }
+            }
+        }
+        // 只保留真正未消费的残留字节（正常最多 3 字节）
+        if pos >= self.byte_tail.len() {
+            self.byte_tail.clear();
+        } else if pos > 0 {
+            let rest = self.byte_tail.split_off(pos);
+            self.byte_tail = rest;
+        }
+        // 保护阀：残留异常膨胀或连续多帧都拼不出完整字符时，强行 lossy 消费并清理，
+        // 避免这段字节一直压着不再往后输出。
+        if self.byte_tail.is_empty() {
+            self.undecoded_frames = 0;
+        } else if self.byte_tail.len() > 8192 || self.undecoded_frames >= 120 {
+            text.push_str(&String::from_utf8_lossy(&self.byte_tail));
+            self.byte_tail.clear();
+            self.undecoded_frames = 0;
+        } else {
+            self.undecoded_frames = self.undecoded_frames.saturating_add(1);
+        }
 
         let mut added = 0usize;
         // 按 `\n` 切行；最后一段无换行则保留到 pending，下一帧拼上

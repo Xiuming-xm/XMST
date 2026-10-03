@@ -1498,6 +1498,10 @@ struct App {
     /// 排除表编辑缓冲（TextEdit 需要跨帧持久文本；切换服务器时重置）
     backup_exclude_text: String,
     backup_exclude_for: Option<usize>,
+    /// run.bat 重启次数的探测结果：(服务器目录, 脚本名与 MAX_RESTARTS)。
+    /// 目录不匹配表示还没在「自动功能」页检查过该服务器（进入页面才读一次脚本，避免每帧读盘）；
+    /// 内层 None 表示该目录没有 run.bat / 没有 MAX_RESTARTS。
+    crash_bat_probe: Option<(PathBuf, Option<(String, i32)>)>,
     /// 优雅停止后台线程回传�?(服务器下�? 是否优雅完成)
     stop_tx: std::sync::mpsc::Sender<(usize, bool)>,
     stop_rx: std::sync::mpsc::Receiver<(usize, bool)>,
@@ -1900,6 +1904,7 @@ impl App {
             backup_stats_cache: None,
             backup_exclude_text: String::new(),
             backup_exclude_for: None,
+            crash_bat_probe: None,
             stop_tx,
             stop_rx,
             stop_inflight: HashSet::new(),
@@ -4445,9 +4450,11 @@ impl App {
     /// 打开文件所在目录并选中该文件（explorer 的 /select, 无 ShellExecute 等价物；
     /// 传空标准句柄避免 0xc0000142，失败则退化为"打开父目录"）。
     fn open_file_location(&self, path: &std::path::Path) {
-        let ok = spawn_reveal(path);
+        // 相对路径会被 explorer 按它自己的工作目录解析（找不到就打开"文档"），先补成绝对路径
+        let p = abs_path(path);
+        let ok = spawn_reveal(&p);
         if !ok {
-            let parent = path.parent().unwrap_or(path);
+            let parent = p.parent().unwrap_or(p.as_path());
             shell_open(parent);
         }
     }
@@ -4465,7 +4472,8 @@ impl App {
         //   ④ ShellExecuteW("explore")
         // 每次点击都会把每一级的真实结果写入 <exe目录>\data\open_diag.log，
         // 便于定位"点了没反应/弹权限错误"到底卡在哪一级（本机 UAC 关闭，shell 交接行为特殊）。
-        let p = path.to_path_buf();
+        // 相对路径先补成绝对路径：explorer.exe 会按自己的工作目录解析，找不到就打开"文档"。
+        let p = abs_path(path);
         std::thread::spawn(move || {
             let mut log = format!(
                 "=== 打开目录 === 时间={}\n目标={}\nexists={} is_dir={}\n进程当前目录={:?}（存在:{}）\nsane_cwd={:?}\n",
@@ -5736,7 +5744,9 @@ fn single_instance_check() -> bool {
     }
 }
 
-/// 读取服务器目录里 .bat 的 `set "MAX_RESTARTS=n"`（用于发现 bat 自带的重启循环）。
+/// 读取服务器目录里 .bat 的 `set "MAX_RESTARTS=n"`（用于把工具的重启次数对齐到脚本）。
+/// 脚本里出现的其它含 MAX_RESTARTS 的行（如 `if %RESTARTS% GEQ %MAX_RESTARTS%`）不是赋值，
+/// 跳过继续找；值写成小数（如 5.5）时向上取整，且最小为 1。
 fn read_bat_max_restarts(dir: &Path) -> Option<(String, i32)> {
     let rd = std::fs::read_dir(dir).ok()?;
     for e in rd.flatten() {
@@ -5746,13 +5756,15 @@ fn read_bat_max_restarts(dir: &Path) -> Option<(String, i32)> {
             for line in s.lines() {
                 let l = line.trim();
                 if l.to_ascii_uppercase().contains("MAX_RESTARTS") {
-                    // set "MAX_RESTARTS=5" / set MAX_RESTARTS=5
+                    // set "MAX_RESTARTS=5" / set MAX_RESTARTS=5 / set /a MAX_RESTARTS=5.5
                     if let Some(v) = l.split('=').nth(1) {
-                        let n = v.trim().trim_matches('"').trim().parse::<i32>().ok()?;
-                        return Some((
-                            p.file_name().unwrap_or_default().to_string_lossy().to_string(),
-                            n,
-                        ));
+                        let t = v.trim().trim_matches('"').trim();
+                        if let Ok(n) = t.parse::<f64>() {
+                            return Some((
+                                p.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                                (n.ceil() as i32).max(1),
+                            ));
+                        }
                     }
                 }
             }
@@ -6376,6 +6388,20 @@ fn shell_open(path: &Path) {
 /// 统一走 spawn_reveal（cmd start 优先，显式 current_dir + 空标准句柄）。
 fn reveal_in_explorer(p: &Path) {
     let _ = spawn_reveal(p);
+}
+
+/// 把路径补成绝对路径。资源管理器（explorer.exe / cmd start）拿到**相对**路径时
+/// 会按它自己的工作目录去解析，找不到就退化成打开"文档"目录 —— 这正是
+/// 「打开目录」跳到文档的成因。这里只做"当前目录 + 相对路径"拼接，不做 canonicalize：
+/// 目标可能尚不存在，且 canonicalize 会引入 `\\?\` 前缀，反而让部分 shell 交互失效。
+fn abs_path(p: &Path) -> PathBuf {
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    match std::env::current_dir() {
+        Ok(c) => c.join(p),
+        Err(_) => p.to_path_buf(),
+    }
 }
 
 /// 目录体积（人类可读，如 "1.2 GB"）；不存在返回 "—"。
@@ -8797,6 +8823,10 @@ impl App {
             // 进入特殊功能页：清除 Spark 检测/文件列表缓存（进入即重新扫描）
             if v == ServerTab::Special {
                 self.clear_special_marks();
+            }
+            // 进入自动功能页：重新读一次 run.bat，把窗口内最大重启次数对齐到脚本
+            if v == ServerTab::Backup {
+                self.crash_bat_probe = None;
             }
             self.server_tab = v;
         }
@@ -11933,7 +11963,29 @@ impl App {
             .default_open(false)
             .show(ui, |ui| {
             ui.label("进程异常退出（崩溃/强杀/断电，非手动停止）时自动重新拉起。熔断窗口内连续崩溃达到上限后停止，防止故障循环刷日志");
-            let mut cr = sc.crash_restart.clone();
+            // run.bat 自带的 MAX_RESTARTS 重启循环与工具自重启会**叠加**（表现为"一直重启很多次"）。
+            // 处理方式是**静默同步**：以脚本为准，进入本页（或切换服务器）时读一次脚本，
+            // 把工具的上限对齐成脚本的值，两者一致就不会双重启；只在数值确实不一致时落盘。
+            let need_probe = !matches!(self.crash_bat_probe.as_ref(), Some((d, _)) if *d == sc.dir);
+            if need_probe {
+                let probe = read_bat_max_restarts(&sc.dir);
+                if let Some((_, bat_max)) = &probe {
+                    // 控件取值范围是 1..=50（DragValue 每帧都会把越界值钳回范围），这里先钳好再写回
+                    let want = (*bat_max).clamp(1, 50);
+                    if self.cfg.servers[idx].crash_restart.max_restarts as i32 != want {
+                        self.cfg.servers[idx].crash_restart.max_restarts = want as u32;
+                        self.save_config();
+                    }
+                }
+                self.crash_bat_probe = Some((sc.dir.clone(), probe));
+            }
+            let bat_probe = self
+                .crash_bat_probe
+                .as_ref()
+                .filter(|(d, _)| *d == sc.dir)
+                .and_then(|(_, v)| v.clone());
+            // 同步之后再取控件副本，本帧的 DragValue 就显示同步后的值
+            let mut cr = self.cfg.servers[idx].crash_restart.clone();
             let mut cr_changed = false;
             if ui.checkbox(&mut cr.enabled, "启用崩溃自动重启").changed() {
                 cr_changed = true;
@@ -11951,7 +12003,7 @@ impl App {
                     ui.label("熔断窗口(分钟):");
                     ui.add(egui::DragValue::new(&mut cr.circuit_minutes).range(1..=240));
                 });
-                if cr != sc.crash_restart {
+                if cr != self.cfg.servers[idx].crash_restart {
                     cr_changed = true;
                 }
             }
@@ -11960,46 +12012,43 @@ impl App {
                 self.save_config();
                 self.set_toast("崩溃重启设置已保存".to_string());
             }
-            // run.bat 自带的 MAX_RESTARTS 重启循环与工具自重启会**叠加**（反馈"一直重启很多次"）。
-            // 这里读出来、明确告警，并提供一键同步按钮把 bat 里的上限改成工具的上限。
-            if let Some((bat, cur_max)) = read_bat_max_restarts(&sc.dir) {
+            if let Some((bat, bat_max)) = bat_probe {
                 let tool_max = self.cfg.servers[idx].crash_restart.max_restarts as i32;
-                egui::Frame::none()
-                    .fill(self.theme_cur.widget_bg)
-                    .stroke(egui::Stroke::new(1.0, self.theme_cur.stroke))
-                    .rounding(6.0)
-                    .inner_margin(egui::Margin::symmetric(10.0, 8.0))
-                    .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if tool_max == bat_max {
                         ui.label(
-                            RichText::new(format!("⚠ 检测到 {bat} 自带重启循环：MAX_RESTARTS={cur_max}"))
-                                .color(Color32::from_rgb(240, 176, 96)),
-                        );
-                        ui.label(
-                            RichText::new(
-                                "它与「崩溃自动重启」叠加时会导致反复重启：建议只保留一处。\
-                                 可以把 bat 的上限同步为工具的上限（或把 bat 改成 1 等于只用工具重启）。",
-                            )
+                            RichText::new(format!(
+                                "已按 {bat} 同步：窗口内最大重启次数 = {tool_max}（与脚本一致，不会双重启）"
+                            ))
                             .weak()
                             .small(),
                         );
-                        ui.horizontal(|ui| {
-                            if ui
-                                .button(format!("把 MAX_RESTARTS 同步为 {tool_max}"))
-                                .clicked()
-                            {
-                                match write_bat_max_restarts(&sc.dir, tool_max) {
-                                    Ok(f) => self.set_toast(format!("已更新 {f} 的 MAX_RESTARTS={tool_max}")),
-                                    Err(e) => self.set_toast(format!("写入失败：{e}")),
-                                }
+                    } else {
+                        ui.label(
+                            RichText::new(format!(
+                                "{bat} 的 MAX_RESTARTS={bat_max}，与工具当前值 {tool_max} 不一致"
+                            ))
+                            .weak()
+                            .small(),
+                        );
+                    }
+                    if ui.small_button("从 run.bat 重新同步").clicked() {
+                        // 清掉探测结果，下一帧重新读脚本并同步
+                        self.crash_bat_probe = None;
+                        self.set_toast("已按 run.bat 重新同步重启次数".to_string());
+                    }
+                    if tool_max != bat_max
+                        && ui.small_button(format!("把 {bat} 改为 {tool_max}")).clicked()
+                    {
+                        match write_bat_max_restarts(&sc.dir, tool_max) {
+                            Ok(f) => {
+                                self.crash_bat_probe = None;
+                                self.set_toast(format!("已把 {f} 的 MAX_RESTARTS 改为 {tool_max}"));
                             }
-                            if ui.button("设为 1（等于只用工具重启）").clicked() {
-                                match write_bat_max_restarts(&sc.dir, 1) {
-                                    Ok(f) => self.set_toast(format!("已更新 {f} 的 MAX_RESTARTS=1")),
-                                    Err(e) => self.set_toast(format!("写入失败：{e}")),
-                                }
-                            }
-                        });
-                    });
+                            Err(e) => self.set_toast(format!("写入失败：{e}")),
+                        }
+                    }
+                });
             }
             // 崩溃重启状态展�?
             let rt = self.runtimes.get(idx);
@@ -12054,7 +12103,8 @@ impl App {
             let restore_scope = self.restore_scope_folders(idx);
             let mut restore_target: Option<(PathBuf, String)> = None;
             let mut delete_target: Option<(PathBuf, String)> = None;
-            let mut open_target: Option<PathBuf> = None;
+            // (目标路径, 是否为新版快照目录)：快照是目录用「打开目录」，旧版 zip 用「定位文件」
+            let mut open_target: Option<(PathBuf, bool)> = None;
             // 按日/月分组折叠显示（mtime 格式 %Y-%m-%d %H:%M:%S，取前 10/7 位）
             let view_mode = self.cfg.servers[idx].backup.view_mode.clone();
             let group_key = |b: &backup::BackupInfo| -> String {
@@ -12108,8 +12158,11 @@ impl App {
                                 if ui.button("删除").clicked() {
                                     delete_target = Some((b.path.clone(), b.name.clone()));
                                 }
-                                if ui.button("打开目录").clicked() {
-                                    open_target = Some(b.path.clone());
+                                if ui
+                                    .button(if b.is_snapshot { "打开目录" } else { "打开所在目录" })
+                                    .clicked()
+                                {
+                                    open_target = Some((b.path.clone(), b.is_snapshot));
                                 }
                             });
                         }
@@ -12123,8 +12176,21 @@ impl App {
             if let Some((path, name)) = delete_target {
                 self.confirm_delete_backup = Some((idx, path, name));
             }
-            if let Some(path) = open_target {
-                reveal_in_explorer(&path);
+            if let Some((path, is_snapshot)) = open_target {
+                // 交给资源管理器之前必须补成绝对路径：相对路径会让 explorer 退化成打开"文档"目录。
+                let abs = abs_path(&path);
+                if is_snapshot {
+                    if !abs.is_dir() {
+                        self.set_toast(format!("快照目录不存在：{}", abs.display()));
+                    } else {
+                        self.open_folder(&abs);
+                    }
+                } else if !abs.is_file() {
+                    self.set_toast(format!("备份文件不存在：{}", abs.display()));
+                } else {
+                    // 旧版 zip 是文件：打开所在目录并选中它
+                    self.open_file_location(&abs);
+                }
             }
         }
         }

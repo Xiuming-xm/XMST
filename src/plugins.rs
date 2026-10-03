@@ -108,20 +108,65 @@ fn reg_dword_hkcu(path: &str, name: &str) -> Option<u32> {
 /// 插件名来自 zip 内的 manifest，属于不可信输入：直接 `join(name)` 会让
 /// `:` `*` `?` 等 Windows 非法字符或超长名导致 `create_dir_all` 静默失败
 /// （只留在插件日志里），也会让 `xmst_resource_dir()` 返回宿主拿不到的路径。
+///
+/// 这里除了「安全」，还必须保证「唯一」：可读部分只把非 ASCII / 非法字符
+/// 替换成 `_`，于是「我的插件」和「测试插件」都会退化成 `____`。两个插件
+/// 一旦共用同一个缓存目录，`load_zip` 解压前的那次清空就会把另一个插件
+/// 已解压的资源整个删掉（`xmst_resource_dir()` 也会指向同一份文件）。
+/// 所以在可读部分之后**强制追加原名的 FNV-1a 64 位哈希**（16 位十六进制）：
+/// 不同插件名必然落到不同目录，也能区分只在 ASCII 大小写上不同的两个名字
+/// （Windows 文件名不区分大小写）。哈希算的是原名的 UTF-8 字节，不参与截断，
+/// 因此可读部分被截断也不会撞目录。
 pub fn cache_key(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
+    // 1) 可读部分：只保留文件系统安全的 ASCII 字符，其余一律换成 '_'。
+    let mut readable = String::with_capacity(name.len());
     for ch in name.chars() {
         if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
-            out.push(ch);
+            readable.push(ch);
         } else {
-            out.push('_');
+            readable.push('_');
         }
     }
-    if out.is_empty() || out == "." || out == ".." {
-        out = "plugin".to_string();
+    // 全是点（""、"."、".."、"..."）会被 OS 当成相对路径段，统一换成固定前缀。
+    if readable.is_empty() || readable.chars().all(|c| c == '.') {
+        readable = "plugin".to_string();
     }
-    out.truncate(64);
-    out
+    // 2) 长度：Windows 整条路径要留余量，总长按 60 字符封顶。
+    //    哈希后缀（'-' + 16 位十六进制 = 17 字符）永不截断，只截可读部分；
+    //    可读部分此刻全是 ASCII，按字节截断不会切坏 UTF-8。
+    const SUFFIX_LEN: usize = 17;
+    const MAX_LEN: usize = 60;
+    if readable.len() > MAX_LEN - SUFFIX_LEN {
+        readable.truncate(MAX_LEN - SUFFIX_LEN);
+    }
+    // 3) 哈希后缀：FNV-1a 64 位，不引入任何依赖。
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{readable}-{hash:016x}")
+}
+
+/// 为该插件准备一份干净的缓存目录，返回解压目标。
+///
+/// **目录名必须带 `cache_key` 里的名称哈希**：名字里没有可区分字符时
+/// （纯中文、纯符号），只靠可读部分会让多个插件解析到同一个目录，这里的
+/// `remove_dir_all` 就会删掉别的插件刚解压出来的资源。带上哈希后目录天然
+/// 按插件名隔离，这次删除只可能命中本插件自己的缓存。
+///
+/// 兼容性：旧版本留下的缓存目录（不带哈希后缀，例如 `____`）不需要迁移，
+/// 路径每次按新规则重算，找不到就当作首次加载重新解压；遗留目录只是不再
+/// 被引用，不影响加载。
+fn reset_plugin_cache_dir(cache_dir: &Path, name: &str) -> PathBuf {
+    let dest = cache_dir.join(cache_key(name));
+    // 双保险：key 里不会出现路径分隔符，这里再校验目标是 cache_dir 的直接
+    // 子目录，避免将来改动命名规则后在这里误删上层目录。
+    if dest.parent() == Some(cache_dir) {
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+    let _ = std::fs::create_dir_all(&dest);
+    dest
 }
 /// Plugin descriptor parsed from `manifest.json`.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -404,9 +449,8 @@ impl PluginManager {
         drop(ef); // release the ZipFile borrow before iterating the archive
 
         // Extract resources (everything except manifest + entry scripts).
-        let dest = self.cache_dir.join(cache_key(&manifest.name));
-        let _ = std::fs::remove_dir_all(&dest);
-        let _ = std::fs::create_dir_all(&dest);
+        // 目录名带插件名哈希（见 cache_key），不同插件不会互相清空资源。
+        let dest = reset_plugin_cache_dir(&self.cache_dir, &manifest.name);
         for i in 0..archive.len() {
             let mut f = archive.by_index(i).map_err(|e| e.to_string())?;
             let name = f.name().to_string();
@@ -683,7 +727,7 @@ impl PluginManager {
                     return String::new();
                 }
                 cfg.lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .get(&name)
                     .and_then(|m| m.get(&key))
                     .cloned()
@@ -707,6 +751,8 @@ impl PluginManager {
             });
         }
         // xmst_resource_dir() -> String
+        // 与 load_zip 使用同一个 cache_key（含名称哈希），保证脚本拿到的就是
+        // 自己那份已解压资源。
         {
             let cache = cache_dir.clone();
             engine.register_fn("xmst_resource_dir", move || -> String {

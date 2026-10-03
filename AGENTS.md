@@ -81,6 +81,9 @@ icacls F:\XMST\dist\XMST-0.1.0-alpha.exe | Select-String 'Mandatory Label' # ★
 - **构建后可删 `target/debug`**（约 1 GB，check 会重建）。
 - 交付目录的**完整性标签必须是 Medium**，否则整个程序会被降级运行（§4.1）。
 - 改动一律 git 提交，便于按提交回退单文件。
+- **发版用 `tools/release.ps1`（详见 `docs/发版流程.md`）**：一条命令完成 构建 → 备份 → 交付（`dist\` + `versions\`）→ 校验 → 提交；默认**不推送**，加 `-Push` 才 `git push`（`-Tag` 同时建并推标签 `v<版本>`）。
+- 脚本已把 §7 的校验固化：三处 SHA256 一致、完整性标签必须 Medium（**Low 直接中止**并打印 `icacls … /setintegritylevel M /T /C`）、MOTW 自动 `Unblock-File`、旧产物备份到 `dist\backup\<时间戳>\`（保留 2 份）。
+- 用法：`powershell -NoProfile -ExecutionPolicy Bypass -File F:\XMST\tools\release.ps1 [-Version x.y.z-alpha] [-SkipBuild] [-Push] [-Tag]`（可在任意目录调用；本机只有 Windows PowerShell 5.1，装了 pwsh 也可用）。
 
 ---
 
