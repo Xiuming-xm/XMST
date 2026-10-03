@@ -5857,6 +5857,46 @@ fn shell_open_str_raw(s: &str) -> isize {
         ) as isize
     }
 }
+/// 稳健改名（模组启用/禁用、重命名都走它）。
+///
+/// 旧实现直接 `std::fs::rename`：一旦**目标已存在**（上一次操作残留的 `.jar.disabled`）、
+/// 源文件带只读属性、或文件被瞬时占用（系统索引器/编辑器/我们自己的 zip 扫描句柄），
+/// Windows 会返回 ACCESS_DENIED —— 用户在界面上看到的就是"操作失败: 拒绝访问 (os error 5)"。
+/// 这里按"清目标 → 去只读 → 重试 3 次 → 退化为复制+删除"处理，并把真实原因回传。
+fn rename_with_retry(old: &Path, new: &Path) -> Result<(), String> {
+    if new.exists() {
+        if let Err(e) = std::fs::remove_file(new) {
+            return Err(format!("目标文件已存在且无法删除：{}（{e}）", new.display()));
+        }
+    }
+    if let Ok(md) = std::fs::metadata(old) {
+        let mut perm = md.permissions();
+        if perm.readonly() {
+            perm.set_readonly(false);
+            let _ = std::fs::set_permissions(old, perm);
+        }
+    }
+    let mut last = String::new();
+    for i in 0..3 {
+        match std::fs::rename(old, new) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last = format!("{e}（os error {:?}）", e.raw_os_error());
+                std::thread::sleep(std::time::Duration::from_millis(150 * (i + 1)));
+            }
+        }
+    }
+    match std::fs::copy(old, new) {
+        Ok(_) => match std::fs::remove_file(old) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(format!("已复制新文件但源文件删除失败：{e}")),
+        },
+        Err(e2) => Err(format!(
+            "改名失败：{last}；退化复制也失败：{e2}（源={}）",
+            old.display()
+        )),
+    }
+}
 /// 给子进程显式指定一个一定存在的工作目录。
 ///
 /// ★ 关键修复：本程序可能被从"之后被删除的目录"启动（例如从 dist\backup\<时间戳> 运行，
@@ -10755,7 +10795,7 @@ impl App {
                                                     } else {
                                                         format!("{name}.disabled")
                                                     };
-                                                    match std::fs::rename(&old_p, target.join(&new_name)) {
+                                                    match rename_with_retry(&old_p, &target.join(&new_name)) {
                                                         Ok(_) => {
                                                             if let Some((pn, _, _, _)) = &mut self.runtimes[idx].file_preview {
                                                                 if pn == name {
@@ -10994,7 +11034,7 @@ impl App {
                                     if new_n != old_name && target.join(&new_n).exists() {
                                         err = Some(format!("「{new_n}」已存在"));
                                     } else {
-                                        match std::fs::rename(&old_p, target.join(&new_n)) {
+                                        match rename_with_retry(&old_p, &target.join(&new_n)) {
                                             Ok(_) => {
                                                 if let Some((pn, _, _, _)) = &mut self.runtimes[idx].file_preview {
                                                     if pn == &old_name {
