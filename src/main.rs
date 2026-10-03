@@ -4112,6 +4112,15 @@ impl App {
                 write_open_log(&log);
                 return;
             }
+            // ⓪ **老版本的原始调用**：`Command::new("explorer.exe").arg(路径).spawn()`，
+            //    不加 CREATE_NO_WINDOW、不覆盖标准句柄、不指定 current_dir ——
+            //    这正是"以前一直能打开"的那段代码（用户反馈是某版本开始的回归），
+            //    所以先原样复现这条路径，再走后面的新方案。
+            match std::process::Command::new("explorer.exe").arg(&p).spawn() {
+                Ok(c) => log.push_str(&format!("⓪ 原始 explorer.exe: spawn OK pid={}\n", c.id())),
+                Err(e) => log.push_str(&format!("⓪ 原始 explorer.exe: 失败 {e} (raw={:?})\n", e.raw_os_error())),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(900));
             // ① COM Explore，带退出码校验
             let ps = format!(
                 "$ErrorActionPreference='Stop'; $s=New-Object -ComObject Shell.Application; $s.Explore('{}')",
@@ -5148,7 +5157,22 @@ fn spawn_reveal(p: &std::path::Path) -> bool {
     //    导致 0xc0000142。这是目录/文件打开的正常行为，保持与旧版一致。
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    // ⓪ 首选 COM：目录用 Explore；文件用 Explore + SelectItem
+    // ⓪ **老版本原始调用**（回归对照）：目录 = explorer.exe <目录>；
+    //    文件 = explorer.exe /select, <文件>（两个独立参数，含空格路径也安全）
+    {
+        let r = if p.is_dir() {
+            std::process::Command::new("explorer.exe").arg(&p_str).spawn()
+        } else {
+            std::process::Command::new("explorer.exe")
+                .arg("/select,")
+                .arg(&p_str)
+                .spawn()
+        };
+        if r.is_ok() {
+            return true;
+        }
+    }
+    // ① COM：目录用 Explore；文件用 Explore + SelectItem
     if p.is_dir() {
         if open_folder_com(&p_str) {
             return true;
