@@ -1604,6 +1604,14 @@ struct App {
     hide_requested: bool,
     /// 延迟隐藏命令（ViewportCommand::Visible(false)）是否已发出
     hide_sent: bool,
+    /// 托盘隐藏态轻量 tick 上次执行时间（1s 节流；隐藏期间可能被反复唤醒，
+    /// 用它保证只按 1s 跑一次业务 tick，避免在托盘态重复触发重活）
+    tray_tick_at: Option<std::time::Instant>,
+    /// 启动自检「低完整性级别（Low IL）」提示文案：Some 时弹一次可关闭的提示窗，
+    /// 用户关闭后置 None（本次运行不再出现）
+    low_il_notice: Option<String>,
+    /// 上面提示里给出的修复命令（供「复制修复命令」按钮使用）
+    low_il_fix_cmd: String,
     /// 托盘版本号（进入/恢复托盘时递增，恢复窗口后的首次 update 消费并强制全量刷新）
     tray_version: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// 上次消费的托盘版本号（update 内比对 tray_version 判断是否刚恢复窗口）
@@ -1966,6 +1974,9 @@ impl App {
             log_row_h: 1.0,
             hide_requested: false,
             hide_sent: false,
+            tray_tick_at: None,
+            low_il_notice: None,
+            low_il_fix_cmd: String::new(),
             tray_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_tray_version: 0,
             egui_ctx: ctx,
@@ -2092,6 +2103,12 @@ impl App {
         app.tray = tray;
         app.tray_show_id = show_id;
         app.tray_quit_id = quit_id;
+        // 托盘心跳线程：隐藏期间每秒投递一条重绘消息，让隐藏态也能跑自动行为 tick
+        //（原因与开销见 spawn_tray_heartbeat / tray_hidden_tick 的注释）
+        spawn_tray_heartbeat(app.tray_hidden.clone());
+        // 启动自检：进程完整性级别（Low IL 会让写其它目录/打开目录/调用系统程序全部失败）。
+        // 检测到 Low 时登记一条可关闭的提示，由 update 内的 ui_low_il_notice 弹出一次。
+        app.check_integrity_level();
         app
     }
 
@@ -2473,6 +2490,166 @@ impl App {
         }
     }
 
+    /// 托盘隐藏态的轻量 tick（约 1s 一次）。
+    ///
+    /// 为什么托盘态也必须 tick：进程退出/崩溃检测、正常关服自动备份、崩溃与自动重启调度、
+    /// 下载与备份的收尾与下一步，全部由这一批 tick 驱动；而隐藏态 update 在开头就早退（不渲染）。
+    /// 用户常见的操作恰恰是「关掉窗口去托盘，再从游戏里停服」——隐藏期间若不跑 tick，
+    /// 退出事件永远检测不到，「正常关服自动备份」和「崩溃自动重启」都会静默失效。
+    ///
+    /// 节流：进入托盘的那几帧（关闭帧、兜底隐藏帧、恢复前）可能连续唤醒 update，用时间戳保证
+    /// 1s 只跑一次；首次进入（tray_tick_at 为 None，关闭时已复位）立即跑一次，尽快开始接管检测。
+    /// 全程不做任何渲染相关的事（不重建纹理/字体、不碰背景材质、不分配大对象），保持托盘态
+    /// 低内存低 CPU；恢复窗口后的既有全量重建逻辑不受影响。
+    fn tray_hidden_tick(&mut self, ctx: &egui::Context) {
+        const TRAY_TICK_MS: u64 = 1000;
+        let now = std::time::Instant::now();
+        let due = self
+            .tray_tick_at
+            .map(|t| now.duration_since(t).as_millis() as u64 >= TRAY_TICK_MS)
+            .unwrap_or(true);
+        // 无论是否到点都重挂一次 1s 的重绘请求：事件循环按 1s 醒来。
+        // 注意窗口不可见时系统不会真的绘制（eframe 对不可见窗口会跳过 request_redraw），
+        // 真正让 update 跑起来的是托盘心跳线程投递的那条重绘消息（见 spawn_tray_heartbeat）。
+        ctx.request_repaint_after(std::time::Duration::from_millis(TRAY_TICK_MS));
+        if !due {
+            return;
+        }
+        self.tray_tick_at = Some(now);
+        // 日志尾读 + 进程退出/崩溃检测 + 关服快照登记：托盘态同样要跑，否则退出检测不到
+        let evts = self.tick_server_logs();
+        self.emit_plugin_events(evts);
+        // 与可见态同一批自动行为 tick（可见态在 update 里调用，此处一一对应）
+        self.tick_net();
+        self.tick_tunnels();
+        self.tick_frp();
+        self.poll_rathole_dl();
+        self.poll_remote_upload();
+        self.tick_backup();
+        self.tick_auto_restart();
+        self.tick_crash_restart();
+        self.tick_stop();
+        self.tick_download();
+        self.tick_mod_update();
+        self.tick_create_server();
+    }
+
+    /// 启动自检：当前进程的完整性级别（只做一次）。
+    ///
+    /// Low IL 的特征是「半可用」：读文件、写自己目录（data）正常，写其它目录一律
+    /// 「拒绝访问 (os error 5)」，打开目录/调用系统程序（explorer / ShellExecute）看似成功
+    /// 却没有窗口 —— 极易被误判成多个互不相干的 bug。检测到 Low 时弹一次修复提示
+    /// （见 ui_low_il_notice）；Medium/High 不打扰用户；API 失败按「未知」处理，
+    /// 但三种结论都写进诊断日志留痕。
+    fn check_integrity_level(&mut self) {
+        let rid = current_integrity_rid();
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| PathBuf::from("."));
+        let dir_text = exe_dir.to_string_lossy().to_string();
+        let level = match rid {
+            Some(rid) if rid == winapi::um::winnt::SECURITY_MANDATORY_LOW_RID => "Low",
+            Some(rid) if rid == winapi::um::winnt::SECURITY_MANDATORY_MEDIUM_RID => "Medium",
+            Some(_) => "High/System",
+            None => "未知",
+        };
+        let rid_text = rid
+            .map(|r| format!("{r:#x}"))
+            .unwrap_or_else(|| "?".to_string());
+        self.integrity_log(&format!(
+            "进程完整性自检：level={level} rid={rid_text} exe_dir={dir_text}"
+        ));
+        if level != "Low" {
+            return;
+        }
+        let cmd = format!("icacls \"{dir_text}\" /setintegritylevel M /T /C");
+        self.low_il_fix_cmd = cmd.clone();
+        let mut lines: Vec<String> = Vec::new();
+        lines.push("当前程序运行在「低完整性级别（Low IL）」，会出现这些现象：".to_string());
+        lines.push(
+            "· 无法写入程序目录以外的位置，改模组/重命名/复制会报「拒绝访问 (os error 5)」；"
+                .to_string(),
+        );
+        lines.push(
+            "· 无法打开文件夹、也无法调用系统程序（explorer / ShellExecute 看似执行了，却没有窗口）。"
+                .to_string(),
+        );
+        lines.push(String::new());
+        lines.push("原因是程序所在目录带了 Low 完整性标签。请用管理员身份打开命令提示符，执行：".to_string());
+        lines.push(String::new());
+        lines.push(cmd);
+        lines.push(String::new());
+        lines.push("改完必须重启本程序才会生效（正在运行的进程会一直沿用旧令牌）。".to_string());
+        self.low_il_notice = Some(lines.join("\n"));
+    }
+
+    /// 完整性自检诊断留痕：追加一行到 `data\integrity_check.log`（超过 64KB 只保留最后 100 行）。
+    fn integrity_log(&self, line: &str) {
+        use std::io::Write;
+        let path = self.data_dir().join("integrity_check.log");
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.len() > 64 * 1024 {
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    let all: Vec<&str> = text.lines().collect();
+                    let keep: Vec<&str> = all
+                        .iter()
+                        .skip(all.len().saturating_sub(100))
+                        .copied()
+                        .collect();
+                    let _ = std::fs::write(&path, keep.join("\n") + "\n");
+                }
+            }
+        }
+        let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        else {
+            return;
+        };
+        let _ = writeln!(
+            f,
+            "[{}] {}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+            line
+        );
+    }
+
+    /// 低完整性（Low IL）提示窗：只弹一次，点「我知道了」或右上角关闭后本次运行不再出现。
+    fn ui_low_il_notice(&mut self, ctx: &egui::Context) {
+        let Some(text) = self.low_il_notice.clone() else {
+            return;
+        };
+        let cmd = self.low_il_fix_cmd.clone();
+        let mut open = true;
+        let mut dismiss = false;
+        egui::Window::new("运行完整性级别偏低（Low IL）")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_max_width(560.0);
+                ui.label(text);
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("我知道了").clicked() {
+                        dismiss = true;
+                    }
+                    if ui.button("复制修复命令").clicked() {
+                        ui.output_mut(|o| o.copied_text = cmd.clone());
+                    }
+                });
+            });
+        if !open || dismiss {
+            self.low_il_notice = None;
+        }
+    }
+
     /// 处理优雅停止后台线程回传结果
     fn tick_stop(&mut self) {
         while let Ok((idx, ok)) = self.stop_rx.try_recv() {
@@ -2685,6 +2862,9 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             self.hide_requested = true;
             self.hide_sent = false;
+            // 复位隐藏态 tick 时间戳：进入托盘后的第一帧隐藏 update 立即跑一次业务 tick，
+            // 让「关窗后马上停服」也能在 1s 内被检测到（不必等满一个节流周期）
+            self.tray_tick_at = None;
             // A4 工作集压缩：进入托盘态 7s 后一次性修剪（勿周期调用——周期修剪会引发抖动）。
             // 托盘态 update 早退（0 重绘），egui 缓存/字形不再需要；压缩线程与主线程解耦，
             // 恢复窗口时 tray_hidden 已复位则跳过，避免把正在恢复的进程工作集打回冷态。
@@ -2736,6 +2916,271 @@ impl App {
         self.confirm_close = Some(running.len());
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         false
+    }
+
+    /// 服务器日志尾读 + 进程退出/崩溃检测 + 关服快照登记（原先内联在 update 中，现抽成方法，
+    /// 让可见态每帧调用、托盘隐藏态按 1s 节流调用同一份逻辑，避免各写一份而走样）。
+    /// 返回本帧收集的插件事件（由调用方分发）。
+    fn tick_server_logs(&mut self) -> Vec<PluginEvt> {
+    let mut notify_queue: Vec<(String, String)> = Vec::new();
+    // 插件事件收集（本帧待分发；BETA_PLUGINS 关闭时保持空 Vec，零开销）
+    let mut plugin_evts: Vec<PluginEvt> = Vec::new();
+    // 本帧检测到的服务器退出事件：(序号, 退出码, 日志尾部, 是否有新崩溃报告)
+    let mut exit_events: Vec<(usize, Option<i32>, String, bool)> = Vec::new();
+    let plugins_active = self
+        .plugins
+        .as_ref()
+        .map(|p| !p.plugins_dir.to_string_lossy().contains("placeholder"))
+        .unwrap_or(false);
+    for (idx, rt) in self.runtimes.iter_mut().enumerate() {
+        let max = self.cfg.max_log_lines;
+        let mut buf = std::mem::take(&mut rt.log_buf); // 移出缓冲，避免每帧大字符串 clone 造成内存峰值
+        let old_len = buf.len();
+        let mut added = 0usize;
+        // 日志文件尾随优先：MC 服务器日志文件实时写盘，绕开 stdout 管道�?Java 缓冲的卡死问�?
+        let mut tail_active = false;
+        if let Some(tail) = &mut rt.log_tail {
+            if let Some(n) = tail.tail_logs(&mut buf, max) {
+                added = n;
+                tail_active = tail.seen_data();
+            }
+        }
+        if let Some(p) = &rt.proc {
+            if tail_active {
+                // 文件通道已生效：丢弃 stdout 管道数据（内容重复且格式不一致）
+                process::drain_logs_discard(p);
+            } else {
+                // 文件通道尚未生效（启动初�?�?MC 服务器）：stdout 管道兜底
+                added += process::drain_logs(p, &mut buf, max);
+            }
+            // MC 服务器启动完成标志（"Done (x.xxxs)! For help, type ..."）→ 更新就绪状态 + 通知（防重复）
+            // D5：判定放宽到「Done (」+「s)」同时出现，兼容不同版本/包装端的小差异。
+            if !rt.startup_notified && buf.contains("Done (") && buf.contains("s)") {
+                rt.startup_notified = true;
+                rt.last_msg = "✅ 启动完成，服务端已就绪".to_string();
+                // 成功运行：重置崩溃重启计数与熔断窗口
+                rt.crash_count = 0;
+                rt.crash_first_at = None;
+                rt.crash_restart_at = None;
+                let name = self.cfg.servers.get(idx).map(|s| s.name.clone()).unwrap_or_default();
+                notify_queue.push(("XMST - 服务器启动完成".to_string(), format!("{name} 已就绪，可以连接")));
+            }
+            // 就绪超时提示：长时间未出现 Done（非标准 MC 服务端或启动异常），给出可见状态
+            if !rt.startup_notified
+                && !rt.startup_warned
+                && rt.started_at.map(|t| t.elapsed().as_secs() > 180).unwrap_or(false)
+            {
+                rt.startup_warned = true;
+                rt.last_msg = "已运行，但未检测到服务端就绪标志（可能不是标准 MC 服务端），请查看日志确认".to_string();
+                // D5 兜底：非标准/代理端/被改过本地化的服务端可能永远不输出 "Done ("
+                // → 插件事件永远不触发。超时后仍按「已启动」补发一次 server_started。
+                if plugins_active && !rt.plugin_start_emitted {
+                    rt.plugin_start_emitted = true;
+                    let name = self.cfg.servers.get(idx).map(|s| s.name.clone()).unwrap_or_default();
+                    plugin_evts.push(PluginEvt::ServerStarted(name));
+                }
+            }
+            // 非用户主动停止时进程消失：先判定是否属于"正常关闭"（控制台输入 /stop 等），
+            // 只有确认异常才当作崩溃处理，并触发崩溃相关提示/重启/备份策略。
+            if !rt.stopping && !process::is_running(p) {
+                let code_opt = process::exit_code(p);
+                let code = code_opt
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                let name = self.cfg.servers.get(idx).map(|s| s.name.clone()).unwrap_or_default();
+                // 三重信号取或：日志出现 Stopping server/Saving worlds 或 退出码为 0，
+                // 且自本次启动以来没有新增崩溃报告
+                let since = rt
+                    .started_at
+                    .and_then(|t| std::time::SystemTime::now().checked_sub(t.elapsed()))
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                let new_crash = self
+                    .cfg
+                    .servers
+                    .get(idx)
+                    .map(|s| backup::has_new_crash_report(&s.dir, since))
+                    .unwrap_or(false);
+                let tail: String = {
+                    let n = buf.chars().count();
+                    buf.chars().skip(n.saturating_sub(4000)).collect()
+                };
+                let normal = backup::looks_normal_shutdown(&tail, code_opt, new_crash);
+                // 关服/崩溃快照统一入口（本帧先登记，循环结束后再起线程）
+                exit_events.push((idx, code_opt, tail, new_crash));
+                if normal {
+                    rt.proc = None;
+                    rt.last_msg = format!("服务器已退出（exit code {code}），按正常关服处理");
+                    if plugins_active {
+                        plugin_evts.push(PluginEvt::ServerStopped(name.clone(), "graceful".to_string()));
+                    }
+                } else {
+                    notify_queue.push(("XMST - 服务器异常退出".to_string(), format!("{name} 进程已退出（code {code}），未经过正常停止")));
+                    // 崩溃根因分析：从日志/crash-report 里提取可操作的原因（缺少前置、Java 版本、
+                    // 内存、端口、Mixin 冲突…），随后弹出小窗提示，而不是只丢一句"异常退出"。
+                    let sdir = self.cfg.servers.get(idx).map(|s| s.dir.clone());
+                    if let Some(sdir) = sdir {
+                        if let Some(finding) = crashscan::analyze(&sdir) {
+                            let first = finding
+                                .causes
+                                .first()
+                                .map(|c| c.title.clone())
+                                .unwrap_or_else(|| "疑似启动失败".to_string());
+                            notify_queue.push((
+                                "XMST - 崩溃原因分析".to_string(),
+                                format!("{name}：{first}（详见「崩溃分析」窗口）"),
+                            ));
+                            self.crash_report = Some((idx, name.clone(), finding));
+                        }
+                    }
+                    rt.proc = None;
+                    // 插件事件：异常退出视为 server_stopped("crashed")
+                    if plugins_active {
+                        plugin_evts.push(PluginEvt::ServerStopped(name.clone(), "crashed".to_string()));
+                    }
+                    // 崩溃自动重启：窗口内计数 -> 计划重启 / 熔断
+                    let cr = self
+                        .cfg
+                        .servers
+                        .get(idx)
+                        .map(|s| s.crash_restart.clone())
+                        .unwrap_or_default();
+                    if cr.enabled {
+                        let now = std::time::Instant::now();
+                        let win_secs = cr.circuit_minutes.saturating_mul(60);
+                        let in_window = rt
+                            .crash_first_at
+                            .map(|t| now.duration_since(t).as_secs() <= win_secs)
+                            .unwrap_or(false);
+                        if !in_window {
+                            rt.crash_first_at = Some(now);
+                            rt.crash_count = 0;
+                        }
+                        rt.crash_count += 1;
+                        let n = rt.crash_count;
+                        if n <= cr.max_restarts {
+                            let wait = std::time::Duration::from_secs(cr.wait_secs);
+                            rt.crash_restart_at = Some(now + wait);
+                            rt.last_msg = format!(
+                                "⚠️ 服务器进程已退出（exit code {code}），将在 {} 秒后自动重启（第 {n}/{} 次）",
+                                cr.wait_secs, cr.max_restarts
+                            );
+                        } else {
+                            rt.last_msg = format!(
+                                "⚠️ 服务器进程已退出（exit code {code}）。{} 分钟内连续崩溃达到上限（{n} 次），已熔断停止自动重启；可手动启动或等待窗口重置",
+                                cr.circuit_minutes
+                            );
+                        }
+                    } else {
+                        rt.last_msg = format!(
+                            "⚠️ 服务器进程已退出（exit code {code}），未经过正常停止。如遇数据异常，可在「自动功能」页回滚")
+                        ;
+                    }
+                }
+            }
+        }
+
+        // 插件事件：服务器启动完成 / 新日志行 / 玩家加入离开（BETA_PLUGINS 启用且目录已就绪才收集）
+        if plugins_active {
+            let srv_name = self
+                .cfg
+                .servers
+                .get(idx)
+                .map(|s| s.name.clone())
+                .unwrap_or_default();
+            if rt.startup_notified && !rt.plugin_start_emitted {
+                rt.plugin_start_emitted = true;
+                plugin_evts.push(PluginEvt::ServerStarted(srv_name.clone()));
+            }
+            if buf.len() > old_len {
+                let new_part = safe_from(&buf, old_len);
+                for line in new_part.split('\n') {
+                    let line = line.trim_end();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if let Some(p) = line.find(" joined the game").and_then(|pos| Self::extract_player_name(line, pos)) {
+                        plugin_evts.push(PluginEvt::PlayerJoined(srv_name.clone(), p));
+                    } else if let Some(p) = line.find(" left the game").and_then(|pos| Self::extract_player_name(line, pos)) {
+                        plugin_evts.push(PluginEvt::PlayerLeft(srv_name.clone(), p));
+                    }
+                    plugin_evts.push(PluginEvt::LogLine(srv_name.clone(), line.to_string()));
+                }
+            }
+        }
+        // 无条件写回：mem::take 已移出缓冲，即使本帧无新增也必须保留旧内容，
+        // 否则无新日志的帧会把已显示的日志清空（表现为日志闪一下消失）
+        // 阶段C：日志落库 SQLite（仅新增行；行数超限由 logdb 内部轮转）
+        if added > 0 {
+            if let Some(db) = self.logdb.as_mut() {
+                let lines: Vec<String> = buf
+                    .lines()
+                    .rev()
+                    .take(added)
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                let srv = self
+                    .cfg
+                    .servers
+                    .get(idx)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_default();
+                db.insert_batch(&srv, &lines);
+            }
+        }
+        rt.log_buf = buf;
+        if added > 0 {
+            rt.log_pending += added;
+        }
+    }
+    for (idx, rt) in self.tunnel_runtimes.iter_mut().enumerate() {
+        if let Some(p) = &rt.proc {
+            let added_t = process::drain_logs(p, &mut rt.log_buf, 2000);
+            // 阶段C：隧道日志落库 SQLite（来源标记为「隧道:名称」）
+            if added_t > 0 {
+                if let Some(db) = self.logdb.as_mut() {
+                    let lines: Vec<String> = rt
+                        .log_buf
+                        .lines()
+                        .rev()
+                        .take(added_t)
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+                    let tname = self
+                        .cfg
+                        .tunnels
+                        .get(idx)
+                        .map(|t| t.name.clone())
+                        .unwrap_or_default();
+                    db.insert_batch(&format!("隧道:{tname}"), &lines);
+                }
+            }
+            rt.log_pending += added_t;
+            // 非手动停止时进程消失：视为穿透异常退�?
+            if !rt.stopping && !process::is_running(p) {
+                let code = process::exit_code(p)
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                let name = self.cfg.tunnels.get(idx).map(|t| t.name.clone()).unwrap_or_default();
+                notify_queue.push(("XMST - 内网穿透异常退出".to_string(), format!("{name} 进程已退出（code {code}）")));
+                rt.proc = None;
+            }
+        }
+    }
+    // 统一投递本次收集的通知（循环结束后避免借用冲突）桌面弹窗 + 工具内通知同步
+    for (title, body) in notify_queue {
+        self.notify(&title, &body);
+    }
+    // 退出后的快照判定（正常关服 → reason=stop；异常退出 → 仅在显式开启崩溃备份时才做）
+    for (i, code_opt, tail, new_crash) in exit_events {
+        self.try_exit_snapshot(i, false, code_opt, &tail, new_crash);
+    }
+        plugin_evts
     }
 
     fn tick_backup(&mut self) {
@@ -6158,6 +6603,58 @@ fn write_open_log(s: &str) {
     }
 }
 
+/// 读取当前进程令牌的完整性级别（TOKEN_MANDATORY_LABEL 的最后一个子授权值）。
+///
+/// 返回 Some(rid)：0x1000=Low、0x2000=Medium、更高为 High/System；None=未知（API 失败，
+/// 调用方按「不打扰用户」处理）。用途见 App::check_integrity_level：exe 所在目录带 Low
+/// 完整性标签时，Windows 会把从该 exe 启动的进程降级为 Low IL —— 只能写同样带 Low 标签的
+/// 对象，写普通目录报「拒绝访问 (os error 5)」，且 UIPI 禁止它与 Medium 的 shell 交互
+/// （explorer / ShellExecute 看似成功却没有窗口）。这是本项目最难查的一类「半可用」故障。
+fn current_integrity_rid() -> Option<u32> {
+    use winapi::shared::minwindef::{DWORD, LPVOID};
+    use winapi::um::handleapi::CloseHandle;
+    use winapi::um::processthreadsapi::{GetCurrentProcess, OpenProcessToken};
+    use winapi::um::securitybaseapi::{
+        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation,
+    };
+    use winapi::um::winnt::{TokenIntegrityLevel, TOKEN_MANDATORY_LABEL, TOKEN_QUERY};
+    unsafe {
+        let mut token: winapi::um::winnt::HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return None;
+        }
+        // 缓冲区用 u64 数组：保证与 TOKEN_MANDATORY_LABEL / SID 的指针对齐；
+        // 256 字节足够容纳该结构（16 字节）加完整性 SID（12 字节）
+        let mut buf = [0u64; 32];
+        let mut ret_len: DWORD = 0;
+        let ok = GetTokenInformation(
+            token,
+            TokenIntegrityLevel,
+            buf.as_mut_ptr() as LPVOID,
+            std::mem::size_of_val(&buf) as DWORD,
+            &mut ret_len,
+        );
+        if ok == 0 {
+            CloseHandle(token);
+            return None;
+        }
+        let label = &*(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL);
+        let sid = label.Label.Sid;
+        let rid = if sid.is_null() {
+            None
+        } else {
+            let count = *GetSidSubAuthorityCount(sid);
+            if count == 0 {
+                None
+            } else {
+                Some(*GetSidSubAuthority(sid, (count - 1) as DWORD))
+            }
+        };
+        CloseHandle(token);
+        rid
+    }
+}
+
 /// 运行 powershell 命令并返回退出码（None=启动失败/超时）。
 fn powershell_status(ps: &str, timeout_secs: u64) -> Option<i32> {
     use std::os::windows::process::CommandExt;
@@ -6818,6 +7315,33 @@ fn main_hwnd() -> winapi::shared::windef::HWND {
     found
 }
 
+/// 托盘心跳线程：托盘隐藏期间每秒向主窗口投递一条 WM_PAINT，让隐藏态也能回调 update()。
+///
+/// 为什么需要它：eframe 对本进程**不可见**的主窗口会跳过 request_redraw
+/// （见 vendor/eframe-0.29.1/src/native/run.rs 的 check_redraw_requests：窗口不可见时不请求重绘、
+/// 直接回到 Wait 休眠，用于修隐藏窗口 Poll 空转 100% CPU），因此隐藏态只靠
+/// ctx.request_repaint_after 只能唤醒事件循环、进不了 update，而 update 是唯一能跑自动行为
+/// tick 的地方。这里改为直接给窗口过程发一条重绘消息：winit 的 WM_PAINT 处理会派发
+/// RedrawRequested 事件，eframe 收到后照常调用 update（窗口保持隐藏，不显示、不重建纹理），
+/// 代价约每秒一帧空帧。非托盘态与空闲时纯睡眠，零 CPU 占用。
+fn spawn_tray_heartbeat(hidden: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    let _ = std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        if !hidden.load(std::sync::atomic::Ordering::Relaxed) {
+            continue;
+        }
+        // 每次按「本进程 + 标题含 XMST」重新解析主窗口：避免窗口重建/退出后对旧句柄发消息
+        let hwnd = main_hwnd();
+        if hwnd.is_null() {
+            continue;
+        }
+        unsafe {
+            use winapi::um::winuser::{SendMessageW, WM_PAINT};
+            SendMessageW(hwnd, WM_PAINT, 0, 0);
+        }
+    });
+}
+
 /// 写 32bpp BMP（自写文件头，避免为诊断截图链入 PNG 编码器让 exe 增大约 3.5MB）。
 fn write_bmp32(
     path: &std::path::Path,
@@ -6911,9 +7435,11 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        // P0 阶段0 A1：托盘态 0 重绘——隐藏时立即返回，不渲染、不注册心跳。
-        // 事件循环进入休眠（延迟隐藏帧已把 ControlFlow 拉回 Wait 后长眠，无任何重绘请求）；
-        // 托盘事件由全局回调（set_event_handler）经 Arc 版本号 + request_repaint 唤醒一次。
+        // P0 阶段0 A1：托盘态不渲染——隐藏时立即返回，不构图、不重建纹理/字体/背景材质。
+        // 但隐藏期间仍要按 1s 跑一批自动行为 tick（进程退出检测 / 正常关服快照 / 崩溃与自动重启 /
+        // 下载与备份收尾），见下方 tray_hidden_tick —— 那是「关窗去托盘后再停服」能被检测到、
+        // 「正常关服自动备份」能触发的唯一路径。
+        // 托盘事件仍由全局回调（set_event_handler）经 Arc 版本号 + request_repaint 唤醒一次。
         if self.tray_hidden.load(std::sync::atomic::Ordering::Relaxed) {
             // 延迟一帧发隐藏命令兜底（通常关闭帧已立即隐藏，此处幂等）：
             // 若关闭帧 Visible(false) 已生效则无事发生；若因事件循环时序未消费则本帧补发。
@@ -6942,6 +7468,9 @@ impl eframe::App for App {
                     mem.caches = Default::default();
                 });
             }
+            // 隐藏态轻量心跳：只跑自动行为 tick（进程退出检测 / 正常关服快照 / 崩溃与自动重启 /
+            // 下载与备份收尾），不渲染、不重建纹理与字体、不碰背景材质。详见 tray_hidden_tick。
+            self.tray_hidden_tick(ctx);
             return;
         }
         // 恢复窗口（托盘 → 显示）后的第一帧：全量重建渲染状态。
@@ -7188,264 +7717,8 @@ impl eframe::App for App {
             }
         }
         // 每帧拉取日志 + 异常退出检�?
-        let mut notify_queue: Vec<(String, String)> = Vec::new();
-        // 插件事件收集（本帧待分发；BETA_PLUGINS 关闭时保持空 Vec，零开销）
-        let mut plugin_evts: Vec<PluginEvt> = Vec::new();
-        // 本帧检测到的服务器退出事件：(序号, 退出码, 日志尾部, 是否有新崩溃报告)
-        let mut exit_events: Vec<(usize, Option<i32>, String, bool)> = Vec::new();
-        let plugins_active = self
-            .plugins
-            .as_ref()
-            .map(|p| !p.plugins_dir.to_string_lossy().contains("placeholder"))
-            .unwrap_or(false);
-        for (idx, rt) in self.runtimes.iter_mut().enumerate() {
-            let max = self.cfg.max_log_lines;
-            let mut buf = std::mem::take(&mut rt.log_buf); // 移出缓冲，避免每帧大字符串 clone 造成内存峰值
-            let old_len = buf.len();
-            let mut added = 0usize;
-            // 日志文件尾随优先：MC 服务器日志文件实时写盘，绕开 stdout 管道�?Java 缓冲的卡死问�?
-            let mut tail_active = false;
-            if let Some(tail) = &mut rt.log_tail {
-                if let Some(n) = tail.tail_logs(&mut buf, max) {
-                    added = n;
-                    tail_active = tail.seen_data();
-                }
-            }
-            if let Some(p) = &rt.proc {
-                if tail_active {
-                    // 文件通道已生效：丢弃 stdout 管道数据（内容重复且格式不一致）
-                    process::drain_logs_discard(p);
-                } else {
-                    // 文件通道尚未生效（启动初�?�?MC 服务器）：stdout 管道兜底
-                    added += process::drain_logs(p, &mut buf, max);
-                }
-                // MC 服务器启动完成标志（"Done (x.xxxs)! For help, type ..."）→ 更新就绪状态 + 通知（防重复）
-                // D5：判定放宽到「Done (」+「s)」同时出现，兼容不同版本/包装端的小差异。
-                if !rt.startup_notified && buf.contains("Done (") && buf.contains("s)") {
-                    rt.startup_notified = true;
-                    rt.last_msg = "✅ 启动完成，服务端已就绪".to_string();
-                    // 成功运行：重置崩溃重启计数与熔断窗口
-                    rt.crash_count = 0;
-                    rt.crash_first_at = None;
-                    rt.crash_restart_at = None;
-                    let name = self.cfg.servers.get(idx).map(|s| s.name.clone()).unwrap_or_default();
-                    notify_queue.push(("XMST - 服务器启动完成".to_string(), format!("{name} 已就绪，可以连接")));
-                }
-                // 就绪超时提示：长时间未出现 Done（非标准 MC 服务端或启动异常），给出可见状态
-                if !rt.startup_notified
-                    && !rt.startup_warned
-                    && rt.started_at.map(|t| t.elapsed().as_secs() > 180).unwrap_or(false)
-                {
-                    rt.startup_warned = true;
-                    rt.last_msg = "已运行，但未检测到服务端就绪标志（可能不是标准 MC 服务端），请查看日志确认".to_string();
-                    // D5 兜底：非标准/代理端/被改过本地化的服务端可能永远不输出 "Done ("
-                    // → 插件事件永远不触发。超时后仍按「已启动」补发一次 server_started。
-                    if plugins_active && !rt.plugin_start_emitted {
-                        rt.plugin_start_emitted = true;
-                        let name = self.cfg.servers.get(idx).map(|s| s.name.clone()).unwrap_or_default();
-                        plugin_evts.push(PluginEvt::ServerStarted(name));
-                    }
-                }
-                // 非用户主动停止时进程消失：先判定是否属于"正常关闭"（控制台输入 /stop 等），
-                // 只有确认异常才当作崩溃处理，并触发崩溃相关提示/重启/备份策略。
-                if !rt.stopping && !process::is_running(p) {
-                    let code_opt = process::exit_code(p);
-                    let code = code_opt
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| "?".to_string());
-                    let name = self.cfg.servers.get(idx).map(|s| s.name.clone()).unwrap_or_default();
-                    // 三重信号取或：日志出现 Stopping server/Saving worlds 或 退出码为 0，
-                    // 且自本次启动以来没有新增崩溃报告
-                    let since = rt
-                        .started_at
-                        .and_then(|t| std::time::SystemTime::now().checked_sub(t.elapsed()))
-                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                    let new_crash = self
-                        .cfg
-                        .servers
-                        .get(idx)
-                        .map(|s| backup::has_new_crash_report(&s.dir, since))
-                        .unwrap_or(false);
-                    let tail: String = {
-                        let n = buf.chars().count();
-                        buf.chars().skip(n.saturating_sub(4000)).collect()
-                    };
-                    let normal = backup::looks_normal_shutdown(&tail, code_opt, new_crash);
-                    // 关服/崩溃快照统一入口（本帧先登记，循环结束后再起线程）
-                    exit_events.push((idx, code_opt, tail, new_crash));
-                    if normal {
-                        rt.proc = None;
-                        rt.last_msg = format!("服务器已退出（exit code {code}），按正常关服处理");
-                        if plugins_active {
-                            plugin_evts.push(PluginEvt::ServerStopped(name.clone(), "graceful".to_string()));
-                        }
-                    } else {
-                        notify_queue.push(("XMST - 服务器异常退出".to_string(), format!("{name} 进程已退出（code {code}），未经过正常停止")));
-                        // 崩溃根因分析：从日志/crash-report 里提取可操作的原因（缺少前置、Java 版本、
-                        // 内存、端口、Mixin 冲突…），随后弹出小窗提示，而不是只丢一句"异常退出"。
-                        let sdir = self.cfg.servers.get(idx).map(|s| s.dir.clone());
-                        if let Some(sdir) = sdir {
-                            if let Some(finding) = crashscan::analyze(&sdir) {
-                                let first = finding
-                                    .causes
-                                    .first()
-                                    .map(|c| c.title.clone())
-                                    .unwrap_or_else(|| "疑似启动失败".to_string());
-                                notify_queue.push((
-                                    "XMST - 崩溃原因分析".to_string(),
-                                    format!("{name}：{first}（详见「崩溃分析」窗口）"),
-                                ));
-                                self.crash_report = Some((idx, name.clone(), finding));
-                            }
-                        }
-                        rt.proc = None;
-                        // 插件事件：异常退出视为 server_stopped("crashed")
-                        if plugins_active {
-                            plugin_evts.push(PluginEvt::ServerStopped(name.clone(), "crashed".to_string()));
-                        }
-                        // 崩溃自动重启：窗口内计数 -> 计划重启 / 熔断
-                        let cr = self
-                            .cfg
-                            .servers
-                            .get(idx)
-                            .map(|s| s.crash_restart.clone())
-                            .unwrap_or_default();
-                        if cr.enabled {
-                            let now = std::time::Instant::now();
-                            let win_secs = cr.circuit_minutes.saturating_mul(60);
-                            let in_window = rt
-                                .crash_first_at
-                                .map(|t| now.duration_since(t).as_secs() <= win_secs)
-                                .unwrap_or(false);
-                            if !in_window {
-                                rt.crash_first_at = Some(now);
-                                rt.crash_count = 0;
-                            }
-                            rt.crash_count += 1;
-                            let n = rt.crash_count;
-                            if n <= cr.max_restarts {
-                                let wait = std::time::Duration::from_secs(cr.wait_secs);
-                                rt.crash_restart_at = Some(now + wait);
-                                rt.last_msg = format!(
-                                    "⚠️ 服务器进程已退出（exit code {code}），将在 {} 秒后自动重启（第 {n}/{} 次）",
-                                    cr.wait_secs, cr.max_restarts
-                                );
-                            } else {
-                                rt.last_msg = format!(
-                                    "⚠️ 服务器进程已退出（exit code {code}）。{} 分钟内连续崩溃达到上限（{n} 次），已熔断停止自动重启；可手动启动或等待窗口重置",
-                                    cr.circuit_minutes
-                                );
-                            }
-                        } else {
-                            rt.last_msg = format!(
-                                "⚠️ 服务器进程已退出（exit code {code}），未经过正常停止。如遇数据异常，可在「自动功能」页回滚")
-                            ;
-                        }
-                    }
-                }
-            }
-
-            // 插件事件：服务器启动完成 / 新日志行 / 玩家加入离开（BETA_PLUGINS 启用且目录已就绪才收集）
-            if plugins_active {
-                let srv_name = self
-                    .cfg
-                    .servers
-                    .get(idx)
-                    .map(|s| s.name.clone())
-                    .unwrap_or_default();
-                if rt.startup_notified && !rt.plugin_start_emitted {
-                    rt.plugin_start_emitted = true;
-                    plugin_evts.push(PluginEvt::ServerStarted(srv_name.clone()));
-                }
-                if buf.len() > old_len {
-                    let new_part = safe_from(&buf, old_len);
-                    for line in new_part.split('\n') {
-                        let line = line.trim_end();
-                        if line.is_empty() {
-                            continue;
-                        }
-                        if let Some(p) = line.find(" joined the game").and_then(|pos| Self::extract_player_name(line, pos)) {
-                            plugin_evts.push(PluginEvt::PlayerJoined(srv_name.clone(), p));
-                        } else if let Some(p) = line.find(" left the game").and_then(|pos| Self::extract_player_name(line, pos)) {
-                            plugin_evts.push(PluginEvt::PlayerLeft(srv_name.clone(), p));
-                        }
-                        plugin_evts.push(PluginEvt::LogLine(srv_name.clone(), line.to_string()));
-                    }
-                }
-            }
-            // 无条件写回：mem::take 已移出缓冲，即使本帧无新增也必须保留旧内容，
-            // 否则无新日志的帧会把已显示的日志清空（表现为日志闪一下消失）
-            // 阶段C：日志落库 SQLite（仅新增行；行数超限由 logdb 内部轮转）
-            if added > 0 {
-                if let Some(db) = self.logdb.as_mut() {
-                    let lines: Vec<String> = buf
-                        .lines()
-                        .rev()
-                        .take(added)
-                        .map(|s| s.to_string())
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .collect();
-                    let srv = self
-                        .cfg
-                        .servers
-                        .get(idx)
-                        .map(|s| s.name.clone())
-                        .unwrap_or_default();
-                    db.insert_batch(&srv, &lines);
-                }
-            }
-            rt.log_buf = buf;
-            if added > 0 {
-                rt.log_pending += added;
-            }
-        }
-        for (idx, rt) in self.tunnel_runtimes.iter_mut().enumerate() {
-            if let Some(p) = &rt.proc {
-                let added_t = process::drain_logs(p, &mut rt.log_buf, 2000);
-                // 阶段C：隧道日志落库 SQLite（来源标记为「隧道:名称」）
-                if added_t > 0 {
-                    if let Some(db) = self.logdb.as_mut() {
-                        let lines: Vec<String> = rt
-                            .log_buf
-                            .lines()
-                            .rev()
-                            .take(added_t)
-                            .map(|s| s.to_string())
-                            .collect::<Vec<_>>()
-                            .into_iter()
-                            .rev()
-                            .collect();
-                        let tname = self
-                            .cfg
-                            .tunnels
-                            .get(idx)
-                            .map(|t| t.name.clone())
-                            .unwrap_or_default();
-                        db.insert_batch(&format!("隧道:{tname}"), &lines);
-                    }
-                }
-                rt.log_pending += added_t;
-                // 非手动停止时进程消失：视为穿透异常退�?
-                if !rt.stopping && !process::is_running(p) {
-                    let code = process::exit_code(p)
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| "?".to_string());
-                    let name = self.cfg.tunnels.get(idx).map(|t| t.name.clone()).unwrap_or_default();
-                    notify_queue.push(("XMST - 内网穿透异常退出".to_string(), format!("{name} 进程已退出（code {code}）")));
-                    rt.proc = None;
-                }
-            }
-        }
-        // 统一投递本次收集的通知（循环结束后避免借用冲突）桌面弹窗 + 工具内通知同步
-        for (title, body) in notify_queue {
-            self.notify(&title, &body);
-        }
-        // 退出后的快照判定（正常关服 → reason=stop；异常退出 → 仅在显式开启崩溃备份时才做）
-        for (i, code_opt, tail, new_crash) in exit_events {
-            self.try_exit_snapshot(i, false, code_opt, &tail, new_crash);
-        }
+        // 服务器日志尾读 + 退出/崩溃检测 + 关服快照登记（本帧一次；托盘态由 tray_hidden_tick 调用）
+        let plugin_evts = self.tick_server_logs();
 
         // Frp 集中管理：后台回�?+ 异常退出检�?
         self.tick_tunnels();
@@ -7503,9 +7776,9 @@ impl eframe::App for App {
             }
         }
 
-        // （P0 阶段0 A1）隐藏态已在此函数最开头 early return：不渲染、不注册心跳，
-        // 本块旧版"1000ms 低频心跳"随早退成为死代码，已删除；事件循环靠隐藏帧注册的
-        // 超长 repaint 请求休眠，托盘恢复由全局回调 request_repaint 唤醒。
+        // （P0 阶段0 A1）隐藏态已在此函数最开头 early return：不渲染；隐藏期间的自动行为 tick
+        // 由 tray_hidden_tick + 托盘心跳线程负责（进程退出检测/关服快照/崩溃重启/下载备份收尾），
+        // 本块以下只处理可见态。托盘恢复由全局回调 request_repaint 唤醒。
 
         // 顶部栏（无背景标题：XMST + 小版本号；右侧为工具内窗口按钮：最小化/最大化/关闭）
         // 颜色必须跟随调色板：此前 Default 分支写死了近黑色 (22,25,32)，
@@ -8265,10 +8538,9 @@ impl eframe::App for App {
         let animating = self.cfg.ui_animations
             && ((self.nav_anim - target_nav).abs() > 0.02
                 || (self.tab_anim - target_tab).abs() > 0.02);
-        // 刷新率：动画 16ms；托盘态不注册任何心跳（A1 零重绘：update 早退 + 延迟隐藏帧把
-        // ControlFlow 拉回 Wait 后事件循环长眠、CPU≈0，托盘恢复由回调 request_repaint 立即唤醒；
-        // 注意不能在托盘态注册超长心跳——该请求到期时窗口已隐藏，request_redraw 无效会使
-        // ControlFlow 滞留 Poll 满转）；其余 200ms
+        // 刷新率：动画 16ms；托盘态本身的 1s 心跳在隐藏分支（tray_hidden_tick）里注册，
+        // 这里只处理可见态（本行条件在可见态恒为真，保留判断以防递归/多视口下的意外调用）；
+        // 隐藏态不能挂可见态这种短周期心跳——窗口不可见时 request_redraw 无效。
         if !self.tray_hidden.load(std::sync::atomic::Ordering::Relaxed) {
             let period_ms = if animating { 16 } else { 200 };
             ctx.request_repaint_after(std::time::Duration::from_millis(period_ms));
@@ -8283,6 +8555,8 @@ impl eframe::App for App {
         self.ui_bg_editor(ctx);
         // 崩溃分析小窗（服务端异常退出后自动出现）
         self.ui_crash_report(ctx);
+        // 低完整性（Low IL）启动提示：只弹一次（检测在 App::new，未检测到则始终为空）
+        self.ui_low_il_notice(ctx);
         // “打开目录”失败提示（错误经静态槽从 open_folder 带回）
         if let Some(e) = take_open_error() {
             self.set_toast(e);
