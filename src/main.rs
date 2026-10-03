@@ -4088,65 +4088,52 @@ impl App {
     /// 因此目录回到 `explorer.exe <目录>`（这条路径一直可用），同时补空标准句柄
     /// 避免 0xc0000142；只有 spawn 本身失败时才退化为 ShellExecuteW。
     fn open_folder(&self, path: &std::path::Path) {
-        use std::process::Stdio;
-        // 去抖：重复点击不再连续拉起 explorer 进程。短时间大量创建 explorer 会耗尽
-        // 「桌面堆」，随后**所有** shell 操作都报 0xc0000142 —— 这正是"很多功能莫名失效"
-        // 的级联现象。
-        {
-            static LAST: std::sync::OnceLock<std::sync::Mutex<Option<std::time::Instant>>> =
-                std::sync::OnceLock::new();
-            let m = LAST.get_or_init(|| std::sync::Mutex::new(None));
-            if let Ok(mut g) = m.lock() {
-                if let Some(t) = *g {
-                    if t.elapsed() < std::time::Duration::from_millis(1200) {
-                        return;
-                    }
-                }
-                *g = Some(std::time::Instant::now());
-            }
-        }
-        if !path.exists() {
-            set_open_error(format!("目录不存在：{}", path.display()));
-            return;
-        }
-        // ① 首选：explorer.exe 直开（实测本机最稳：cmd start 的 ShellExecute 解析链路
-        //    在本机会失败并弹「Windows 无法访问指定设备、路径或文件」，而 explorer 直开成功）
-        {
-            let ok = std::process::Command::new("explorer.exe")
-                .arg(path)
-                .current_dir(sane_cwd())
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .is_ok();
-            if ok {
+        // 打开目录改为**后台线程执行"逐级尝试 + 结果校验 + 全程写日志"**：
+        //   ① COM Shell.Application.Explore（校验 powershell 退出码，能真正判断成败）
+        //   ② cmd /C start "" <目录>
+        //   ③ explorer.exe <目录>
+        //   ④ ShellExecuteW("explore")
+        // 每次点击都会把每一级的真实结果写入 <exe目录>\data\open_diag.log，
+        // 便于定位"点了没反应/弹权限错误"到底卡在哪一级（本机 UAC 关闭，shell 交接行为特殊）。
+        let p = path.to_path_buf();
+        std::thread::spawn(move || {
+            let mut log = format!(
+                "=== 打开目录 === 时间={}\n目标={}\nexists={} is_dir={}\n进程当前目录={:?}（存在:{}）\nsane_cwd={:?}\n",
+                chrono::Local::now(),
+                p.display(),
+                p.exists(),
+                p.is_dir(),
+                std::env::current_dir().ok(),
+                std::env::current_dir().map(|d| d.is_dir()).unwrap_or(false),
+                sane_cwd()
+            );
+            if !p.exists() {
+                log.push_str("目录不存在，终止\n");
+                write_open_log(&log);
                 return;
             }
-        }
-        // ② 进程内 ShellExecute("explore")
-        if shell_explore(path) {
-            return;
-        }
-        // ③ cmd /C start（兜底）
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            let mut c = std::process::Command::new("cmd");
-            c.args(["/C", "start", "", &path.to_string_lossy()])
-                .current_dir(sane_cwd())
-                .creation_flags(CREATE_NO_WINDOW)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            if c.spawn().is_ok() {
+            // ① COM Explore，带退出码校验
+            let ps = format!(
+                "$ErrorActionPreference='Stop'; $s=New-Object -ComObject Shell.Application; $s.Explore('{}')",
+                p.to_string_lossy().replace('\'', "''")
+            );
+            let r1 = powershell_status(&ps, 8);
+            log.push_str(&format!("① COM Explore: {r1:?}\n"));
+            if matches!(r1, Some(0)) {
+                write_open_log(&log);
                 return;
             }
-        }
-        set_open_error(format!(
-            "打开目录失败（explorer/ShellExecute/cmd 都不可用）：{}",
-            path.display()
-        ));
+            // ② cmd /C start
+            let r2 = spawn_status("cmd", &["/C", "start", "", &p.to_string_lossy()]);
+            log.push_str(&format!("② cmd /C start: {r2:?}\n"));
+            // ③ explorer.exe
+            let r3 = spawn_status("explorer.exe", &[&p.to_string_lossy()]);
+            log.push_str(&format!("③ explorer.exe: {r3:?}\n"));
+            // ④ ShellExecute(explore) 原始返回码（>32 成功）
+            let r4 = shell_explore_raw(&p.to_string_lossy());
+            log.push_str(&format!("④ ShellExecute(explore) 返回={r4}（>32 视为成功；5=拒绝访问）\n"));
+            write_open_log(&log);
+        });
     }
 
     /// 删除文件/目录到系统回收站（阶段16④：经 PowerShell Microsoft.VisualBasic.FileIO，
@@ -5564,6 +5551,68 @@ pub fn run_open_diag(target: &str) {
 }
 
 /// ShellExecuteW("explore", s) 的原始返回值（诊断用）。
+/// 写"打开目录"诊断日志到 <exe目录>\data\open_diag.log。
+fn write_open_log(s: &str) {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent().map(|d| d.join("data")) {
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(dir.join("open_diag.log"), s);
+        }
+    }
+}
+
+/// 运行 powershell 命令并返回退出码（None=启动失败/超时）。
+fn powershell_status(ps: &str, timeout_secs: u64) -> Option<i32> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut child = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            ps,
+        ])
+        .current_dir(sane_cwd())
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => return Some(st.code().unwrap_or(-1)),
+            Ok(None) => {
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(120));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// spawn 一个程序（返回 Ok/Err 描述）。
+fn spawn_status(prog: &str, args: &[&str]) -> Result<u32, String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut c = std::process::Command::new(prog);
+    c.args(args)
+        .current_dir(sane_cwd())
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    match c.spawn() {
+        Ok(ch) => Ok(ch.id()),
+        Err(e) => Err(format!("{e} (raw={:?})", e.raw_os_error())),
+    }
+}
 fn shell_explore_raw(s: &str) -> isize {
     use winapi::um::shellapi::ShellExecuteW;
     use winapi::um::winuser::SW_SHOWNORMAL;
