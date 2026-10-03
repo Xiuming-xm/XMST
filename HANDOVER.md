@@ -2,6 +2,7 @@
 AIGC:
     Label: "1"
     ContentProducer: 001191440300708461136T1XGW3
+
     ProduceID: f60842f40542d18996ccf15309f5e3de_17863382ba6111f1b172525400248c00
     ReservedCode1: YmoiOHAOfG57fZJy69SXZFnCWdnF/AeAB0/Cohw2OgEWa4fKJ+PaGVkwjIpLWIQn6qCv8/2MGtFYjTy8hBmoy//d8jizX1W1nuNeeADux2XaLs+nrQIiODf5xGTS89E0dXt+VWG5wA4lDSCq/QwiXH+P4Mbs2ezL2a6o/6jqAz8btBxvHsJo1MYnTW0=
     ContentPropagator: 001191440300708461136T1XGW3
@@ -687,3 +688,53 @@ AIGC:
 - 来源：会话交接_2026-09-26.md（阶段 0-7）、README.md（2026-09-20/21）、docs\TODO-frp平台API接入.md、HANDOVER.md 残留尾部与历次会话记录。
 - 阶段 9/10 无任何记录佐证，如实标注缺失，未臆造；「2026-09-25 自动备份禁用完全隐藏」条目完整内容亦缺失，待人工补充。
 *（内容由AI生成，仅供参考）*
+
+
+---
+
+## ★★ 重要经验（2026-10-03 结案）：低完整性（Low IL）目录 = 文件操作与 shell 交互全部失效
+
+**现象（连续多轮被误判为代码/API 问题）**
+- 模组启用/禁用、重命名 → `操作失败: 拒绝访问 (os error 5)`，连复制也是 5
+- "打开目录 / 打开所在目录"完全无效：`explorer.exe`、`cmd /c start` **spawn 成功却无窗口**
+- `ShellExecuteW` → **5 (SE_ERR_ACCESSDENIED)**；`powershell Invoke-Item` → 退出码 1
+- COM `Shell.Application.Explore` → **退出码 0 但窗口不出现**；`Shell.Application.Windows()` 枚举**卡住**
+- 每次运行 exe 弹"无法验证发布者"；**同一台机器用 PowerShell 做同样操作全部成功**
+- 读文件/列目录/写自己目录（`dist\data`）一直正常 → 极易误判成"只有某几个功能坏了"
+
+**根因**：`F:\XMST` 整棵树（含 exe）带 **Low 完整性标签**：
+```
+icacls F:\XMST   →   Mandatory Label\Low Mandatory Level:(OI)(CI)(NW)
+```
+Windows 中**进程完整性级别取自可执行文件自身的标签** ⇒ 从该 exe 启动的进程是 **Low IL**：
+1. 只能写同样带 Low 标签的对象（所以配置/日志写 `dist\data` 一直"正常"，把排查带偏）；
+2. 写普通目录（Medium，如 `D:\Desktop\**`）→ **ACCESS_DENIED(5)**；
+3. **UIPI 禁止 Low IL 与 Medium 的 shell 交互** → ShellExecute / COM / explorer 全部"看似成功实则无效"。
+
+**10 秒判定**
+```powershell
+icacls "<程序目录>" | Select-String 'Mandatory Label'   # 期望 Medium；若为 Low 就是它
+# 进程内：whoami /groups | findstr "Mandatory Label"     # Low=S-1-16-4096, Medium=S-1-16-8192
+```
+程序内置自检：`set XMST_OPEN_TEST=<目录>` 运行 → 看 `dist\data\open_diag.log`
+（令牌完整性 + 目标目录写入/改名/复制实测 + 各级打开方式返回码）。
+
+**修复**（改完**必须重启程序**，运行中的进程保持旧令牌）
+```cmd
+icacls "F:\XMST" /setintegritylevel M /T /C /Q
+```
+修复后实测：写入/改名/复制 OK，`ShellExecute` 由 5 → **42（>32=成功）**，`Invoke-Item` 由 1 → **0**。
+
+**防再犯（重要）**
+1. **排查顺序**：进程令牌/完整性标签 → ACL·SRP·CFA·杀软·Job 对象 → **最后才怀疑代码写法**（本项目顺序反了，代价是好几轮）。
+2. **交叉验证技巧**：同一操作**用 PowerShell 做一遍**；PowerShell 成功而程序失败 ⇒ 99% 是**进程上下文差异**（令牌/完整性/会话/桌面/Job），**不是 API 用法**——这种场景下抄别的项目（如 PCL）的写法必然无效。
+3. **交付校验**：发布前确认 exe 及目录完整性标签为 Medium（部署流程已加 `icacls` 检查）。
+4. 待办：启动时自检 Low IL 并明确提示用户。
+
+## 2026-10-03 审计驱动的修复（均已构建部署）
+- **配置安全**：`save_config` 去抖 600 ms + 原子写（tmp → `.bak` → `rename`）；**序列化失败绝不写空文件**（旧实现会清空配置，用户实测丢过多次）；`load_config` 解析失败**先留档**（`xmst_config.broken_*.json`）再从 `.bak` 恢复；关闭前强制 flush。
+- **模组检查更新**：`/v2/version_files` 按**对象 map**（键 `sha1:<hash>`）解析、版本 id 读 `id`（旧代码读 `version_id` 永远为空）→ 此前从未成功；因 SHA1 只对"官方原样构建"有效，现**移入测试功能**（`beta.server.mod_update`，默认禁用），后续按 **modid 兜底 + 只检查不自动更新** 重做。
+- **`rename_with_retry`**：清目标 → 去只读 → 重试 3 次 → 退化复制+删除。
+- **稳定性**：22 处 `.lock().unwrap()` → `unwrap_or_else(|e| e.into_inner())`（`panic=abort` 下锁中毒=闪退）。
+- **性能**：`dir_size_mb` 30 s 记忆化（概览页此前**每帧**递归遍历 `world/`，实测 282 ms / 7.9 GB）；日志页查询 500 ms 节流缓存（此前每帧 `COUNT(*)` + 800 行）。
+- **其它**：`perf.rs` 补 `PROCESS_VM_READ`（此前内存静默计 0）；rhai `max_operations` 钳制 20 万；插件包迁到 `dist\data\plugins`。
