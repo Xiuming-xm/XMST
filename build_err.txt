@@ -1,5 +1,307 @@
 warning: Cargo.toml: unused manifest key: package.windows_subsystem
 warning: `xmst` (manifest) generated 1 warning
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.26
+   Compiling cfg-if v1.0.5
+   Compiling serde_core v1.0.229
+   Compiling windows-link v0.2.1
+   Compiling autocfg v1.5.1
+   Compiling portable-atomic v1.15.0
+   Compiling stable_deref_trait v1.2.1
+   Compiling smallvec v1.16.1
+   Compiling version_check v0.9.5
+   Compiling memchr v2.8.3
+   Compiling anyhow v1.0.104
+   Compiling shlex v2.0.1
+   Compiling log v0.4.34
+   Compiling pin-project-lite v0.2.17
+   Compiling once_cell v1.21.4
+   Compiling crossbeam-utils v0.8.23
+   Compiling find-msvc-tools v0.1.13
+   Compiling simd-adler32 v0.3.10
+   Compiling zerocopy v0.8.57
+   Compiling crunchy v0.2.4
+   Compiling windows-sys v0.61.2
+   Compiling tiny-keccak v2.0.2
+   Compiling crc32fast v1.5.2
+   Compiling serde v1.0.229
+   Compiling adler2 v2.0.1
+   Compiling windows_x86_64_gnu v0.52.6
+   Compiling bytes v1.12.1
+   Compiling num-traits v0.2.19
+   Compiling getrandom v0.2.17
+   Compiling crossbeam-epoch v0.9.21
+   Compiling getrandom v0.3.4
+   Compiling cc v1.4.7
+   Compiling ahash v0.8.12
+   Compiling crossbeam-deque v0.8.8
+   Compiling writeable v0.6.4
+   Compiling const-random-macro v0.1.16
+   Compiling khronos_api v3.1.0
+   Compiling litemap v0.8.3
+   Compiling syn v3.0.6
+   Compiling syn v2.0.119
+   Compiling const-random v0.1.18
+   Compiling windows-targets v0.52.6
+   Compiling miniz_oxide v0.9.1
+   Compiling cfg_aliases v0.2.2
+   Compiling icu_properties_data v2.3.0
+   Compiling icu_normalizer_data v2.3.0
+   Compiling futures-core v0.3.34
+   Compiling utf8_iter v1.0.4
+   Compiling rayon-core v1.13.0
+   Compiling thiserror v2.0.20
+   Compiling libc v0.2.189
+   Compiling itoa v1.0.18
+   Compiling xml-rs v0.8.29
+   Compiling percent-encoding v2.3.2
+   Compiling futures-sink v0.3.34
+   Compiling either v1.18.0
+   Compiling paste v1.0.15
+   Compiling scopeguard v1.2.0
+   Compiling parking_lot_core v0.9.12
+   Compiling tracing-core v0.1.36
+   Compiling num-integer v0.1.47
+   Compiling flate2 v1.1.10
+   Compiling ttf-parser v0.25.1
+   Compiling arrayvec v0.7.8
+   Compiling gl_generator v0.14.0
+   Compiling num-bigint v0.4.8
+   Compiling rayon v1.12.0
+   Compiling tracing v0.1.44
+   Compiling itertools v0.14.0
+   Compiling ring v0.17.14
+   Compiling lock_api v0.4.14
+   Compiling http v1.5.0
+   Compiling form_urlencoded v1.2.2
+   Compiling as-slice v0.2.1
+   Compiling unicode-segmentation v1.13.3
+   Compiling zeroize v1.9.0
+   Compiling av-scenechange v0.14.1
+   Compiling windows_x86_64_gnu v0.53.1
+   Compiling ab_glyph_rasterizer v0.1.10
+   Compiling libm v0.2.16
+   Compiling built v0.8.1
+   Compiling rustls-pki-types v1.15.1
+   Compiling aligned v0.4.3
+   Compiling parking_lot v0.12.5
+   Compiling windows-sys v0.52.0
+   Compiling bitflags v2.13.2
+   Compiling mio v1.2.3
+   Compiling socket2 v0.6.5
+   Compiling http-body v1.1.0
+   Compiling rav1e v0.8.1
+   Compiling synstructure v0.14.0
+   Compiling nom v8.0.0
+   Compiling tokio v1.53.1
+   Compiling num-rational v0.4.2
+   Compiling no_std_io2 v0.9.4
+   Compiling pulp v0.22.3
+   Compiling quick-error v2.0.1
+   Compiling epaint_default_fonts v0.29.1
+   Compiling nohash-hasher v0.2.0
+   Compiling pastey v0.1.1
+   Compiling unicase v2.9.0
+   Compiling futures-io v0.3.34
+   Compiling owned_ttf_parser v0.25.1
+   Compiling ab_glyph v0.2.32
+   Compiling raw-window-handle v0.6.2
+   Compiling getrandom v0.4.3
+   Compiling slab v0.4.12
+   Compiling zerofrom-derive v0.1.8
+   Compiling yoke-derive v0.8.3
+   Compiling displaydoc v0.2.7
+   Compiling zerovec-derive v0.11.6
+   Compiling bytemuck_derive v1.12.1
+   Compiling serde_derive v1.0.229
+   Compiling thiserror-impl v2.0.20
+   Compiling httparse v1.10.1
+   Compiling futures-task v0.3.34
+   Compiling zerofrom v0.1.8
+   Compiling yoke v0.8.3
+   Compiling dpi v0.1.2
+   Compiling siphasher v1.0.3
+   Compiling y4m v0.8.0
+   Compiling zerotrie v0.2.5
+   Compiling untrusted v0.9.0
+   Compiling phf_shared v0.11.3
+   Compiling futures-util v0.3.34
+   Compiling maybe-rayon v0.1.1
+   Compiling bitstream-io v4.10.0
+   Compiling zerovec v0.11.8
+   Compiling raw-cpuid v11.6.0
+   Compiling bytemuck v1.25.2
+   Compiling glutin_wgl_sys v0.6.1
+   Compiling glutin_egl_sys v0.7.1
+   Compiling emath v0.29.1
+   Compiling zerocopy-derive v0.8.57
+   Compiling equator-macro v0.4.2
+   Compiling tinystr v0.8.4
+   Compiling potential_utf v0.1.6
+   Compiling icu_collections v2.3.0
+   Compiling ecolor v0.29.1
+   Compiling arg_enum_proc_macro v0.3.4
+   Compiling icu_locale_core v2.3.0
+   Compiling prost-derive v0.13.5
+   Compiling equator v0.4.2
+   Compiling profiling-procmacros v1.0.18
+   Compiling aligned-vec v0.6.4
+   Compiling num-derive v0.4.2
+   Compiling num-complex v0.4.6
+   Compiling winit v0.30.13
+   Compiling simd_helpers v0.1.0
+   Compiling v_frame v0.3.9
+   Compiling profiling v1.0.18
+   Compiling miniz_oxide v0.8.9
+   Compiling rustversion v1.0.23
+   Compiling av1-grain v0.2.5
+   Compiling tower-service v0.3.3
+   Compiling try-lock v0.2.5
+   Compiling regex-syntax v0.8.11
+   Compiling zune-core v0.5.3
+   Compiling imgref v1.12.3
+   Compiling icu_provider v2.3.1
+   Compiling noop_proc_macro v0.3.0
+   Compiling icu_normalizer v2.3.0
+   Compiling icu_properties v2.3.0
+   Compiling weezl v0.1.12
+   Compiling new_debug_unreachable v1.0.6
+   Compiling pulp-wasm-simd-flag v0.1.1
+   Compiling rustls v0.23.45
+   Compiling winnow v1.0.4
+   Compiling reborrow v0.5.5
+   Compiling hashbrown v0.17.1
+   Compiling equivalent v1.0.2
+   Compiling prettyplease v0.2.37
+   Compiling toml_parser v1.1.3+spec-1.1.0
+   Compiling prost v0.13.5
+   Compiling zune-jpeg v0.5.15
+   Compiling loop9 v0.1.5
+   Compiling want v0.3.1
+   Compiling regex-automata v0.4.18
+   Compiling windows-targets v0.53.5
+   Compiling phf v0.11.3
+   Compiling indexmap v2.14.2
+   Compiling serde_spanned v1.1.1
+   Compiling toml_datetime v1.1.1+spec-1.1.0
+   Compiling avif-serialize v0.8.9
+   Compiling futures-channel v0.3.34
+   Compiling glutin v0.32.3
+   Compiling memoffset v0.9.1
+   Compiling fdeflate v0.3.7
+   Compiling zune-inflate v0.2.54
+   Compiling idna_adapter v1.2.2
+   Compiling toml_writer v1.1.2+spec-1.1.0
+   Compiling idna v1.1.0
+   Compiling cursor-icon v1.2.0
+   Compiling byteorder-lite v0.1.0
+   Compiling error-code v3.4.0
+   Compiling lebe v0.5.3
+   Compiling winapi-x86_64-pc-windows-gnu v0.4.0
+   Compiling smol_str v0.2.2
+   Compiling atomic-waker v1.1.2
+   Compiling url v2.5.8
+   Compiling color_quant v1.1.0
+   Compiling pxfm v0.1.30
+   Compiling compression-core v0.4.33
+   Compiling semver v1.0.28
+   Compiling vcpkg v0.2.15
+   Compiling pkg-config v0.3.34
+   Compiling fax v0.2.7
+   Compiling subtle v2.6.1
+   Compiling rgb v0.8.53
+   Compiling thiserror v1.0.69
+   Compiling fixedbitset v0.5.7
+   Compiling fastrand v2.5.0
+   Compiling zmij v1.0.23
+   Compiling bit_field v0.10.3
+   Compiling tempfile v3.27.0
+   Compiling petgraph v0.7.1
+   Compiling rustc_version v0.4.1
+   Compiling compression-codecs v0.4.43
+   Compiling libsqlite3-sys v0.28.0
+   Compiling gif v0.14.2
+   Compiling regex v1.13.1
+   Compiling image-webp v0.2.4
+   Compiling hyper v1.11.1
+   Compiling clipboard-win v5.4.1
+   Compiling png v0.18.1
+   Compiling toml v1.1.6+spec-1.1.0
+   Compiling rustls-webpki v0.103.15
+   Compiling mime_guess2 v2.3.1
+   Compiling windows-sys v0.60.2
+   Compiling prost-types v0.13.5
+   Compiling thiserror-impl v1.0.69
+   Compiling half v2.7.1
+   Compiling moxcms v0.8.1
+   Compiling qoi v0.4.1
+   Compiling sync_wrapper v1.0.2
+   Compiling epaint v0.29.1
+   Compiling glutin-winit v0.5.0
+   Compiling windows-sys v0.59.0
+   Compiling smartstring v1.0.1
+   Compiling libloading v0.8.9
+   Compiling tiff v0.11.3
+   Compiling exr v1.74.2
+   Compiling winapi v0.3.9
+   Compiling protoc-bin-vendored-linux-x86_32 v3.2.0
+   Compiling protoc-bin-vendored-linux-s390_64 v3.2.0
+   Compiling tower-layer v0.3.3
+   Compiling serde_json v1.0.151
+   Compiling base64 v0.23.1
+   Compiling heck v0.5.0
+   Compiling static_assertions v1.1.0
+   Compiling protoc-bin-vendored-linux-x86_64 v3.2.0
+   Compiling protoc-bin-vendored-linux-ppcle_64 v3.2.0
+   Compiling ipnet v2.12.2
+   Compiling protoc-bin-vendored-linux-aarch_64 v3.2.0
+   Compiling protoc-bin-vendored-macos-x86_64 v3.2.0
+   Compiling protoc-bin-vendored-macos-aarch_64 v3.2.0
+   Compiling protoc-bin-vendored-win32 v3.2.0
+   Compiling ravif v0.13.0
+   Compiling multimap v0.10.1
+   Compiling protoc-bin-vendored v3.2.0
+   Compiling embed-resource v3.0.11
+   Compiling arboard v3.6.1
+   Compiling hyper-util v0.1.21
+   Compiling prost-build v0.13.5
+   Compiling tower v0.5.3
+   Compiling egui v0.29.1
+   Compiling hashbrown v0.14.5
+   Compiling encoding_rs v0.8.42
+   Compiling async-compression v0.4.48
+   Compiling webbrowser v1.2.4
+   Compiling toml_datetime v0.6.3
+   Compiling serde_spanned v0.6.9
+   Compiling keyboard-types v0.7.0
+   Compiling tokio-util v0.7.19
+   Compiling enum-map-derive v0.17.0
+   Compiling http-body-util v0.1.5
+   Compiling winapi-util v0.1.11
+   Compiling webpki-roots v1.0.9
+   Compiling crossbeam-channel v0.5.17
+   Compiling glow v0.14.2
+   Compiling zip v2.4.2
+   Compiling litrs v1.0.0
+   Compiling winnow v0.5.40
+   Compiling web-time v1.1.0
+   Compiling tokio-rustls v0.26.5
+   Compiling ryu v1.0.23
+   Compiling bumpalo v3.20.3
+   Compiling mime v0.3.17
+   Compiling rfd v0.15.4
+   Compiling hyper-rustls v0.27.10
+   Compiling zopfli v0.8.3
+   Compiling serde_urlencoded v0.7.1
+   Compiling document-features v0.2.12
+   Compiling muda v0.15.3
+   Compiling enum-map v2.7.3
+   Compiling tower-http v0.6.11
+   Compiling same-file v1.0.6
+   Compiling image v0.25.10
+   Compiling hashlink v0.9.1
+   Compiling xmst v0.1.0-alpha (F:\XMST)
 warning: unused `CompilationResult` that must be used
   --> build.rs:19:5
    |
@@ -12,7 +314,27 @@ help: use `let _ = ...` to ignore the resulting value
 19 |     let _ = embed_resource::compile("resource.rc", embed_resource::NONE);
    |     +++++++
 
+   Compiling rhai_codegen v3.2.0
+   Compiling base64 v0.22.1
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling core_detect v1.0.0
+   Compiling fallible-iterator v0.3.0
+   Compiling toml_edit v0.20.2
 warning: `xmst` (build script) generated 1 warning
+   Compiling thin-vec v0.2.20
+   Compiling simdutf8 v0.1.5
+   Compiling multiversion_no_op v1.0.0
+   Compiling reqwest v0.12.28
+   Compiling tray-icon v0.19.3
+   Compiling walkdir v2.5.0
+   Compiling egui_glow v0.29.1
+   Compiling egui-winit v0.29.1
+   Compiling rhai v1.26.1
+   Compiling chrono v0.4.45
+   Compiling toml v0.8.2
+   Compiling filetime v0.2.29
+   Compiling eframe v0.29.1 (F:\XMST\vendor\eframe-0.29.1)
+   Compiling egui_extras v0.29.1
 warning: struct `DummyStorage` is never constructed
    --> vendor\eframe-0.29.1\src\epi.rs:803:19
     |
@@ -22,7 +344,7 @@ warning: struct `DummyStorage` is never constructed
     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
 
 warning: `eframe` (lib) generated 1 warning
-   Compiling xmst v0.1.0-alpha (F:\XMST)
+   Compiling rusqlite v0.31.0
 warning: unused imports: `SeekFrom` and `Seek`
   --> src\download.rs:13:21
    |
@@ -32,34 +354,34 @@ warning: unused imports: `SeekFrom` and `Seek`
    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
 
 warning: unnecessary parentheses around closure body
-   --> src\theme.rs:101:21
+   --> src\theme.rs:104:21
     |
-101 |     let f = |x: u8| ((x as f32 * 0.5).round().max(45.0) as u8);
+104 |     let f = |x: u8| ((x as f32 * 0.5).round().max(45.0) as u8);
     |                     ^                                        ^
     |
     = note: `#[warn(unused_parens)]` (part of `#[warn(unused)]`) on by default
 help: remove these parentheses
     |
-101 -     let f = |x: u8| ((x as f32 * 0.5).round().max(45.0) as u8);
-101 +     let f = |x: u8| (x as f32 * 0.5).round().max(45.0) as u8;
+104 -     let f = |x: u8| ((x as f32 * 0.5).round().max(45.0) as u8);
+104 +     let f = |x: u8| (x as f32 * 0.5).round().max(45.0) as u8;
     |
 
 warning: unused import: `winapi::um::winnt::KEY_READ`
-    --> src\main.rs:4754:13
+    --> src\main.rs:5064:13
      |
-4754 |         use winapi::um::winnt::KEY_READ;
+5064 |         use winapi::um::winnt::KEY_READ;
      |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 warning: unused import: `MIB_IFROW`
-    --> src\main.rs:5163:46
+    --> src\main.rs:5759:46
      |
-5163 |     use winapi::shared::ifmib::{MIB_IFTABLE, MIB_IFROW};
+5759 |     use winapi::shared::ifmib::{MIB_IFTABLE, MIB_IFROW};
      |                                              ^^^^^^^^^
 
 warning: unused import: `MIB_TCP6ROW`
-     --> src\main.rs:16751:9
+     --> src\main.rs:18444:9
       |
-16751 |         MIB_TCP6ROW, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID, MIB_TCP_STATE_ESTAB,
+18444 |         MIB_TCP6ROW, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID, MIB_TCP_STATE_ESTAB,
       |         ^^^^^^^^^^^
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
@@ -91,130 +413,229 @@ warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisf
      = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-    --> src\main.rs:5969:55
+    --> src\main.rs:4643:36
      |
-5969 | ...                   egui::Stroke::new(1.8, Color32::from_rgb(235, 238, 245)),
+4643 |         let st = egui::Stroke::new(1.5, color);
+     |                                    ^^^ help: explicitly specify the type as `f32`: `1.5_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\main.rs:4651:43
+     |
+4651 |                         egui::Stroke::new(1.4, color),
+     |                                           ^^^ help: explicitly specify the type as `f32`: `1.4_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\main.rs:4722:43
+     |
+4722 |                         egui::Stroke::new(1.2, color),
+     |                                           ^^^ help: explicitly specify the type as `f32`: `1.2_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\main.rs:6669:55
+     |
+6669 | ...                   egui::Stroke::new(1.8, self.theme_cur.text),
      |                                         ^^^ help: explicitly specify the type as `f32`: `1.8_f32`
      |
      = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
      = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-    --> src\main.rs:5976:55
+    --> src\main.rs:6676:55
      |
-5976 | ...                   egui::Stroke::new(1.8, Color32::from_rgb(235, 238, 245)),
+6676 | ...                   egui::Stroke::new(1.8, self.theme_cur.text),
      |                                         ^^^ help: explicitly specify the type as `f32`: `1.8_f32`
      |
      = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
      = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-    --> src\main.rs:5997:55
+    --> src\main.rs:6697:55
      |
-5997 | ...                   egui::Stroke::new(1.6, Color32::from_rgb(235, 238, 245)),
+6697 | ...                   egui::Stroke::new(1.6, self.theme_cur.text),
      |                                         ^^^ help: explicitly specify the type as `f32`: `1.6_f32`
      |
      = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
      = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-    --> src\main.rs:6015:55
+    --> src\main.rs:6715:55
      |
-6015 | ...                   egui::Stroke::new(1.6, Color32::from_rgb(235, 238, 245)),
+6715 | ...                   egui::Stroke::new(1.6, self.theme_cur.text),
      |                                         ^^^ help: explicitly specify the type as `f32`: `1.6_f32`
      |
      = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
      = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-    --> src\main.rs:6045:63
+    --> src\main.rs:6756:63
      |
-6045 | ...                   egui::Stroke::new(1.4, ic),
+6756 | ...                   egui::Stroke::new(1.4, col),
      |                                         ^^^ help: explicitly specify the type as `f32`: `1.4_f32`
      |
      = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
      = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-    --> src\main.rs:6072:39
+    --> src\main.rs:6764:67
      |
-6072 |                     egui::Stroke::new(1.0, Color32::from_rgb(44, 48, 58)),
+6764 | ...                   egui::Stroke::new(1.4, col),
+     |                                         ^^^ help: explicitly specify the type as `f32`: `1.4_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\main.rs:6793:39
+     |
+6793 |                     egui::Stroke::new(1.0, self.theme_cur.stroke),
      |                                       ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
      |
      = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
      = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-    --> src\main.rs:6597:21
+    --> src\main.rs:7354:21
      |
-6597 |                     1.0,
+7354 |                     1.0,
      |                     ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
      |
      = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
      = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> src\main.rs:10100:47
+    --> src\main.rs:8576:45
+     |
+8576 |         let card_stroke = egui::Stroke::new(1.0, self.theme_cur.stroke);
+     |                                             ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src\main.rs:9640:39
+     |
+9640 |             .stroke(egui::Stroke::new(1.0, self.theme_cur.stroke))
+     |                                       ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+     --> src\main.rs:10853:43
       |
-10100 |                     .stroke(egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(120, 160, 255, 60)))
+10853 |                 .stroke(egui::Stroke::new(1.0, self.theme_cur.stroke))
+      |                                           ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+      |
+      = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+      = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+     --> src\main.rs:11146:47
+      |
+11146 |                     .stroke(egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(120, 160, 255, 60)))
       |                                               ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> src\main.rs:11048:39
+     --> src\main.rs:12094:39
       |
-11048 |             .stroke(egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(120, 160, 255, 60)))
+12094 |             .stroke(egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(120, 160, 255, 60)))
       |                                       ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> src\main.rs:12239:67
+     --> src\main.rs:12977:43
       |
-12239 | ...                   .stroke(egui::Stroke::new(1.2, risk_red))
-      |                                                 ^^^ help: explicitly specify the type as `f32`: `1.2_f32`
-      |
-      = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
-      = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
-
-warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> src\main.rs:12277:69
-      |
-12277 | ...                   let card_stroke = egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(150, 160, 180, 45));
-      |                                                           ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+12977 |                 .stroke(egui::Stroke::new(1.0, self.theme_cur.stroke))
+      |                                           ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> src\main.rs:13250:59
+     --> src\main.rs:14366:59
       |
-13250 | ...                   .stroke(egui::Stroke::new(1.0, card_stroke))
+14366 | ...                   .stroke(egui::Stroke::new(1.0, card_stroke))
       |                                                 ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> src\main.rs:17036:27
+     --> src\main.rs:16370:55
       |
-17036 |         egui::Stroke::new(2.0, Color32::from_rgb(120, 200, 255))
+16370 | ...                   .stroke(egui::Stroke::new(1.0, self.theme_cur.stroke))
+      |                                                 ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+      |
+      = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+      = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+     --> src\main.rs:16550:55
+      |
+16550 | ...                   .stroke(egui::Stroke::new(1.0, self.theme_cur.stroke))
+      |                                                 ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+      |
+      = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+      = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+     --> src\main.rs:17683:55
+      |
+17683 | ...                   .stroke(egui::Stroke::new(1.0, self.theme_cur.stroke))
+      |                                                 ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+      |
+      = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+      = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+     --> src\main.rs:18729:27
+      |
+18729 |         egui::Stroke::new(2.0, Color32::from_rgb(120, 200, 255))
       |                           ^^^ help: explicitly specify the type as `f32`: `2.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> src\main.rs:17038:27
+     --> src\main.rs:18731:27
       |
-17038 |         egui::Stroke::new(2.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
+18731 |         egui::Stroke::new(2.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
       |                           ^^^ help: explicitly specify the type as `f32`: `2.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: variable does not need to be mutable
+   --> src\crashscan.rs:153:9
+    |
+153 |     let mut push = |cur: &mut String, out: &mut Vec<String>| {
+    |         ----^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> src\crashscan.rs:697:9
+    |
+697 |     let mut consider = |p: &Path, best: &mut Option<(f32, String, bool)>| {
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
 
 warning: variable does not need to be mutable
   --> src\logdb.rs:94:21
@@ -223,8 +644,6 @@ warning: variable does not need to be mutable
    |                     ----^^^^
    |                     |
    |                     help: remove this `mut`
-   |
-   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
 
 warning: variable does not need to be mutable
    --> src\logdb.rs:108:21
@@ -282,242 +701,273 @@ warning: unused variable: `name`
     |
     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
 
+warning: variable does not need to be mutable
+   --> src\serverinfo.rs:159:13
+    |
+159 |         let mut seen = |p: &str| libs.join(p).is_dir();
+    |             ----^^^^
+    |             |
+    |             help: remove this `mut`
+
 warning: unreachable pattern
-    --> src\main.rs:4506:13
+    --> src\main.rs:4816:13
      |
-4506 |             _ => {}
+4816 |             _ => {}
      |             ^ no value can reach this
      |
 note: multiple earlier patterns match some of the same values
-    --> src\main.rs:4506:13
+    --> src\main.rs:4816:13
      |
-4476 |             D::East => w = sw + dx,
+4786 |             D::East => w = sw + dx,
      |             ------- matches some of the same values
-4477 |             D::South => h = sh + dy,
+4787 |             D::South => h = sh + dy,
      |             -------- matches some of the same values
-4478 |             D::SouthEast => {
+4788 |             D::SouthEast => {
      |             ------------ matches some of the same values
 ...
-4482 |             D::West => {
+4792 |             D::West => {
      |             ------- matches some of the same values
 ...
-4506 |             _ => {}
+4816 |             _ => {}
      |             ^ ...and 4 other patterns collectively make this unreachable
      = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
 
 warning: unused variable: `i`
-    --> src\main.rs:7006:18
+    --> src\main.rs:7797:18
      |
-7006 |             for (i, (label, val)) in tabs.iter().enumerate() {
+7797 |             for (i, (label, val)) in tabs.iter().enumerate() {
      |                  ^
      |
 help: you might have meant to pattern match on the similarly named constant `S`
      |
-7006 -             for (i, (label, val)) in tabs.iter().enumerate() {
-7006 +             for (make_app_icon::S, (label, val)) in tabs.iter().enumerate() {
+7797 -             for (i, (label, val)) in tabs.iter().enumerate() {
+7797 +             for (make_app_icon::S, (label, val)) in tabs.iter().enumerate() {
      |
 help: if this is intentional, prefix it with an underscore
      |
-7006 |             for (_i, (label, val)) in tabs.iter().enumerate() {
+7797 |             for (_i, (label, val)) in tabs.iter().enumerate() {
      |                  +
 
 warning: variable does not need to be mutable
-     --> src\main.rs:10637:13
+     --> src\main.rs:11683:13
       |
-10637 |         let mut removed = false;
+11683 |         let mut removed = false;
       |             ----^^^^^^^
       |             |
       |             help: remove this `mut`
 
-warning: unused variable: `db`
-     --> src\main.rs:12317:57
+warning: value assigned to `content_h` is never read
+     --> src\main.rs:12435:29
       |
-12317 | ...                   if let Some(db) = &self.logdb {
-      |                                   ^^ help: if this is intentional, prefix it with an underscore: `_db`
+12435 |         let mut content_h = 0.0_f32;
+      |                             ^^^^^^^ this value is reassigned later and never used
+...
+12450 |         content_h = child.min_rect().height();
+      |         ------------------------------------- `content_h` is overwritten here before the previous value is read
+      |
+      = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
 
 warning: variable does not need to be mutable
-     --> src\main.rs:13306:46
+     --> src\main.rs:14422:46
       |
-13306 | ...                   let (mut bg_style, mut bg_alpha) = {
+14422 | ...                   let (mut bg_style, mut bg_alpha) = {
       |                            ----^^^^^^^^
       |                            |
       |                            help: remove this `mut`
 
 warning: unused variable: `client`
-     --> src\main.rs:14761:13
+     --> src\main.rs:15907:13
       |
-14761 |         let client = download::new_client();
+15907 |         let client = download::new_client();
       |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_client`
 
 warning: variable does not need to be mutable
-     --> src\main.rs:17169:13
+     --> src\main.rs:18862:13
       |
-17169 |         let mut v = m.entry(key.to_string()).or_insert_with(|| def.to_string());
+18862 |         let mut v = m.entry(key.to_string()).or_insert_with(|| def.to_string());
       |             ----^
       |             |
       |             help: remove this `mut`
 
 warning: variable does not need to be mutable
-     --> src\main.rs:17182:13
+     --> src\main.rs:18875:13
       |
-17182 |         let mut v = m.entry(key.to_string()).or_insert_with(|| def.to_string());
+18875 |         let mut v = m.entry(key.to_string()).or_insert_with(|| def.to_string());
       |             ----^
       |             |
       |             help: remove this `mut`
 
 warning: variable does not need to be mutable
-     --> src\main.rs:17199:13
+     --> src\main.rs:18892:13
       |
-17199 |         let mut v = m.entry(key.to_string()).or_insert_with(|| def.to_string());
+18892 |         let mut v = m.entry(key.to_string()).or_insert_with(|| def.to_string());
       |             ----^
       |             |
       |             help: remove this `mut`
 
 warning: variable does not need to be mutable
-     --> src\main.rs:17217:13
+     --> src\main.rs:18910:13
       |
-17217 |         let mut v = m.entry(key.to_string()).or_insert_with(|| def.to_string());
+18910 |         let mut v = m.entry(key.to_string()).or_insert_with(|| def.to_string());
       |             ----^
       |             |
       |             help: remove this `mut`
 
 warning: function `java_required` is never used
-   --> src\main.rs:515:4
+   --> src\main.rs:517:4
     |
-515 | fn java_required(mc: Option<&str>) -> &'static str {
+517 | fn java_required(mc: Option<&str>) -> &'static str {
     |    ^^^^^^^^^^^^^
     |
     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
 
 warning: function `extract_zip_to` is never used
-   --> src\main.rs:533:4
+   --> src\main.rs:535:4
     |
-533 | fn extract_zip_to(zip_path: &std::path::Path, dest: &std::path::Path) -> Result<usize, String> {
+535 | fn extract_zip_to(zip_path: &std::path::Path, dest: &std::path::Path) -> Result<usize, String> {
     |    ^^^^^^^^^^^^^^
 
 warning: fields `path`, `file_name`, `kind`, `mc_version`, and `in_zip` are never read
-   --> src\main.rs:566:5
+   --> src\main.rs:568:5
     |
-564 | struct DetectedCore {
+566 | struct DetectedCore {
     |        ------------ fields in this struct
-565 |     /// 实际路径（zip 整合包内条目时为 zip 文件路径）
-566 |     path: std::path::PathBuf,
+567 |     /// 实际路径（zip 整合包内条目时为 zip 文件路径）
+568 |     path: std::path::PathBuf,
     |     ^^^^
-567 |     /// 文件名（zip 整合包内为 zip 内条目路径，如 subdir/server.jar）
-568 |     file_name: String,
+569 |     /// 文件名（zip 整合包内为 zip 内条目路径，如 subdir/server.jar）
+570 |     file_name: String,
     |     ^^^^^^^^^
-569 |     /// 核心类型：Vanilla / Paper / Fabric / Forge / NeoForge / Spigot / Unknown
-570 |     kind: String,
+571 |     /// 核心类型：Vanilla / Paper / Fabric / Forge / NeoForge / Spigot / Unknown
+572 |     kind: String,
     |     ^^^^
-571 |     /// MC 版本（尽力提取，可能为 None）
-572 |     mc_version: Option<String>,
+573 |     /// MC 版本（尽力提取，可能为 None）
+574 |     mc_version: Option<String>,
     |     ^^^^^^^^^^
 ...
-576 |     in_zip: bool,
+578 |     in_zip: bool,
     |     ^^^^^^
     |
     = note: `DetectedCore` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
 
 warning: variant `Install` is never constructed
-   --> src\main.rs:632:5
+   --> src\main.rs:636:5
     |
-630 | enum ModCardAction {
+634 | enum ModCardAction {
     |      ------------- variant in this enum
-631 |     None,
-632 |     Install,
+635 |     None,
+636 |     Install,
     |     ^^^^^^^
 
 warning: fields `backup_working` and `players_refresh_seq` are never read
-    --> src\main.rs:1121:5
+    --> src\main.rs:1160:5
      |
-1082 | struct ServerRuntime {
+1121 | struct ServerRuntime {
      |        ------------- fields in this struct
 ...
-1121 |     backup_working: bool,
+1160 |     backup_working: bool,
      |     ^^^^^^^^^^^^^^
 ...
-1175 |     players_refresh_seq: u64,
+1214 |     players_refresh_seq: u64,
      |     ^^^^^^^^^^^^^^^^^^^
 
 warning: field `err_notified` is never read
-    --> src\main.rs:1376:5
+    --> src\main.rs:1415:5
      |
-1368 | struct TunnelRuntime {
+1407 | struct TunnelRuntime {
      |        ------------- field in this struct
 ...
-1376 |     err_notified: bool,
+1415 |     err_notified: bool,
      |     ^^^^^^^^^^^^
 
-warning: fields `frp_tx`, `title_drag_start`, and `tray_quit` are never read
-    --> src\main.rs:1426:5
+warning: fields `frp_tx`, `title_drag_start`, `tray_quit`, `player_prop_name`, `player_prop_gamemode`, and `player_prop_op` are never read
+    --> src\main.rs:1465:5
      |
-1404 | struct App {
+1443 | struct App {
      |        --- fields in this struct
 ...
-1426 |     frp_tx: std::sync::mpsc::Sender<Result<process::ManagedProcess, String>>,
+1465 |     frp_tx: std::sync::mpsc::Sender<Result<process::ManagedProcess, String>>,
      |     ^^^^^^
 ...
-1508 |     title_drag_start: Option<egui::Pos2>,
+1547 |     title_drag_start: Option<egui::Pos2>,
      |     ^^^^^^^^^^^^^^^^
 ...
-1531 |     tray_quit: std::sync::Arc<std::sync::atomic::AtomicBool>,
+1588 |     tray_quit: std::sync::Arc<std::sync::atomic::AtomicBool>,
      |     ^^^^^^^^^
+...
+1670 |     player_prop_name: String,
+     |     ^^^^^^^^^^^^^^^^
+1671 |     /// 玩家属性（阶段C）：目标游戏模式
+1672 |     player_prop_gamemode: String,
+     |     ^^^^^^^^^^^^^^^^^^^^
+1673 |     /// 玩家属性（阶段C）：是否 OP
+1674 |     player_prop_op: bool,
+     |     ^^^^^^^^^^^^^^
 
 warning: methods `start_frp_all` and `stop_frp_all` are never used
-    --> src\main.rs:3401:8
+    --> src\main.rs:3516:8
      |
-1712 | impl App {
+1779 | impl App {
      | -------- methods in this implementation
 ...
-3401 |     fn start_frp_all(&mut self) {
+3516 |     fn start_frp_all(&mut self) {
      |        ^^^^^^^^^^^^^
 ...
-3520 |     fn stop_frp_all(&mut self) {
+3635 |     fn stop_frp_all(&mut self) {
      |        ^^^^^^^^^^^^
 
 warning: function `w_launch_rel` is never used
-    --> src\main.rs:4287:4
+    --> src\main.rs:4469:4
      |
-4287 | fn w_launch_rel(entry: &str) -> String {
+4469 | fn w_launch_rel(entry: &str) -> String {
      |    ^^^^^^^^^^^^
 
 warning: constant `DEFAULT_FRPC_TOML` is never used
-    --> src\main.rs:4734:7
+    --> src\main.rs:5044:7
      |
-4734 | const DEFAULT_FRPC_TOML: &str = "\
+5044 | const DEFAULT_FRPC_TOML: &str = "\
      |       ^^^^^^^^^^^^^^^^^
 
 warning: function `primary_screen_size` is never used
-    --> src\main.rs:4958:4
+    --> src\main.rs:5527:4
      |
-4958 | fn primary_screen_size() -> Option<(f32, f32)> {
+5527 | fn primary_screen_size() -> Option<(f32, f32)> {
      |    ^^^^^^^^^^^^^^^^^^^
 
+warning: method `ui_players_props` is never used
+    --> src\main.rs:9449:8
+     |
+7305 | impl App {
+     | -------- method in this implementation
+...
+9449 |     fn ui_players_props(&mut self, ui: &mut egui::Ui, idx: usize) {
+     |        ^^^^^^^^^^^^^^^^
+
 warning: variant `BackupDone` is never constructed
-     --> src\main.rs:13713:5
+     --> src\main.rs:14829:5
       |
-13707 | enum PluginEvt {
+14823 | enum PluginEvt {
       |      --------- variant in this enum
 ...
-13713 |     BackupDone(String, String, i64),
+14829 |     BackupDone(String, String, i64),
       |     ^^^^^^^^^^
 
 warning: function `write_frpc_toml_file` is never used
-     --> src\main.rs:16472:4
+     --> src\main.rs:18165:4
       |
-16472 | fn write_frpc_toml_file(
+18165 | fn write_frpc_toml_file(
       |    ^^^^^^^^^^^^^^^^^^^^
 
 warning: function `sanitize_toml_str` is never used
-     --> src\main.rs:16502:4
+     --> src\main.rs:18195:4
       |
-16502 | fn sanitize_toml_str(s: &str) -> String {
+18195 | fn sanitize_toml_str(s: &str) -> String {
       |    ^^^^^^^^^^^^^^^^^
 
 warning: function `parse_frp_local_port` is never used
-     --> src\main.rs:16566:4
+     --> src\main.rs:18259:4
       |
-16566 | fn parse_frp_local_port(cfg: &str) -> Option<u16> {
+18259 | fn parse_frp_local_port(cfg: &str) -> Option<u16> {
       |    ^^^^^^^^^^^^^^^^^^^^
 
 warning: field `files` is never read
@@ -538,13 +988,19 @@ warning: function `dir_size` is never used
     |        ^^^^^^^^
 
 warning: method `release_gdi` is never used
-   --> src\backdrop.rs:152:8
+   --> src\backdrop.rs:161:8
     |
 123 | impl BackdropCapture {
     | -------------------- method in this implementation
 ...
-152 |     fn release_gdi(&mut self) {}
+161 |     fn release_gdi(&mut self) {}
     |        ^^^^^^^^^^^
+
+warning: function `find_config_for` is never used
+   --> src\crashscan.rs:534:4
+    |
+534 | fn find_config_for(dir: &Path, mod_id: &str) -> Option<String> {
+    |    ^^^^^^^^^^^^^^^
 
 warning: field `id` is never read
   --> src\logdb.rs:18:9
@@ -618,6 +1074,12 @@ warning: field `name` is never read
     |
     = note: `ModrinthVersion` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
 
+warning: function `translate_text_fallback` is never used
+   --> src\modrinth.rs:609:8
+    |
+609 | pub fn translate_text_fallback(text: &str) -> Result<String, String> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^
+
 warning: fields `events` and `resources` are never read
    --> src\plugins.rs:136:9
     |
@@ -668,6 +1130,26 @@ warning: function `sanitize_version` is never used
 271 | pub fn sanitize_version(version: &str) -> String {
     |        ^^^^^^^^^^^^^^^^
 
+warning: method `is_plugin_capable` is never used
+  --> src\serverinfo.rs:63:12
+   |
+33 | impl PlatformKind {
+   | ----------------- method in this implementation
+...
+63 |     pub fn is_plugin_capable(self) -> bool {
+   |            ^^^^^^^^^^^^^^^^^
+
+warning: field `main_jar` is never read
+  --> src\serverinfo.rs:96:9
+   |
+89 | pub struct PlatformInfo {
+   |            ------------ field in this struct
+...
+96 |     pub main_jar: Option<String>,
+   |         ^^^^^^^^
+   |
+   = note: `PlatformInfo` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
 warning: fields `warn` and `ok` are never read
   --> src\spark_analysis.rs:34:9
    |
@@ -683,34 +1165,34 @@ warning: fields `warn` and `ok` are never read
    = note: `OverviewCard` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
 
 warning: variable `S` should have a snake case name
-    --> src\main.rs:5194:25
+    --> src\main.rs:5790:25
      |
-5194 | fn make_theme_icon_rgba(S: usize) -> Vec<u8> {
+5790 | fn make_theme_icon_rgba(S: usize) -> Vec<u8> {
      |                         ^ help: convert the identifier to snake case (notice the capitalization): `s`
      |
      = note: `#[warn(non_snake_case)]` (part of `#[warn(nonstandard_style)]`) on by default
 
 warning: unused return value of `Ui::selectable_label` that must be used
-     --> src\main.rs:14836:21
+     --> src\main.rs:15998:21
       |
-14836 |                     ui.selectable_label(true, "Modrinth");
+15998 |                     ui.selectable_label(true, "Modrinth");
       |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
       |
       = note: You should check if the user clicked this with `if ui.selectable_label(…).clicked() { … } 
       = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default
 help: use `let _ = ...` to ignore the resulting value
       |
-14836 |                     let _ = ui.selectable_label(true, "Modrinth");
+15998 |                     let _ = ui.selectable_label(true, "Modrinth");
       |                     +++++++
 
 warning: call to `.clone()` on a reference in this situation does nothing
-     --> src\main.rs:14850:60
+     --> src\main.rs:16012:60
       |
-14850 |                         if ui.selectable_label(tags == t, t.clone()).clicked() {
+16012 |                         if ui.selectable_label(tags == t, t.clone()).clicked() {
       |                                                            ^^^^^^^^ help: remove this redundant call
       |
       = note: the type `str` does not implement `Clone`, so calling `clone` on `&str` copies the reference, which does not do anything and can be removed
       = note: `#[warn(noop_method_call)]` on by default
 
-warning: `xmst` (bin "xmst") generated 74 warnings (run `cargo fix --bin "xmst" -p xmst` to apply 40 suggestions)
-    Finished `release` profile [optimized] target(s) in 3m 07s
+warning: `xmst` (bin "xmst") generated 91 warnings (run `cargo fix --bin "xmst" -p xmst` to apply 51 suggestions)
+    Finished `release` profile [optimized] target(s) in 5m 26s

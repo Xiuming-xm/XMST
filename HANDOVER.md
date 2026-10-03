@@ -16,6 +16,16 @@ AIGC:
 > **2026-09-29 发布策略变更**：构建产出由双 exe 改为单 exe，命名 `dist\XMST-<版本号>.exe`（版本号取 Cargo.toml version），不再产出双 exe。
 ## 最近变更记录
 
+- 2026-10-03（第十七轮：夜间模式图标确认 + 目录打开行为回稳）：
+  1. **夜间模式图标**：确认右上角主题按钮月亮图标已为**完整圆月**（`circle_filled` 实心圆，半径 5.6，无月牙缺口），交叉淡入淡出与主题色保留；本轮无需再改。
+  2. **「打开所在目录」行为回稳（目录问题按用户要求不动）**：`spawn_reveal()` 由 explorer.exe 直开优先**调回 `cmd /C start` 优先**——目录 `cmd /C start "" <dir>`、文件 `cmd /C start "" explorer.exe /select,<path>`，显式 `current_dir(sane_cwd())` + 空标准句柄 + `CREATE_NO_WINDOW`，与旧版 dist（E163C1A6，目录打开正常）行为一致；explorer 直开仅作兜底。目录无法打开问题本身维持现状（已交接 Deepseek 处理，本轮不动）。
+  3. **产物**：`dist\XMST-0.1.0-alpha.exe` SHA256 `2826BCEE…`（15,515,136 B；增量 release 3m12s，C 盘 target `C:\Users\xiumi\AppData\Local\Temp\xmst-target` 构建，避开 F 盘 ACL）；dist 旧版备份 `F:\XMST\dist\backup\20261003_131314\XMST-0.1.0-alpha.exe.prev`。
+
+  1. **右上角主题图标改圆月**：亮/暗切换按钮的月亮图标由「新月/月牙（外圆减偏移内圆多边形）」改为**完整圆月**——`circle_filled` 实心圆（半径 5.6），保留交叉淡入淡出与主题色；太阳图标（描边圆+8 光线）与自定义三态（调色板）不变。
+  2. **「打开所在目录」全部入口统一修复**：新增模块级 `spawn_reveal()`，目录走 `cmd /C start "" <dir>`、文件走 `cmd /C start "" explorer.exe /select,<path>`（与 `open_folder` 首选同路，实测最稳），显式 `current_dir(sane_cwd())` + 空标准句柄，避开 GUI 进程「当前目录失效 / 标准句柄缺失」导致的 explorer 子进程 0xc0000142；spawn 失败再退化为 explorer.exe 直接拉起。原 `explorer_select`（带 CREATE_NO_WINDOW + 整串参数，注释已证易触发 0xc0000142）、`reveal_in_explorer`（缺 current_dir/空句柄）、`open_file_location` 三处统一委托 `spawn_reveal`；覆盖调用点：Java 所在目录、下载历史/自定义目录、文件浏览器右键「打开所在目录」、崩溃分析「跳转到该位置」。
+  3. **产物**：`dist\XMST-0.1.0-alpha.exe` SHA256 `E163C1A6C30405143F7B504C7DA3CC4B16702046A6A62892CAC2580E90609270`（15,499,776 B；增量 release 构建）。源码备份 `F:\XMST\backup\20261003_035334\`（main.rs/theme.rs/features.rs .bak）；dist 旧版备份 `F:\XMST\dist\backup\20261003_041042\XMST-0.1.0-alpha.exe.prev`。
+
+
 - 2026-10-03（第十五轮：崩溃跳转 / 弹窗可缩放 / 快照过滤 / 页签动效 / 折叠卡顿根因 / 卡片与预览精简）：
   1. **崩溃分析可跳转（用户要求）**：`crashscan::Cause` 新增 `path`（相对服务器目录）——JSON 配置损坏类结论会在 `config/`（含一层子目录）里按模组 id 模糊查找对应配置并给出相对路径，找不到则回退到 `config` 目录；EULA → `eula.txt`，端口占用 → `server.properties`。弹窗里显示 `📄 路径` + **「跳转到该位置」**（资源管理器定位/打开，新增 `reveal_in_explorer()`）。
   2. **弹窗可缩放**：为 16 个 `egui::Window`（创建新服务器、删除/重命名、文件编辑、隧道配置、确认类弹窗等）统一加 `.resizable(true)`。

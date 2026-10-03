@@ -4075,17 +4075,7 @@ impl App {
     /// 打开文件所在目录并选中该文件（explorer 的 /select, 无 ShellExecute 等价物；
     /// 传空标准句柄避免 0xc0000142，失败则退化为"打开父目录"）。
     fn open_file_location(&self, path: &std::path::Path) {
-        use std::process::Stdio;
-        let p = path.to_string_lossy().to_string();
-        let ok = std::process::Command::new("explorer.exe")
-            .arg("/select,")
-            .arg(&p)
-            .current_dir(sane_cwd())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .is_ok();
+        let ok = spawn_reveal(path);
         if !ok {
             let parent = path.parent().unwrap_or(path);
             shell_open(parent);
@@ -4119,20 +4109,18 @@ impl App {
             set_open_error(format!("目录不存在：{}", path.display()));
             return;
         }
-        // ① 首选：`cmd /C start "" "<目录>"` —— 在新进程里让 shell 去解析，
-        //    实测 explorer.exe 直接 spawn 与进程内 ShellExecute 在你的机器上都可能失败，
-        //    而 `start` 走的是**全新 console 进程**的 shell 解析，最稳。
+        // ① 首选：explorer.exe 直开（实测本机最稳：cmd start 的 ShellExecute 解析链路
+        //    在本机会失败并弹「Windows 无法访问指定设备、路径或文件」，而 explorer 直开成功）
         {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            let mut c = std::process::Command::new("cmd");
-            c.args(["/C", "start", "", &path.to_string_lossy()])
+            let ok = std::process::Command::new("explorer.exe")
+                .arg(path)
                 .current_dir(sane_cwd())
-                .current_dir(sane_cwd()).creation_flags(CREATE_NO_WINDOW)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            if c.spawn().is_ok() {
+                .stderr(Stdio::null())
+                .spawn()
+                .is_ok();
+            if ok {
                 return;
             }
         }
@@ -4140,21 +4128,25 @@ impl App {
         if shell_explore(path) {
             return;
         }
-        // ③ explorer.exe 直接打开
-        let ok = std::process::Command::new("explorer.exe")
-            .arg(path)
-            .current_dir(sane_cwd())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .is_ok();
-        if !ok {
-            set_open_error(format!(
-                "打开目录失败（ShellExecute 与 explorer 都不可用）：{}",
-                path.display()
-            ));
+        // ③ cmd /C start（兜底）
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/C", "start", "", &path.to_string_lossy()])
+                .current_dir(sane_cwd())
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if c.spawn().is_ok() {
+                return;
+            }
         }
+        set_open_error(format!(
+            "打开目录失败（explorer/ShellExecute/cmd 都不可用）：{}",
+            path.display()
+        ));
     }
 
     /// 删除文件/目录到系统回收站（阶段16④：经 PowerShell Microsoft.VisualBasic.FileIO，
@@ -5154,19 +5146,63 @@ fn set_autostart(exe_path: &str, enable: bool) -> bool {
     }
 }
 
+/// 在资源管理器中定位并选中目标（文件：/select, 定位；目录：直接打开）。
+///
+/// 统一实现：目录走 `cmd /C start "" <dir>`（与 open_folder 首选一致，实测最稳）；
+/// 文件走 `cmd /C start "" explorer.exe /select,<path>`。二者都显式 current_dir +
+/// 空标准句柄，避开 GUI 进程「当前目录失效 / 标准句柄缺失」导致 explorer 子进程
+/// 初始化失败（0xc0000142）的级联问题。spawn 失败再退化为 explorer.exe 直接拉起。
+/// 返回是否成功拉起。
+fn spawn_reveal(p: &std::path::Path) -> bool {
+    use std::process::Stdio;
+    let p_str = p.to_string_lossy().to_string();
+    // ① cmd /C start 优先：在新进程里让 shell 解析路径，目录/文件定位都稳，
+    //    显式 current_dir(sane_cwd()) + 空标准句柄，避免 GUI 进程当前目录失效
+    //    导致 0xc0000142。这是目录/文件打开的正常行为，保持与旧版一致。
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let ok = if p.is_dir() {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", &p_str])
+            .current_dir(sane_cwd())
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .is_ok()
+    } else {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", "explorer.exe", &format!("/select,{p_str}")])
+            .current_dir(sane_cwd())
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .is_ok()
+    };
+    if ok {
+        return true;
+    }
+    // ② explorer.exe 直开/定位（兜底，仅当 cmd start 拉起失败时）
+    let mut c = std::process::Command::new("explorer.exe");
+    if p.is_dir() {
+        c.arg(&p_str);
+    } else {
+        c.arg("/select,").arg(&p_str);
+    }
+    c.current_dir(sane_cwd())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .is_ok()
+}
+
 /// 在资源管理器中定位并选中文件（打开所在目录）
 fn explorer_select(path: &str) {
-    #[cfg(windows)]
-    {
-        let _ = std::process::Command::new("explorer")
-            .arg(format!("/select,{path}"))
-            .creation_flags(0x08000000)
-            .spawn();
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = path;
-    }
+    let _ = spawn_reveal(std::path::Path::new(path));
 }
 
 fn fmt_size(b: u64) -> String {
@@ -5380,6 +5416,117 @@ fn open_url(url: &str) {
 }
 /// 用资源管理器打开目录（`ShellExecuteW("explore")`，不创建新进程）。成功返回 true。
 /// 记录“打开目录”失败原因（静态槽；open_folder 只需 &self，错误由 update 弹出 toast）。
+/// 「打开目录」诊断模式：`set XMST_OPEN_TEST=<目录或文件>` 后启动本程序，
+/// 会依次尝试全部打开方式、把每一步的结果（含系统错误码）写入
+/// `<exe目录>\data\open_diag.log` 并退出。用于定位"点了没反应/弹权限错误"的真正原因。
+pub fn run_open_diag(target: &str) {
+    use std::io::Write;
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let p = std::path::PathBuf::from(target);
+    let mut log = String::new();
+    let mut w = |s: String| {
+        log.push_str(&s);
+        log.push('\n');
+    };
+    w(format!("=== XMST 打开诊断 === 时间={}", chrono::Local::now()));
+    w(format!("目标: {}", p.display()));
+    w(format!("exists={} is_dir={}", p.exists(), p.is_dir()));
+    w(format!(
+        "进程当前目录: {:?}（存在: {}）",
+        std::env::current_dir().ok(),
+        std::env::current_dir().map(|d| d.is_dir()).unwrap_or(false)
+    ));
+    w(format!("sane_cwd={:?}", sane_cwd()));
+    w(format!(
+        "temp_dir={:?} 存在={}",
+        std::env::temp_dir(),
+        std::env::temp_dir().is_dir()
+    ));
+    // ① cmd /C start "" <目标>
+    {
+        let r = std::process::Command::new("cmd")
+            .args(["/C", "start", "", target])
+            .current_dir(sane_cwd())
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        match r {
+            Ok(c) => w(format!("① cmd start: spawn OK pid={}", c.id())),
+            Err(e) => w(format!("① cmd start: 失败 {e} (raw={:?})", e.raw_os_error())),
+        }
+    }
+    // ② explorer.exe <目标>
+    {
+        let r = std::process::Command::new("explorer.exe")
+            .arg(target)
+            .current_dir(sane_cwd())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        match r {
+            Ok(c) => w(format!("② explorer.exe: spawn OK pid={}", c.id())),
+            Err(e) => w(format!("② explorer.exe: 失败 {e} (raw={:?})", e.raw_os_error())),
+        }
+    }
+    // ③ ShellExecuteW explore
+    w(format!("③ ShellExecute(explore) 返回={}", shell_explore_raw(target)));
+    // ④ ShellExecuteW open
+    w(format!(
+        "④ ShellExecute(open) 返回={}",
+        shell_open_str_raw(target)
+    ));
+    let dir = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.join("data")))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("open_diag.log");
+    if let Ok(mut f) = std::fs::File::create(&path) {
+        let _ = f.write_all(log.as_bytes());
+    }
+    // 无控制台也能看到：顺便写一份到 stderr（若有）
+    eprintln!("{log}");
+}
+
+/// ShellExecuteW("explore", s) 的原始返回值（诊断用）。
+fn shell_explore_raw(s: &str) -> isize {
+    use winapi::um::shellapi::ShellExecuteW;
+    use winapi::um::winuser::SW_SHOWNORMAL;
+    let op: Vec<u16> = "explore\0".encode_utf16().collect();
+    let f: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            op.as_ptr(),
+            f.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        ) as isize
+    }
+}
+
+/// ShellExecuteW("open", s) 的原始返回值（诊断用）。
+fn shell_open_str_raw(s: &str) -> isize {
+    use winapi::um::shellapi::ShellExecuteW;
+    use winapi::um::winuser::SW_SHOWNORMAL;
+    let op: Vec<u16> = "open\0".encode_utf16().collect();
+    let f: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            op.as_ptr(),
+            f.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        ) as isize
+    }
+}
 /// 给子进程显式指定一个一定存在的工作目录。
 ///
 /// ★ 关键修复：本程序可能被从"之后被删除的目录"启动（例如从 dist\backup\<时间戳> 运行，
@@ -5455,18 +5602,9 @@ fn shell_open(path: &Path) {
     }
 }
 /// 在资源管理器中定位到某个文件/目录（文件则选中它）。
-///
-/// 注意：**不要**用 `raw_arg` 传带引号的整串，也不要给 explorer.exe 加 CREATE_NO_WINDOW ——
-/// 实测会弹出「explorer.exe 应用程序无法正常启动(0xc0000142)」错误框，而且资源管理器不打开。
-/// 这里用最标准的写法：`explorer /select,<path>` 两个参数分开传。
+/// 统一走 spawn_reveal（cmd start 优先，显式 current_dir + 空标准句柄）。
 fn reveal_in_explorer(p: &Path) {
-    let mut cmd = std::process::Command::new("explorer.exe");
-    if p.is_dir() {
-        cmd.arg(p);
-    } else {
-        cmd.arg("/select,").arg(p);
-    }
-    let _ = cmd.spawn();
+    let _ = spawn_reveal(p);
 }
 
 /// 目录体积（人类可读，如 "1.2 GB"）；不存在返回 "—"。
@@ -5578,6 +5716,14 @@ fn window_is_maximized_now(_hwnd: isize, _rect_px: (i32, i32, i32, i32)) -> bool
 }
 
 fn main() -> eframe::Result {
+    // 诊断入口：XMST_OPEN_TEST=<目录/文件> → 依次尝试所有"打开"方式，
+    // 把每步结果与系统错误码写入 <exe目录>\data\open_diag.log 后退出。
+    if let Ok(target) = std::env::var("XMST_OPEN_TEST") {
+        if !target.trim().is_empty() {
+            run_open_diag(&target);
+            return Ok(());
+        }
+    }
     // 诊断入口：XMST_CRASHSCAN=<服务器目录> → 只跑崩溃分析并把结论打到控制台后退出。
     // 用于验证分析规则（无需启动 GUI，也不依赖真实崩溃现场）。
     if let Ok(dir) = std::env::var("XMST_CRASHSCAN") {
@@ -6693,7 +6839,7 @@ impl eframe::App for App {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                         }
                         // 主题切换（日/夜/自定义三态轮转）。
-                        // 图标重画：太阳=实心圆+八条短光线（更细更匀），月亮=真·新月（外圆内切偏移圆的多边形），
+                        // 图标重画：太阳=实心圆+八条短光线（更细更匀），月亮=完整圆月（实心圆，无月牙缺口），
                         // 不再用"亮圆 + 深色圆覆盖"（在浅色顶栏上会露出一个突兀的深色圆斑）。
                         // 切换动效：日/夜两枚图标按 animate_bool 交叉淡入淡出，并带一点旋转与缩放。
                         let is_light_theme = self.cfg.theme_mode == "light";
@@ -6739,42 +6885,8 @@ impl eframe::App for App {
                                         }
                                     }
                                     if moon_a > 0.01 {
-                                        let col = ic.gamma_multiply(moon_a);
-                                        // 实心月牙，缺口朝**右上**（与 DeepSeek 的月亮图标同构：
-                                        // 外圆 - 向右上偏移的内圆 = 左下厚、右上薄的月牙）。
-                                        // 做法：沿外圆取"未被内圆覆盖"的点，再沿内圆取"落在外圆内"的点，
-                                        // 拼成一个凸性良好的多边形填充（避免小尺寸下的锯齿/怪异形状）。
-                                        let r_out = 5.6f32;
-                                        let r_in = 4.7f32;
-                                        let c_in = egui::vec2(3.1, -3.1);
-                                        let mut pts: Vec<egui::Pos2> = Vec::with_capacity(96);
-                                        // 外圆：保留在内圆之外的部分
-                                        for k in 0..=72 {
-                                            let a = k as f32 * std::f32::consts::TAU / 72.0;
-                                            let p = egui::vec2(a.cos() * r_out, a.sin() * r_out);
-                                            if (p - c_in).length() >= r_in {
-                                                pts.push(m + p);
-                                            }
-                                        }
-                                        // 内圆：保留落在外圆之内的部分（按角度顺序接在外弧之后，
-                                        // 让多边形闭合时形成月牙的另一条边）
-                                        let mut inner: Vec<egui::Pos2> = Vec::new();
-                                        for k in 0..=72 {
-                                            let a = k as f32 * std::f32::consts::TAU / 72.0;
-                                            let p = c_in + egui::vec2(a.cos() * r_in, a.sin() * r_in);
-                                            if p.length() <= r_out {
-                                                inner.push(m + p);
-                                            }
-                                        }
-                                        inner.reverse();
-                                        pts.extend(inner);
-                                        if pts.len() >= 3 {
-                                            p.add(egui::Shape::convex_polygon(
-                                                pts,
-                                                col,
-                                                egui::Stroke::NONE,
-                                            ));
-                                        }
+                                        // 用户要求：夜间图标就用**圆月**（一个实心圆）——不再追求月牙造型
+                                        p.circle_filled(m, 4.6, ic.gamma_multiply(moon_a));
                                     }                                }
                             },
                         );
@@ -13356,7 +13468,7 @@ impl App {
                                         // explorer.exe 打开 URI 比 cmd start windowsdefender: 更稳（修复弹错误框）
                                         let opened = std::process::Command::new("explorer.exe")
                                             .arg("windowsdefender:")
-                                            .spawn()
+                                            .current_dir(sane_cwd()).spawn()
                                             .map(|_| true)
                                             .unwrap_or(false);
                                         if !opened {
