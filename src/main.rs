@@ -4224,6 +4224,15 @@ impl App {
 
     /// mods 内 .jar 检查更新：后台算 SHA1 -> Modrinth version_files 指纹匹配 -> 对比项目最新版本
     fn mod_update_check(&mut self, idx: usize, name: &str, is_disabled: bool) {
+        // 已移入「测试功能」（默认禁用）：SHA1 指纹匹配只对"官方原样构建"有效，
+        // 其余情况会误报"不在 Modrinth 上"，因此先关掉、后续按 modid 兜底重做。
+        if !features::is_enabled(&self.cfg.features, features::BETA_MOD_UPDATE) {
+            if let Some(rt) = self.runtimes.get_mut(idx) {
+                rt.mod_update_msg =
+                    "「检查更新」已移入测试功能（默认禁用）：设置 → 测试功能 → 模组检查更新".to_string();
+            }
+            return;
+        }
         if idx >= self.runtimes.len() {
             return;
         }

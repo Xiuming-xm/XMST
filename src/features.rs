@@ -97,6 +97,7 @@ pub const BETA_RATHOLE: &str = "beta.tunnel.rathole"; // 穿透内核 rathole（
 pub const BETA_REMOTE_BACKUP: &str = "beta.server.remote_backup"; // 备份远端转存（本地/UNC/WebDAV）
 pub const BETA_SPECIAL: &str = "beta.server.special"; // 特殊功能（Spark 分析）总开关【2026-10-02 移回测试功能，默认禁用】
 pub const FEATURE_SPARK: &str = "server.special.spark"; // Spark 分析子开关【随总开关 BETA_SPECIAL 显示】
+pub const BETA_MOD_UPDATE: &str = "beta.server.mod_update"; // 模组检查更新（SHA1 指纹 + modid 兜底尚未完成，默认禁用）
 
 /// ===== 阶段 3 新功能 ID（默认启用，普通功能开关） =====
 
@@ -396,6 +397,13 @@ pub const REGISTRY: &[FeatureMeta] = &[
         default_enabled: false,
         default_visible: true,
         order: 90,
+    },    FeatureMeta {
+        id: BETA_MOD_UPDATE,
+        name: "模组检查更新",
+        group: FeatureGroup::Beta,
+        default_enabled: false,
+        default_visible: true,
+        order: 91,
     },
     FeatureMeta {
         id: FEATURE_SPARK,
