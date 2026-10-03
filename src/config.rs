@@ -395,25 +395,27 @@ pub struct CrashRestartConfig {
     pub circuit_minutes: u64,
 }
 
+// 熔断参数默认值取「很短窗口」：故障循环里 3 次 / 5 分钟即可停手，
+// 不再等到 5 次 / 10 分钟（那期间服务器已被反复拉起，用户即使想停也很难打断）。
 fn default_crash_max() -> u32 {
-    5
+    3
 }
 
 fn default_crash_wait() -> u64 {
-    10
+    5
 }
 
 fn default_crash_circuit() -> u64 {
-    10
+    5
 }
 
 impl Default for CrashRestartConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_restarts: 5,
-            wait_secs: 10,
-            circuit_minutes: 10,
+            max_restarts: default_crash_max(),
+            wait_secs: default_crash_wait(),
+            circuit_minutes: default_crash_circuit(),
         }
     }
 }

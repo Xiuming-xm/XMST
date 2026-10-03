@@ -1319,6 +1319,9 @@ struct ToastMsg {
     title: String,
     body: String,
     born: std::time::Instant,
+    /// 崩溃自动重启通知：附带「取消自动重启」按钮的目标服务器序号（None = 普通通知）。
+    /// 该字段为 Some 且重启仍在倒计时时，通知不随滞留时间消失，避免用户来不及点取消。
+    cancel_server: Option<usize>,
 }
 
 impl Default for ServerRuntime {
@@ -2261,6 +2264,17 @@ impl App {
             }
         }
         self.cfg.servers.remove(idx);
+        // 删除服务器即终止它的崩溃重启循环（runtime 一并移除，待执行重启随之中断）；
+        // 通知里记录的序号会因删除而前移，这里同步清掉被删服务器的、并前移其余服务器的序号，
+        // 否则「取消自动重启」按钮可能作用到另一台服务器上
+        self.toasts.retain(|t| t.cancel_server != Some(idx));
+        for t in self.toasts.iter_mut() {
+            if let Some(i) = t.cancel_server.as_mut() {
+                if *i > idx {
+                    *i -= 1;
+                }
+            }
+        }
         self.runtimes.remove(idx);
         if self.selected_server == Some(idx) {
             self.selected_server = None;
@@ -2837,8 +2851,11 @@ impl App {
     fn handle_close_request(&mut self, ctx: &egui::Context) -> bool {
         // 关闭前把去抖中的配置立刻落盘（避免丢改动）
         self.flush_config();
-        // 已确认退出且全部服务器已停止：放�?
+        // 已确认退出且全部服务器已停止：放行
         if self.ctx_close_pending {
+            // 退出程序即终止崩溃重启循环：此时可能还有服务器是"崩溃后待重启"状态
+            // （进程已退出、不在 running 列表里），不清空会被工具在退出过程中重新拉起
+            self.clear_all_pending_crash_restarts();
             return true;
         }
         // 已确认退出但仍有服务器在停止中：继续等待
@@ -2923,6 +2940,8 @@ impl App {
     /// 返回本帧收集的插件事件（由调用方分发）。
     fn tick_server_logs(&mut self) -> Vec<PluginEvt> {
     let mut notify_queue: Vec<(String, String)> = Vec::new();
+    // 带「取消自动重启」按钮的通知（服务器序号, 标题, 正文）：循环内无法回调 self，统一在循环后投递
+    let mut cancel_restart_toasts: Vec<(usize, String, String)> = Vec::new();
     // 插件事件收集（本帧待分发；BETA_PLUGINS 关闭时保持空 Vec，零开销）
     let mut plugin_evts: Vec<PluginEvt> = Vec::new();
     // 本帧检测到的服务器退出事件：(序号, 退出码, 日志尾部, 是否有新崩溃报告)
@@ -3064,11 +3083,28 @@ impl App {
                                 "⚠️ 服务器进程已退出（exit code {code}），将在 {} 秒后自动重启（第 {n}/{} 次）",
                                 cr.wait_secs, cr.max_restarts
                             );
+                            // 同步弹通知：带「取消自动重启」按钮，倒计时期间不消失，用户想停手就能立刻停
+                            cancel_restart_toasts.push((
+                                idx,
+                                "XMST - 即将自动重启".to_string(),
+                                format!(
+                                    "{name} 将在 {} 秒后自动重启（第 {n}/{} 次）；点「取消自动重启」可立即停止",
+                                    cr.wait_secs, cr.max_restarts
+                                ),
+                            ));
                         } else {
                             rt.last_msg = format!(
                                 "⚠️ 服务器进程已退出（exit code {code}）。{} 分钟内连续崩溃达到上限（{n} 次），已熔断停止自动重启；可手动启动或等待窗口重置",
                                 cr.circuit_minutes
                             );
+                            // 熔断必须明确告知：说明次数与窗口，并指向崩溃分析入口
+                            notify_queue.push((
+                                "XMST - 已停止崩溃自动重启".to_string(),
+                                format!(
+                                    "{name} 已连续崩溃 {n} 次（{} 分钟内），停止自动重启；可点「查看崩溃分析」",
+                                    cr.circuit_minutes
+                                ),
+                            ));
                         }
                     } else {
                         rt.last_msg = format!(
@@ -3175,6 +3211,11 @@ impl App {
     // 统一投递本次收集的通知（循环结束后避免借用冲突）桌面弹窗 + 工具内通知同步
     for (title, body) in notify_queue {
         self.notify(&title, &body);
+    }
+    // 已计划崩溃重启的通知：带「取消自动重启」按钮（托盘态只入列表，恢复窗口后即可见并操作）
+    for (i, title, body) in cancel_restart_toasts {
+        self.sys_toast(&title, &body);
+        self.push_toast_cancel_restart(i, &title, &body);
     }
     // 退出后的快照判定（正常关服 → reason=stop；异常退出 → 仅在显式开启崩溃备份时才做）
     for (i, code_opt, tail, new_crash) in exit_events {
@@ -5392,7 +5433,44 @@ fn load_config(path: &Path) -> GlobalConfig {
             let _ = std::fs::write(path, json);
         }
     }
+    // 崩溃熔断参数收敛：历史上默认「5 次 / 等待 10 秒 / 窗口 10 分钟」，
+    // 故障循环里会把服务器反复拉起很久；有改动时原子回写磁盘（临时文件 → 替换）。
+    if migrate_crash_restart_defaults(&mut cfg) {
+        if let Ok(json) = serde_json::to_string_pretty(&cfg) {
+            if let Some(data_dir) = path.parent() {
+                let _ = std::fs::create_dir_all(data_dir);
+            }
+            let tmp = path.with_extension("json.tmp");
+            if std::fs::write(&tmp, json.as_bytes()).is_ok() {
+                let _ = std::fs::rename(&tmp, path);
+            }
+        }
+    }
     cfg
+}
+
+/// 崩溃熔断的旧默认值收敛（默认值见 config.rs 的 default_crash_*）。
+/// 只处理**仍等于旧默认值**的项：最大重启次数 5 → 3、崩溃后等待 10 秒 → 5 秒、
+/// 熔断窗口 10 分钟 → 5 分钟；用户显式改过的值一律保留不动。
+/// 返回是否有改动（有改动才回写配置）。
+fn migrate_crash_restart_defaults(cfg: &mut GlobalConfig) -> bool {
+    let mut changed = false;
+    for sc in cfg.servers.iter_mut() {
+        let cr = &mut sc.crash_restart;
+        if cr.max_restarts == 5 {
+            cr.max_restarts = 3;
+            changed = true;
+        }
+        if cr.wait_secs == 10 {
+            cr.wait_secs = 5;
+            changed = true;
+        }
+        if cr.circuit_minutes == 10 {
+            cr.circuit_minutes = 5;
+            changed = true;
+        }
+    }
+    changed
 }
 
 // ---------- Windows 辅助：右下角通知与开机自�?----------
@@ -5695,11 +5773,53 @@ impl App {
             title: title.to_string(),
             body: body.to_string(),
             born: std::time::Instant::now(),
+            cancel_server: None,
         });
         // 最多同时保�?4 条，超出丢弃最旧的
         if self.toasts.len() > 4 {
             self.toasts.remove(0);
         }
+    }
+
+    /// 崩溃自动重启通知：与普通通知一样弹出，但附带「取消自动重启」按钮，
+    /// 并且在待执行重启期间不自动消失（否则倒计时只有几秒，用户根本来不及点）。
+    fn push_toast_cancel_restart(&mut self, idx: usize, title: &str, body: &str) {
+        self.next_toast_id += 1;
+        self.toasts.push(ToastMsg {
+            id: self.next_toast_id,
+            title: title.to_string(),
+            body: body.to_string(),
+            born: std::time::Instant::now(),
+            cancel_server: Some(idx),
+        });
+        if self.toasts.len() > 4 {
+            self.toasts.remove(0);
+        }
+    }
+
+    /// 清空全部待执行的崩溃重启（不改变各服务器运行状态）。
+    /// 用于「停止/强停/删除服务器/退出程序」以及人工取消：退出时若还留着已计划的重启，
+    /// 工具会一边关服一边把崩溃过的服务器重新拉起。
+    fn clear_all_pending_crash_restarts(&mut self) {
+        for rt in self.runtimes.iter_mut() {
+            rt.crash_restart_at = None;
+        }
+    }
+
+    /// 取消某台服务器待执行的崩溃重启（用户可见操作），返回是否真的取消了。
+    /// 只清空重启计划，保留窗口内崩溃计数，熔断判定不受影响。
+    fn cancel_crash_restart(&mut self, idx: usize) -> bool {
+        let had = self
+            .runtimes
+            .get_mut(idx)
+            .map(|rt| rt.crash_restart_at.take().is_some())
+            .unwrap_or(false);
+        if had {
+            if let Some(rt) = self.runtimes.get_mut(idx) {
+                rt.last_msg = "已取消自动重启（服务器保持停止，可手动启动）".to_string();
+            }
+        }
+        had
     }
 
     /// 桌面级自绘弹窗（窗口关闭/最小化时也可见）：无边框深色卡片，右下角，6 秒自动关闭。
@@ -5795,32 +5915,64 @@ $timer.Start(); \
         let margin = 12.0_f32;
         let card_w = 320.0_f32.min(screen.width() - 2.0 * margin).max(200.0);
         let card_h = 62.0_f32;
+        // 带「取消自动重启」按钮的通知要更高：正文下面多一行倒计时 + 按钮
+        let card_h_btn = card_h + 32.0;
         let gap = 8.0_f32;
         let anim = if self.cfg.ui_animations { 0.25_f32 } else { 0.001_f32 }; // 进出动画时长（秒）；关闭动效时近似瞬时
         let total = hold + 2.0 * anim;
         // 逐条计算位置与透明度，渲染后移除过期项
-        let mut render: Vec<(u64, String, String, egui::Pos2, f32)> = Vec::new();
+        // (id, 标题, 正文, 取消按钮目标服务器, 倒计时秒数, 位置, 透明度)
+        let mut render: Vec<(
+            u64,
+            String,
+            String,
+            Option<usize>,
+            Option<u64>,
+            egui::Pos2,
+            f32,
+        )> = Vec::new();
         let mut alive: Vec<ToastMsg> = Vec::new();
-        for (i, t) in self.toasts.iter().enumerate() {
+        // 卡片自下往上堆叠：每张高度可能不同（是否带取消按钮），逐张累加而不是按下标乘固定高度
+        let mut y_bottom = screen.bottom() - margin;
+        for t in self.toasts.iter() {
             let el = now.duration_since(t.born).as_secs_f32();
-            if el > total {
-                continue; // 已过期，移除
+            // 待执行的崩溃重启倒计时：直接用 crash_restart_at 与当前时间算，不缓存、不额外分配
+            let countdown = t
+                .cancel_server
+                .and_then(|i| self.runtimes.get(i))
+                .and_then(|rt| rt.crash_restart_at)
+                .map(|at| at.saturating_duration_since(now).as_secs());
+            let pending = countdown.is_some();
+            if el > total && !pending {
+                continue; // 已过期，移除；仍在倒计时的通知保留到重启执行或被取消
             }
-            alive.push(ToastMsg { id: t.id, title: t.title.clone(), body: t.body.clone(), born: t.born });
+            alive.push(ToastMsg {
+                id: t.id,
+                title: t.title.clone(),
+                body: t.body.clone(),
+                born: t.born,
+                cancel_server: t.cancel_server,
+            });
             let alpha = if el < anim {
                 el / anim
+            } else if pending {
+                // 待执行重启：通知要一直等用户处理，倒计时期间保持完全不透明（不能淡成透明只剩可点区域）
+                1.0
             } else if el > hold + anim {
                 (total - el) / anim
             } else {
                 1.0
             };
-            let y = screen.bottom() - margin - (i as f32) * (card_h + gap) - card_h;
+            let h = if pending { card_h_btn } else { card_h };
+            let y = y_bottom - h;
             let x = match style.as_str() {
                 "fade" => screen.right() - margin - card_w,
                 _ => {
-                    // slide：从右侧滑入 / 滑出
+                    // slide：从右侧滑入 / 滑出（待执行重启期间保持停在原位）
                     let k = if el < anim {
                         el / anim
+                    } else if pending {
+                        1.0
                     } else if el > hold + anim {
                         (total - el) / anim
                     } else {
@@ -5829,10 +5981,23 @@ $timer.Start(); \
                     screen.right() - k * (card_w + margin)
                 }
             };
-            render.push((t.id, t.title.clone(), t.body.clone(), egui::pos2(x, y), alpha));
+            render.push((
+                t.id,
+                t.title.clone(),
+                t.body.clone(),
+                if pending { t.cancel_server } else { None },
+                countdown,
+                egui::pos2(x, y),
+                alpha,
+            ));
+            y_bottom = y - gap;
         }
         self.toasts = alive;
-        for (id, title, body, pos, alpha) in render {
+        // 点击取消只记录，渲染循环结束后统一处理（避免与 self.toasts 的借用冲突）
+        let mut cancel_clicked: Option<usize> = None;
+        for (id, title, body, cancel_server, countdown, pos, alpha) in render {
+            let mut clicked_here = false;
+            let bar_h = if cancel_server.is_some() { card_h_btn - 16.0 } else { card_h - 16.0 };
             egui::Area::new(egui::Id::new(("toast", id)))
                 .order(egui::Order::Foreground)
                 .fixed_pos(pos)
@@ -5851,7 +6016,7 @@ $timer.Start(); \
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 8.0;
                             // 左侧强调条（按通知类型着色）
-                            let (resp, painter) = ui.allocate_painter(egui::vec2(4.0, card_h - 16.0), egui::Sense::hover());
+                            let (resp, painter) = ui.allocate_painter(egui::vec2(4.0, bar_h), egui::Sense::hover());
                             let mut fill = egui::Color32::from_rgba_unmultiplied(0, 191, 255, (alpha * 255.0) as u8);
                             if title.contains("异常") || title.contains("失败") {
                                 fill = egui::Color32::from_rgba_unmultiplied(255, 80, 80, (alpha * 255.0) as u8);
@@ -5876,10 +6041,50 @@ $timer.Start(); \
                                     )
                                     .wrap(),
                                 );
+                                // 崩溃重启倒计时 + 取消入口：通知里就能立刻停掉这次自动重启
+                                if let (Some(_), Some(secs)) = (cancel_server, countdown) {
+                                    ui.add_space(4.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(format!("{secs} 秒后自动重启（取消）"))
+                                                .size(12.0)
+                                                .color(egui::Color32::from_rgba_unmultiplied(
+                                                    255,
+                                                    200,
+                                                    80,
+                                                    (alpha * 255.0) as u8,
+                                                )),
+                                        );
+                                        if ui
+                                            .add(egui::Button::new(RichText::new("取消自动重启").size(12.0)))
+                                            .clicked()
+                                        {
+                                            clicked_here = true;
+                                        }
+                                    });
+                                }
                             });
                         });
                     });
                 });
+            if clicked_here {
+                cancel_clicked = cancel_server;
+            }
+        }
+        // 取消操作在这里统一执行：清空待执行重启 + toast 确认（按钮所在通知随即消失）
+        if let Some(i) = cancel_clicked {
+            if self.cancel_crash_restart(i) {
+                let name = self
+                    .cfg
+                    .servers
+                    .get(i)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_default();
+                self.push_toast(
+                    "XMST - 已取消自动重启",
+                    &format!("已取消「{name}」的自动重启，服务器保持停止；需要时点「启动服务器」"),
+                );
+            }
         }
     }
 }
@@ -8353,6 +8558,9 @@ impl eframe::App for App {
                                 .collect();
                             self.confirm_close = None;
                             self.closing_exit = true;
+                            // 退出前先终止所有待执行的崩溃重启：崩溃过的服务器已不在 running 列表里，
+                            // 只停运行中的会漏掉它们，工具会在关服过程中把服务器重新拉起
+                            self.clear_all_pending_crash_restarts();
                             for i in running {
                                 self.stop_server(i);
                             }
@@ -8570,9 +8778,24 @@ impl eframe::App for App {
     }
 }
 
+/// 内容区右侧/底部统一内边距（点）。取值需大于 handle_edge_resize 的 9pt 缩放热区，
+/// 并留出滚动条自身宽度，滚动条才不会被判成窗口边缘。
+const CONTENT_EDGE_PAD: f32 = 14.0;
+
+/// 给页面内容容器补上右侧（和底部）内边距的 Frame 包装：为什么给内容留右内边距——
+/// 无边框窗口最外几像素是窗口边缘缩放的命中区（见 handle_edge_resize 的 9pt 热区），
+/// 窗口较小时右侧滚动条正好压在命中带上，拖滚动条会变成左右缩放窗口；内容整体内移即可避开。
+fn content_frame(mut frame: egui::Frame) -> egui::Frame {
+    frame.inner_margin.right = frame.inner_margin.right.max(CONTENT_EDGE_PAD);
+    frame.inner_margin.bottom = frame.inner_margin.bottom.max(CONTENT_EDGE_PAD);
+    frame
+}
+
 impl App {
     fn ui_dashboard(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default()
+            .frame(content_frame(egui::Frame::central_panel(&ctx.style())))
+            .show(ctx, |ui| {
             // 第二批：全页面 max-width 1100 左对齐（字号小时内容贴合左侧）
             let _avail = ui.available_rect_before_wrap();
             let _w = _avail.width().min(1100.0);
@@ -8991,7 +9214,9 @@ impl App {
             }
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default()
+            .frame(content_frame(egui::Frame::central_panel(&ctx.style())))
+            .show(ctx, |ui| {
             // 第二批：max-width 1100 左对齐（服务器详情页；空态/early-return 在容器内）
             let _avail = ui.available_rect_before_wrap();
             let _w = _avail.width().min(1100.0);
@@ -12324,21 +12549,71 @@ impl App {
                     }
                 });
             }
-            // 崩溃重启状态展�?
-            let rt = self.runtimes.get(idx);
-            if let Some(rt) = rt {
-                if rt.crash_count > 0 {
-                    ui.label(format!(
-                        "本窗口已连续崩溃 {} 次（上限 {}），{}",
-                        rt.crash_count,
-                        self.cfg.servers[idx].crash_restart.max_restarts,
-                        if rt.crash_restart_at.is_some() {
-                            "等待自动重启中"
-                        } else {
-                            "已熔断停止自动重启"
-                        }
-                    ));
-                }
+            // 崩溃重启状态与倒计时：先取值再画（避免与「取消」按钮的可变借用冲突）
+            let crash_count = self.runtimes.get(idx).map(|rt| rt.crash_count).unwrap_or(0);
+            let pending_secs = self
+                .runtimes
+                .get(idx)
+                .and_then(|rt| rt.crash_restart_at)
+                .map(|at| at.saturating_duration_since(std::time::Instant::now()).as_secs());
+            if crash_count > 0 {
+                ui.label(format!(
+                    "本窗口已连续崩溃 {} 次（上限 {}），{}",
+                    crash_count,
+                    self.cfg.servers[idx].crash_restart.max_restarts,
+                    if pending_secs.is_some() {
+                        "等待自动重启中"
+                    } else {
+                        "已熔断停止自动重启"
+                    }
+                ));
+            }
+            // 待执行重启：显眼倒计时 + 「取消自动重启」按钮（倒计时数字每帧由 crash_restart_at 重算）
+            if let Some(secs) = pending_secs {
+                ui.add_space(4.0);
+                egui::Frame::none()
+                    .fill(Color32::from_rgba_unmultiplied(255, 170, 60, 24))
+                    .stroke(egui::Stroke::new(
+                        1.0_f32,
+                        Color32::from_rgba_unmultiplied(255, 170, 60, 120),
+                    ))
+                    .rounding(egui::Rounding::same(6.0))
+                    .inner_margin(egui::Margin::same(8.0))
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                RichText::new(format!("⏳ {secs} 秒后自动重启（取消）"))
+                                    .strong()
+                                    .color(self.fg(Color32::from_rgb(255, 200, 80))),
+                            );
+                            if ui
+                                .add(egui::Button::new(
+                                    RichText::new("🛑 取消自动重启").strong(),
+                                ))
+                                .on_hover_text("立即清空这次待执行的重启；服务器保持停止，可随时手动启动")
+                                .clicked()
+                            {
+                                if self.cancel_crash_restart(idx) {
+                                    let name = self
+                                        .cfg
+                                        .servers
+                                        .get(idx)
+                                        .map(|s| s.name.clone())
+                                        .unwrap_or_default();
+                                    self.set_toast(format!(
+                                        "已取消「{name}」的自动重启；服务器保持停止，可手动启动"
+                                    ));
+                                    // 另弹一条通知：标题栏的 toast 文本会被截断，这里保证取消结果明确可见
+                                    self.push_toast(
+                                        "XMST - 已取消自动重启",
+                                        &format!(
+                                            "已取消「{name}」的自动重启，服务器保持停止；需要时点「启动服务器」"
+                                        ),
+                                    );
+                                }
+                            }
+                        });
+                    });
             }
             ui.separator();
         });
@@ -12585,7 +12860,9 @@ impl App {
                     });
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default()
+            .frame(content_frame(egui::Frame::central_panel(&ctx.style())))
+            .show(ctx, |ui| {
             // 第二批：max-width 1100 左对齐（内网穿透内容区，ScrollArea 移入容器内）
             let _avail = ui.available_rect_before_wrap();
             let _w = _avail.width().min(1100.0);
@@ -14671,7 +14948,9 @@ impl App {
                     });
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default()
+            .frame(content_frame(egui::Frame::central_panel(&ctx.style())))
+            .show(ctx, |ui| {
             // 第二批：max-width 1100 左对齐（设置页内容区，ScrollArea 移入容器内）
             let _avail = ui.available_rect_before_wrap();
             let _w = _avail.width().min(1100.0);
@@ -15741,7 +16020,9 @@ const MATERIAL_OWNER_FALLBACK: &str = "xmst-frosted-glass-demo";
         // 滑杆即时生效：半透明改覆盖层 alpha，模糊类重设 DWM 着色
         let mut bg_reapply: Option<f32> = None;
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(ctx.style().visuals.panel_fill))
+            .frame(content_frame(
+                egui::Frame::none().fill(ctx.style().visuals.panel_fill),
+            ))
             .show(ctx, |ui| {
                 // 第二批：max-width 1100 左对齐（插件页，ScrollArea 移入容器内）
                 let _avail = ui.available_rect_before_wrap();
@@ -17083,7 +17364,9 @@ impl App {
             return;
         }
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(ctx.style().visuals.panel_fill))
+            .frame(content_frame(
+                egui::Frame::none().fill(ctx.style().visuals.panel_fill),
+            ))
             .show(ctx, |ui| {
                 // 第二批：max-width 1100 左对齐（下载页，ScrollArea 移入容器内）
                 let _avail = ui.available_rect_before_wrap();
@@ -18023,7 +18306,9 @@ impl App {
         let mut do_clear = false;
         let mut do_export = false;
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(ctx.style().visuals.panel_fill))
+            .frame(content_frame(
+                egui::Frame::none().fill(ctx.style().visuals.panel_fill),
+            ))
             .show(ctx, |ui| {
                 let avail = ui.available_rect_before_wrap();
                 let pad = 14.0f32;
