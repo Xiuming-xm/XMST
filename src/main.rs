@@ -5520,6 +5520,7 @@ pub fn run_open_diag(target: &str) {
         std::env::current_dir().map(|d| d.is_dir()).unwrap_or(false)
     ));
     w(format!("sane_cwd={:?}", sane_cwd()));
+    w(job_info());
     w(format!(
         "temp_dir={:?} 存在={}",
         std::env::temp_dir(),
@@ -5592,6 +5593,65 @@ pub fn run_open_diag(target: &str) {
     eprintln!("{log}");
 }
 
+/// 读取本进程的 Job 归属与 Job 的 UI 限制标志（诊断用）。
+/// Job 带 JOB_OBJECT_UILIMIT_* 时，进程及其子进程无法访问作业外的 USER 句柄，
+/// 于是"打开文件夹"的请求会被资源管理器静默丢弃、ShellExecute 报 5(拒绝访问)。
+fn job_info() -> String {
+    use winapi::um::jobapi::IsProcessInJob;
+    use winapi::um::jobapi2::QueryInformationJobObject;
+    use winapi::um::processthreadsapi::GetCurrentProcess;
+    use winapi::um::winnt::{JobObjectBasicUIRestrictions, JOBOBJECT_BASIC_UI_RESTRICTIONS};
+    unsafe {
+        let mut in_job: winapi::shared::minwindef::BOOL = 0;
+        let ok = IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut in_job);
+        if ok == 0 {
+            return "Job 查询失败".to_string();
+        }
+        if in_job == 0 {
+            return "是否在 Job 中: 否（正常）".to_string();
+        }
+        let mut ui: JOBOBJECT_BASIC_UI_RESTRICTIONS = std::mem::zeroed();
+        let q = QueryInformationJobObject(
+            std::ptr::null_mut(),
+            JobObjectBasicUIRestrictions,
+            &mut ui as *mut _ as *mut winapi::ctypes::c_void,
+            std::mem::size_of::<JOBOBJECT_BASIC_UI_RESTRICTIONS>() as u32,
+            std::ptr::null_mut(),
+        );
+        if q == 0 {
+            return "是否在 Job 中: 是（UI 限制查询失败）".to_string();
+        }
+        format!(
+            "是否在 Job 中: 是；UI 限制标志=0x{:X}（0 表示无 UI 限制；非 0 会阻止与资源管理器通信）",
+            ui.UIRestrictionsClass
+        )
+    }
+}
+
+/// 统计当前桌面上的资源管理器文件夹窗口数量（校验"是否真的打开了"）。
+fn folder_window_count() -> i32 {
+    use winapi::um::winuser::{FindWindowExW, GetDesktopWindow};
+    let cls: Vec<u16> = "CabinetWClass\0".encode_utf16().collect();
+    let mut count = 0;
+    unsafe {
+        let mut h = FindWindowExW(
+            GetDesktopWindow(),
+            std::ptr::null_mut(),
+            cls.as_ptr(),
+            std::ptr::null(),
+        );
+        while !h.is_null() {
+            count += 1;
+            h = FindWindowExW(
+                GetDesktopWindow(),
+                h,
+                cls.as_ptr(),
+                std::ptr::null(),
+            );
+        }
+    }
+    count
+}
 /// ShellExecuteW 且 lpVerb = NULL（默认动词，等价于 .NET UseShellExecute=true）。
 fn shell_exec_default_raw(s: &str) -> isize {
     use winapi::um::shellapi::ShellExecuteW;
