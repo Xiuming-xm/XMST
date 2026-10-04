@@ -41,7 +41,10 @@ fn extract_java_from_bat(bat: &Path) -> Option<String> {
         if lower.starts_with("set ") {
             let rest = &line[4..];
             if let Some(eq) = rest.find('=') {
-                let key = rest[..eq].trim().to_lowercase();
+                // `set "JAVA_PATH=..."` 这种整体带引号的写法：键上的引号也要去掉，
+                // 否则键变成 `"java_path` 匹配不上，整行又被上面的 starts_with("set ") 吃掉，
+                // 分支判断根本轮不到下面的 `java.exe` 兜底 → Java 路径解析不出来。
+                let key = rest[..eq].trim().trim_matches('"').trim().to_lowercase();
                 let val = rest[eq + 1..].trim().trim_matches('"').to_string();
                 if !val.is_empty()
                     && (key == "java" || key == "java_path" || key == "java_home")
@@ -2717,6 +2720,203 @@ struct LaunchSpec {
     kind: String,
 }
 
+// ---------- 启动诊断辅助（组合④：绕过 cmd/bat 直接用 java）----------
+
+/// bat 里的「脚本目录」占位符 `%~dp0` → 无空格临时 token。
+/// 先切分参数、后回填真实路径，这样"路径含空格"时 `-Djava.io.tmpdir=<含空格的目录>\tmp`
+/// 仍然是一个完整参数，不会被空白切碎。
+const BAT_DIR_TOKEN: &str = "\u{1}XMST_BATDIR\u{1}";
+/// bat 里的「当前目录」占位符 `%CD%` → 无空格临时 token（不含结尾反斜杠）
+const BAT_CWD_TOKEN: &str = "\u{1}XMST_BATCD\u{1}";
+
+/// 从 bat 脚本里提取指定 `set "KEY=值"` 变量的值（`keys` 用纯小写，bat 变量名大小写不敏感）。
+/// 只用于诊断取值：取不到返回 None，不影响任何启动流程。
+fn extract_bat_var(bat: &Path, keys: &[&str]) -> Option<String> {
+    let content = read_text_auto_encoding(bat).ok()?.0;
+    for line in content.lines() {
+        let line = line.trim();
+        if !line.to_lowercase().starts_with("set ") {
+            continue;
+        }
+        let rest = &line[4..];
+        let Some(eq) = rest.find('=') else { continue };
+        let key = rest[..eq].trim().trim_matches('"').trim().to_lowercase();
+        if !keys.iter().any(|k| *k == key) {
+            continue;
+        }
+        let val = rest[eq + 1..].trim().trim_matches('"').trim().to_string();
+        if !val.is_empty() {
+            return Some(val);
+        }
+    }
+    None
+}
+
+/// 展开文本里形如 `%NAME%` 的环境变量（取不到就原样保留，并把名字记进 `missing`）。
+fn expand_env_placeholders(raw: &str) -> (String, Vec<String>) {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut out = String::with_capacity(raw.len());
+    let mut missing: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars.get(i).copied().unwrap_or('\0');
+        if c == '%' {
+            let mut end: Option<usize> = None;
+            let mut j = i + 1;
+            while j < chars.len() {
+                if chars.get(j).copied() == Some('%') {
+                    end = Some(j);
+                    break;
+                }
+                j += 1;
+            }
+            if let Some(e) = end {
+                let name: String = chars
+                    .get(i + 1..e)
+                    .map(|s| s.iter().collect())
+                    .unwrap_or_default();
+                let name = name.trim();
+                if !name.is_empty() {
+                    if let Ok(v) = std::env::var(name) {
+                        out.push_str(&v);
+                        i = e + 1;
+                        continue;
+                    }
+                    if !missing.iter().any(|m| m.as_str() == name) {
+                        missing.push(name.to_string());
+                    }
+                }
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    (out, missing)
+}
+
+/// 把 bat 的一段参数文本切成参数表：先展开 `%~dp0` / `%CD%`（含常见大小写写法）与其余
+/// `%NAME%` 环境变量，再按空白切分；无法展开的环境变量在返回值里回报。
+fn split_bat_args(raw: &str, dir: &Path) -> (Vec<String>, Vec<String>) {
+    let dir_sep = format!("{}\\", dir.display());
+    let dir_plain = dir.display().to_string();
+    let prepared = raw
+        .replace("%~dp0", BAT_DIR_TOKEN)
+        .replace("%~DP0", BAT_DIR_TOKEN)
+        .replace("%CD%", BAT_CWD_TOKEN)
+        .replace("%cd%", BAT_CWD_TOKEN);
+    let (expanded, missing) = expand_env_placeholders(&prepared);
+    let args: Vec<String> = expanded
+        .split_whitespace()
+        .map(|t| {
+            t.replace(BAT_DIR_TOKEN, &dir_sep)
+                .replace(BAT_CWD_TOKEN, &dir_plain)
+        })
+        .collect();
+    (args, missing)
+}
+
+/// 把「解析出的 java 值」归一成可执行文件路径：
+/// - 去掉首尾引号/空白；已是 `java.exe`/`javaw.exe` 的原样使用；
+/// - 以 `bin` 结尾（JAVA_HOME 指向 jdk\bin）→ 追加 `java.exe`；
+/// - 其它（目录 / JAVA_HOME）→ 追加 `bin\java.exe`；
+/// - 相对路径按服务器目录展开（run.bat 里常见 `.\Java21\bin\java.exe`）。
+/// 归一后路径里不含 `java` 时返回 None（避免把普通目录当程序去启动）。
+fn normalize_java_exe(raw: &str, dir: &Path) -> Option<String> {
+    let v = raw.trim().trim_matches('"').trim();
+    if v.is_empty() {
+        return None;
+    }
+    let lower = v.to_lowercase();
+    let mut p = PathBuf::from(v);
+    if lower.ends_with("java.exe") || lower.ends_with("javaw.exe") || lower.ends_with(".exe") {
+        // 已经是可执行文件，原样使用（存在性由调用方检查）
+    } else if lower.ends_with("bin") || lower.ends_with("bin\\") || lower.ends_with("bin/") {
+        p = p.join("java.exe");
+    } else {
+        p = p.join("bin").join("java.exe");
+    }
+    if p.is_relative() {
+        p = dir.join(p);
+    }
+    // 去掉路径里的 `\.\`（`.\Java21\bin\java.exe` 展开后常见），日志里更干净
+    let s = p.display().to_string().replace("\\.\\", "\\");
+    if s.to_lowercase().contains("java") {
+        Some(s)
+    } else {
+        None
+    }
+}
+
+/// 诊断输出末尾若干行 → 缩进文本（空则写出 `<empty>`；单行过长按字符截断，避免撑破窗口）。
+fn diag_lines_text(lines: &[String]) -> String {
+    if lines.is_empty() {
+        return "    <empty>".to_string();
+    }
+    let mut out = String::new();
+    for l in lines {
+        out.push_str("    ");
+        out.push_str(&truncate_str(l, 400));
+        out.push('\n');
+    }
+    out.trim_end().to_string()
+}
+
+/// 把一次诊断组合的结果块追加到报告文本，返回"是否判定为启动成功"。
+fn push_diag_block(
+    report: &mut String,
+    label: &str,
+    extra: &str,
+    outcome: Result<process::DiagOutcome, String>,
+) -> bool {
+    report.push_str(label);
+    report.push('\n');
+    if !extra.is_empty() {
+        report.push_str(extra);
+    }
+    match outcome {
+        Ok(o) => {
+            report.push_str(&format!(
+                "  结果：{} ｜ PID {} ｜ 观察 {} ms ｜ 结束时仍在运行={}\n",
+                if o.end_reason.is_success() {
+                    "启动成功"
+                } else {
+                    "未判定为启动成功"
+                },
+                o.pid,
+                o.waited_ms,
+                o.still_running
+            ));
+            report.push_str(&format!(
+                "  结束原因：{}\n",
+                o.end_reason.text(o.raw_exit_code)
+            ));
+            report.push_str(&format!("  latest.log：{}\n", o.log_change));
+            report.push_str(&format!("  stdout 首行：{}\n", o.stdout_first));
+            report.push_str(&format!(
+                "  stdout 末 {} 行：\n{}\n",
+                o.stdout_tail.len(),
+                diag_lines_text(&o.stdout_tail)
+            ));
+            report.push_str(&format!("  stderr 首行：{}\n", o.stderr_first));
+            report.push_str(&format!(
+                "  stderr 末 {} 行：\n{}\n",
+                o.stderr_tail.len(),
+                diag_lines_text(&o.stderr_tail)
+            ));
+            if !o.note.is_empty() {
+                report.push_str(&format!("  附注：{}\n", o.note));
+            }
+            report.push('\n');
+            o.end_reason.is_success()
+        }
+        Err(e) => {
+            report.push_str(&format!("  结果：spawn 失败 ｜ 原因：{e}\n"));
+            report.push_str("  stdout / stderr：<未启动>\n\n");
+            false
+        }
+    }
+}
+
 impl App {
     /// 当前界面**实际生效**的深浅（用于强调色/前景派生）。
     ///
@@ -3311,6 +3511,120 @@ impl App {
         })
     }
 
+    /// 诊断组合④用：绕过 `cmd`/`run.bat`，直接按 bat 里解析出的 java 路径与参数启动。
+    ///
+    /// 取值链与生产路径保持一致：java 走 `resolve_java_for_server`（服务器指定 → 自定义 →
+    /// run.bat 的 `JAVA_PATH`/`JAVA_HOME` → 版本匹配 → 全局 → PATH）；JVM 参数优先取 bat 的
+    /// `JVM_ARGS`（这才是 bat 自己执行的那套），核心 jar 优先取 bat 的 `SERVER_JAR`，
+    /// 都没有时按 `detect_core_jar` 扫描目录。
+    /// 返回 `(java 可执行文件, 参数列表, 取值来源说明)`；解析不出可用的 java / 核心 jar 时返回
+    /// `Err(原因)`，调用方跳过该组合并在结果里写明。
+    fn build_java_diag_spec(&self, idx: usize) -> Result<(String, Vec<String>, String), String> {
+        let spec = self
+            .build_launch_spec(idx)
+            .ok_or_else(|| "服务器下标越界".to_string())?;
+        let sc = self
+            .cfg
+            .servers
+            .get(idx)
+            .ok_or_else(|| "服务器下标越界".to_string())?
+            .clone();
+        let dir = spec.dir.clone();
+
+        // ① java 可执行文件
+        let java_src = if sc.java_home_id.is_some() {
+            "服务器指定的 Java 列表项"
+        } else if sc.java_path.is_some() {
+            "服务器自定义 Java 路径"
+        } else {
+            "run.bat 解析（JAVA / JAVA_PATH / JAVA_HOME）或按版本匹配"
+        };
+        let raw_java = resolve_java_for_server(&self.cfg, &sc);
+        let exe = normalize_java_exe(&raw_java, &dir).ok_or_else(|| {
+            format!("未能解析出可用的 java（解析结果=\"{raw_java}\"，来源={java_src}）")
+        })?;
+        let exe_path = PathBuf::from(&exe);
+        if !exe_path.exists() {
+            return Err(format!("解析出的 java 不存在：{}", exe_path.display()));
+        }
+
+        // ② JVM 参数：bat 的 JVM_ARGS 优先，其次与生产路径同一条链（服务器级 → 全局 → 推荐值）
+        let bat = dir.join("run.bat");
+        let bat_has = bat.exists();
+        let bat_jvm = if bat_has {
+            extract_bat_var(&bat, &["jvm_args", "jvmargs", "java_args"])
+        } else {
+            None
+        };
+        let jvm_from_bat = bat_jvm.is_some();
+        let jvm_raw = bat_jvm.unwrap_or_else(|| {
+            sc.jvm_args
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| {
+                    let d = self.cfg.default_jvm_args.trim().to_string();
+                    if d.is_empty() {
+                        None
+                    } else {
+                        Some(d)
+                    }
+                })
+                .unwrap_or_else(|| recommended_jvm_args(physical_memory_gb()))
+        });
+        let (mut args, missing_env) = split_bat_args(&jvm_raw, &dir);
+        // 私有临时目录（与生产路径一致）：bat 自己写了 -Djava.io.tmpdir 就不重复追加
+        if let Some(p) = &spec.priv_tmp {
+            if !args.iter().any(|a| a.contains("-Djava.io.tmpdir")) {
+                args.insert(0, format!("-Djava.io.tmpdir={}", p.display()));
+            }
+        }
+
+        // ③ 核心 jar + nogui：与 bat 的 `-jar %SERVER_JAR% nogui` 对齐
+        let bat_jar = if bat_has {
+            extract_bat_var(&bat, &["server_jar", "jar"])
+        } else {
+            None
+        };
+        let jar = bat_jar.clone().unwrap_or_else(|| detect_core_jar(&dir));
+        let jar_path = if Path::new(&jar).is_absolute() {
+            PathBuf::from(&jar)
+        } else {
+            dir.join(&jar)
+        };
+        if !jar_path.exists() {
+            return Err(format!("解析出的服务端核心不存在：{}", jar_path.display()));
+        }
+        args.push("-jar".to_string());
+        args.push(jar.clone());
+        args.push("nogui".to_string());
+
+        let mut detail = format!(
+            "  命令：{exe} {}\n  来源：java={java_src}（解析值 \"{raw_java}\"）；JVM 参数={}；核心 jar={}（{}）",
+            args.join(" "),
+            if jvm_from_bat {
+                "run.bat 的 JVM_ARGS"
+            } else if bat_has {
+                "配置/推荐值（run.bat 里没有 JVM_ARGS）"
+            } else {
+                "配置/推荐值（目录里没有 run.bat）"
+            },
+            jar,
+            if bat_jar.is_some() {
+                "run.bat 的 SERVER_JAR"
+            } else {
+                "目录扫描 detect_core_jar"
+            }
+        );
+        if !missing_env.is_empty() {
+            detail.push_str(&format!("；⚠ 未展开的环境变量={}", missing_env.join(",")));
+        }
+        if spec.priv_tmp.is_some() {
+            detail.push_str("；已注入私有 TEMP/TMP");
+        }
+        detail.push('\n');
+        Ok((exe, args, detail))
+    }
+
     fn start_server(&mut self, idx: usize) {
         if idx >= self.cfg.servers.len() || idx >= self.runtimes.len() {
             return;
@@ -3435,11 +3749,12 @@ impl App {
         }
     }
 
-    /// 「🧪 启动诊断」：依次用 3 种标志组合各启动一次（每次约 3 秒后强制结束进程树），
-    /// 结果写进 `data\launch.log` 并回传可滚动结果窗口。
+    /// 「🧪 启动诊断」：依次用 4 种启动方式各启动一次（每种最多观察 12 秒，出现 Done /
+    /// logs\latest.log 有新内容 / 进程自行退出都会提前结束），结果写进 `data\launch.log`
+    /// 并回传可滚动结果窗口。
     ///
-    /// 价值：一次点击就能确定"是哪个标志/Job 导致启动失败"；若三种组合都成功，
-    /// 说明问题在启动编排（时机/环境/命令模板）而不是 spawn 的标志组合。
+    /// 价值：一次点击就能确定"是哪个标志/Job 导致失败"、"问题在 cmd/bat 这一层"
+    /// 还是"java 进程创建本身受限（Job 的进程数/内存上限）"。
     fn start_launch_diag(&mut self, idx: usize) {
         if self.launch_diag_busy {
             self.set_toast("启动诊断正在进行中，请稍候".to_string());
@@ -3459,30 +3774,49 @@ impl App {
             .get(idx)
             .map(|s| s.name.clone())
             .unwrap_or_default();
+        // 组合④（绕过 cmd/bat 直接起 java）要先解析出 java 与参数；解析不出来只跳过该组合
+        let java_diag = self.build_java_diag_spec(idx);
         self.launch_diag_busy = true;
-        self.launch_diag_text =
-            Some("启动诊断进行中……（三种组合各启动一次，每次约 3 秒后自动结束）".to_string());
+        self.launch_diag_text = Some(
+            "启动诊断进行中……（四种组合各启动一次，每种最多观察 12 秒；出现 Done / 日志有新内容会提前结束）"
+                .to_string(),
+        );
         self.bg_busy
             .insert("launchdiag".to_string(), "启动诊断进行中…".to_string());
         let tx = self.bg_tx.clone();
+        let job_limits = process::current_job_limits_text();
+        let job_restrictive = process::job_flags_has_process_or_memory_limit(
+            process::current_job_limit_flags().unwrap_or(0),
+        );
+        let in_job = matches!(process::is_self_in_job(), Some(true));
         std::thread::spawn(move || {
+            let mut report = String::new();
+            report.push_str(&format!("服务器：{}\n", name));
+            report.push_str(&format!("目录：{}\n", spec.dir.display()));
+            report.push_str(&format!(
+                "命令：{} {}\n",
+                spec.prog,
+                spec.args.join(" ")
+            ));
+            // 工具自身所在 Job 的限制：java 创建失败的第一个怀疑对象
+            report.push_str("── 工具自身的进程上下文 ──\n");
+            report.push_str(&format!("在 Job 内：{}\n", in_job));
+            for line in job_limits.lines() {
+                report.push_str(&format!("  {line}\n"));
+            }
+            report.push('\n');
+            report.push_str("诊断会短暂启动服务器（每种最多 12 秒，出现 Done / 日志有新内容会提前结束）\n");
+            report.push_str("后立即强制结束整棵进程树；四种组合只有启动方式不同。\n\n");
+            // 组合①~③ 用同一套 cmd /c run.bat 命令，唯一变量是启动标志
+            let arg_refs: Vec<&str> = spec.args.iter().map(|s| s.as_str()).collect();
             let modes = [
                 process::DiagMode::Production,
                 process::DiagMode::NoJob,
                 process::DiagMode::NoNoWindow,
             ];
-            let mut report = String::new();
-            report.push_str(&format!("服务器：{}\n", name));
-            report.push_str(&format!("目录：{}\n", spec.dir.display()));
-            report.push_str(&format!(
-                "命令：{} {}\n\n",
-                spec.prog,
-                spec.args.join(" ")
-            ));
-            report.push_str("诊断会短暂启动服务器（每次约 3 秒）后立即强制结束整棵进程树；\n");
-            report.push_str("三种组合只有启动标志不同，用来确定是哪一项导致启动失败。\n\n");
-            let arg_refs: Vec<&str> = spec.args.iter().map(|s| s.as_str()).collect();
             let mut ok_count = 0usize;
+            let mut cmd_layer_ok = false;
+            let mut java_direct_ok: Option<bool> = None;
             for mode in modes.iter() {
                 let ctx = process::LaunchCtx::new(&name, &spec.dir, mode.label());
                 process::launch_log_sep(&format!(
@@ -3494,16 +3828,7 @@ impl App {
                 report.push_str(&format!("{}\n", mode.label()));
                 // ③ 走要求的直连诊断入口 spawn_diagnostic（等价标志组合），其余走带上下文的模式化接口
                 let outcome = if matches!(mode, process::DiagMode::NoNoWindow) {
-                    process::spawn_diagnostic(&spec.prog, &arg_refs, &spec.dir, &spec.envs).map(
-                        |(pid, out_first, err_first, code)| process::DiagOutcome {
-                            pid,
-                            stdout_first: out_first,
-                            stderr_first: err_first,
-                            raw_exit_code: code,
-                            still_running: code.is_none(),
-                            note: "（③ 经 spawn_diagnostic 直连启动）".to_string(),
-                        },
-                    )
+                    process::spawn_diagnostic(&spec.prog, &arg_refs, &spec.dir, &spec.envs)
                 } else {
                     process::spawn_diagnostic_mode(
                         &spec.prog,
@@ -3514,54 +3839,93 @@ impl App {
                         &ctx,
                     )
                 };
-                match outcome {
-                    Ok(o) => {
-                        ok_count += 1;
-                        let exit_text = match o.raw_exit_code {
-                            Some(c) => format!("0x{c:08X}（十进制 {c}）"),
-                            None => "无（3 秒时仍在运行，已由诊断结束）".to_string(),
-                        };
-                        let state = if o.still_running {
-                            "3 秒时仍在运行 → 已强制结束进程树"
-                        } else {
-                            "3 秒内自行退出"
-                        };
-                        report.push_str(&format!(
-                            "  结果：启动成功 ｜ PID {} ｜ {} ｜ 退出码 {}\n",
-                            o.pid, state, exit_text
-                        ));
-                        report.push_str(&format!("  stdout 首行：{}\n", o.stdout_first));
-                        report.push_str(&format!("  stderr 首行：{}\n", o.stderr_first));
-                        if !o.note.is_empty() {
-                            report.push_str(&format!("  附注：{}\n", o.note));
-                        }
-                    }
-                    Err(e) => {
-                        report.push_str(&format!("  结果：spawn 失败 ｜ 原因：{e}\n"));
-                        report.push_str("  stdout 首行：<未启动>\n");
-                        report.push_str("  stderr 首行：<未启动>\n");
-                    }
+                let cmd_line = format!("  命令：{} {}\n", spec.prog, spec.args.join(" "));
+                let ok = push_diag_block(&mut report, "", &cmd_line, outcome);
+                if ok {
+                    ok_count += 1;
+                    cmd_layer_ok = true;
                 }
-                report.push('\n');
             }
-            report.push_str(&format!("合计：{ok_count} / 3 种组合启动成功\n"));
-            if ok_count == 3 {
+            // 组合④：绕过 cmd/bat，直接用 bat 里解析出的 java 与参数启动
+            match &java_diag {
+                Ok((prog, args, detail)) => {
+                    let label = process::DiagMode::DirectJava.label();
+                    let ctx = process::LaunchCtx::new(&name, &spec.dir, label);
+                    process::launch_log_sep(&format!(
+                        "诊断尝试 #{}：{}（{}）",
+                        ctx.id, name, label
+                    ));
+                    let java_arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                    let outcome = process::spawn_diagnostic_mode(
+                        prog,
+                        &java_arg_refs,
+                        &spec.dir,
+                        &spec.envs,
+                        process::DiagMode::DirectJava,
+                        &ctx,
+                    );
+                    let ok = push_diag_block(&mut report, label, detail, outcome);
+                    if ok {
+                        ok_count += 1;
+                    }
+                    java_direct_ok = Some(ok);
+                }
+                Err(e) => {
+                    report.push_str(process::DiagMode::DirectJava.label());
+                    report.push('\n');
+                    report.push_str(&format!("  跳过：{e}\n\n"));
+                    process::launch_log_line(&format!(
+                        "诊断跳过 {} ｜ 原因：{e}",
+                        process::DiagMode::DirectJava.label()
+                    ));
+                }
+            }
+            let total = if java_direct_ok.is_some() { 4 } else { 3 };
+            report.push_str(&format!("合计：{ok_count} / {total} 种组合判定为启动成功\n"));
+            // 针对性结论：先看"工具是否在一个带限制的 Job 里"，再按 ④ 与 ①②③ 的对比定位层级
+            if in_job && job_restrictive {
                 report.push_str(
-                    "结论：三种标志组合都能启动成功 —— 问题更可能在启动编排（启动时机、环境变量、\
-                     命令模板、TEMP 注入），而不是 spawn 的标志或 Job。\n",
+                    "结论：工具运行在一个带限制的 Job 中（进程数/内存上限），java 很可能因此无法创建或秒退；\
+                     请从资源管理器（而非其它宿主程序/终端）直接双击运行 XMST 再试。\n",
                 );
-            } else if ok_count == 0 {
+            } else if in_job {
                 report.push_str(
-                    "结论：三种组合都失败 —— 与 CREATE_NO_WINDOW / Job / stdin 管道无关，\
-                     请对比 PowerShell 成功时的差异（工作目录、环境变量、完整性级别、命令本身）。\n",
+                    "结论：工具运行在 Job 内，但上方 LimitFlags 未含进程数/内存上限位\
+                     （若含 JOB_TIME 也要留意时间上限）。\n",
                 );
             } else {
+                report.push_str("结论：工具自身不在任何 Job 内（排除外层 Job 限制这一层）。\n");
+            }
+            match java_direct_ok {
+                Some(false) => report.push_str(
+                    "结论：组合④（不经 cmd/bat 直接启动 java）也失败 ⇒ java 进程创建本身受限，\
+                     重点检查 Job 限制（进程数/内存上限）与内存/杀软拦截；\
+                     同一套参数在外部 PowerShell 能成功时，差异只可能在进程上下文。\n",
+                ),
+                Some(true) if !cmd_layer_ok => report.push_str(
+                    "结论：组合④（直接启动 java）成功，而经 cmd/run.bat 的组合失败 ⇒ \
+                     问题在 cmd/bat 这一层（脚本分支、退出码、环境变量），不是 java 创建受限。\n",
+                ),
+                Some(true) => report.push_str(
+                    "结论：四种组合都能启动成功 —— 问题更可能在启动编排（启动时机、环境变量、\
+                     命令模板、TEMP 注入），而不是 spawn 的标志或 Job。\n",
+                ),
+                None => report.push_str(
+                    "结论：组合④已跳过（见上方原因），请先补齐 java 路径/核心 jar 后再试。\n",
+                ),
+            }
+            if !cmd_layer_ok && matches!(java_direct_ok, Some(true) | None) {
                 report.push_str(
-                    "结论：组合之间存在差异 —— 上方失败的那一种，失败点就在它的标志上。\n",
+                    "提示：经 cmd/bat 的组合全部失败时，请对照每条组合的“结束原因”与 stdout 末尾输出，\
+                     确认 bat 打印到哪一步中断（bat 打印完头部即失败 ⇒ 失败在脚本调起 java 的那一步）。\n",
                 );
             }
             // 汇总也写进 launch.log（单行，便于在日志里直接看到结论）
-            process::launch_log_line(&format!("诊断汇总 ｜ {}", report.replace('\n', " ｜ ")));
+            process::launch_log_line(&format!(
+                "诊断汇总 ｜ Job限制：{} ｜ {}",
+                job_limits.replace('\n', " ｜ "),
+                report.replace('\n', " ｜ ")
+            ));
             let _ = tx.send(BgMsg::LaunchDiag(idx, report));
         });
     }
@@ -3837,6 +4201,12 @@ impl App {
             "工具启动 版本={} exe_dir={dir_text} 完整性level={level} rid={rid_text} 本进程在Job内={in_job} 本进程cwd={self_cwd}",
             env!("CARGO_PKG_VERSION")
         ));
+        // Job 限制逐项落盘（多行文本压成一行便于 grep）：带进程数/内存上限的外层 Job
+        // 会拦住需要大堆的 java，而 cmd/echo 这类小进程看不出异常 —— 这是第一个怀疑对象。
+        process::launch_log_line(&format!(
+            "工具启动 Job限制= {}",
+            process::current_job_limits_oneline()
+        ));
         if level != "Low" {
             return;
         }
@@ -3945,8 +4315,8 @@ impl App {
             .show(ctx, |ui| {
                 ui.label(
                     RichText::new(
-                        "诊断会短暂启动服务器后立即结束：每种组合观察约 3 秒即强制结束整棵进程树，\
-                         不会残留进程或占用端口。",
+                        "诊断会短暂启动服务器后立即结束：每种组合最多观察 12 秒（出现 Done / 日志有新内容会提前结束），\
+                         结束时强制结束整棵进程树，不会残留进程或占用端口。",
                     )
                     .small()
                     .weak(),
@@ -13680,16 +14050,17 @@ impl App {
             if self.bg_busy.contains_key("diag") {
                 ui.label(RichText::new("诊断包打包中…").small().weak());
             }
-            // 启动诊断：一次点击对比三种启动标志组合，确定是哪个标志/Job 导致启动失败。
-            // 会短暂启动服务器（每次约 3 秒后强制结束），因此服务器运行中禁用。
+            // 启动诊断：一次点击对比四种启动方式，确定失败在哪个层级（标志/Job、cmd/bat、还是 java 创建本身）。
+            // 会短暂启动服务器（每种最多观察 12 秒，出现 Done / 日志有新内容会提前结束），因此服务器运行中禁用。
             if ui
                 .add_enabled(
                     !self.launch_diag_busy && !busy,
                     egui::Button::new("🧪 启动诊断"),
                 )
                 .on_hover_text(
-                    "依次用 3 种启动标志组合各启动一次（每次约 3 秒后强制结束进程树）：\
-                     ① 当前生产组合 ② 去掉 Job ③ 去掉 CREATE_NO_WINDOW。\
+                    "依次用 4 种启动方式各启动一次（每种最多观察 12 秒，出现 Done / 日志有新内容会提前结束）：\
+                     ① 当前生产组合 ② 去掉 Job ③ 去掉 CREATE_NO_WINDOW ④ 绕过 cmd/bat 直接用 java。\
+                     结果包含工具所在 Job 的限制、每种组合的最后 15 行输出与 logs\\latest.log 是否变化。\
                      会短暂启动服务器，服务器运行时不可用。结果同时写入 data\\launch.log",
                 )
                 .clicked()
@@ -13699,7 +14070,7 @@ impl App {
             // 打开启动日志：打开 data\launch.log 所在目录并选中该文件
             if ui
                 .button("📄 打开启动日志")
-                .on_hover_text("打开 data\\launch.log 所在目录并选中它（每次启动的命令、环境、PID、退出码与前 3 秒输出）")
+                .on_hover_text("打开 data\\launch.log 所在目录并选中它（每次启动的命令、环境、Job 限制、PID、退出码、结束原因与最后 15 行输出）")
                 .clicked()
             {
                 process::ensure_launch_log();

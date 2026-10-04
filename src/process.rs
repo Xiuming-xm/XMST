@@ -4,19 +4,27 @@ use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use winapi::shared::minwindef::{BOOL, DWORD, LPVOID};
+use winapi::shared::ntdef::LARGE_INTEGER;
 use winapi::um::errhandlingapi::GetLastError;
 use winapi::um::handleapi::CloseHandle;
 use winapi::um::jobapi::IsProcessInJob;
-use winapi::um::jobapi2::{AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject};
+use winapi::um::jobapi2::{
+    AssignProcessToJobObject, CreateJobObjectW, QueryInformationJobObject, SetInformationJobObject,
+};
 use winapi::um::processthreadsapi::{GetCurrentProcess, GetExitCodeProcess};
 use winapi::um::winnt::{
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+    JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_JOB_MEMORY,
+    JOB_OBJECT_LIMIT_JOB_TIME, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+    JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
 };
 
 /// stderr 末尾保留行数（崩溃诊断要展示"最后 30 行"，这里多留一些便于后续扩展）
@@ -195,6 +203,238 @@ fn self_in_job_text() -> String {
         Some(false) => "false".to_string(),
         None => "未知".to_string(),
     }
+}
+
+// ---------- 当前进程所在 Job 的限制（诊断"java 秒退"最可疑的一层） ----------
+//
+// 背景：本工具可能被别的宿主程序（终端、任务栏工具、启动器…）放进一个带限制的 Job 对象。
+// 这种 Job 对小进程（cmd / echo）没影响，但会拦住需要 ~4GB 堆的 java：进程创建失败或秒退，
+// 而退出码仍是 JVM/脚本自己给的 1、stderr 也可能是空的 —— 只从"启动标志组合"上看不出区别。
+// 因此这里直接把"当前 Job 的限制位与配额"读出来落盘，用数据判断是否卡在 Job 上。
+
+/// 常见 Job Object LimitFlags 位 → 人类可读解释（只覆盖诊断要看的常见位）。
+const JOB_LIMIT_FLAG_NAMES: [(DWORD, &str); 8] = [
+    (
+        JOB_OBJECT_LIMIT_JOB_TIME,
+        "JOB_TIME(整个 Job 的用户态时间上限 0x4)",
+    ),
+    (
+        JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+        "ACTIVE_PROCESS(活动进程数上限 0x8)",
+    ),
+    (
+        JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+        "PROCESS_MEMORY(单进程内存上限 0x100)",
+    ),
+    (
+        JOB_OBJECT_LIMIT_JOB_MEMORY,
+        "JOB_MEMORY(Job 总内存上限 0x200)",
+    ),
+    (
+        JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
+        "DIE_ON_UNHANDLED_EXCEPTION(未处理异常即终止 0x400)",
+    ),
+    (
+        JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+        "BREAKAWAY_OK(允许脱离 Job 0x800)",
+    ),
+    (
+        JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+        "SILENT_BREAKAWAY_OK(子进程默认不加入 Job 0x1000)",
+    ),
+    (
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        "KILL_ON_JOB_CLOSE(Job 句柄关闭即杀进程 0x2000)",
+    ),
+];
+
+/// 逐位解释 LimitFlags（未列出的位以 hex 原样写出；0 表示没有任何限制位）。
+fn describe_job_limit_flags(flags: DWORD) -> String {
+    if flags == 0 {
+        return "未设置任何限制位（LimitFlags=0）".to_string();
+    }
+    let mut names: Vec<&str> = Vec::new();
+    let mut known: DWORD = 0;
+    for (bit, name) in JOB_LIMIT_FLAG_NAMES.iter() {
+        known |= *bit;
+        if flags & *bit != 0 {
+            names.push(name);
+        }
+    }
+    let mut text = if names.is_empty() {
+        "无已知限制位".to_string()
+    } else {
+        names.join(" + ")
+    };
+    let rest = flags & !known;
+    if rest != 0 {
+        text.push_str(&format!(" + 未识别位=0x{rest:08X}"));
+    }
+    text
+}
+
+/// LARGE_INTEGER（100 纳秒单位）→ 毫秒（诊断显示用；取不到记 0）。
+fn large_ms(v: &LARGE_INTEGER) -> i64 {
+    // UNION 取值必须走 accessor；此处只读，不会写入
+    let raw = unsafe { *v.QuadPart() };
+    raw / 10_000
+}
+
+/// 字节数 → MB 文本（保留 1 位小数）
+fn mb_text(v: usize) -> String {
+    format!("{:.1} MB", v as f64 / (1024.0 * 1024.0))
+}
+
+/// Job 的 PriorityClass → 文本（0=不限制；其余按 Windows 优先级类常量解释）。
+fn priority_class_text(v: DWORD) -> String {
+    let name = match v {
+        0 => "不限制",
+        0x40 => "IDLE_PRIORITY_CLASS",
+        0x4000 => "BELOW_NORMAL_PRIORITY_CLASS",
+        0x20 => "NORMAL_PRIORITY_CLASS",
+        0x8000 => "ABOVE_NORMAL_PRIORITY_CLASS",
+        0x80 => "HIGH_PRIORITY_CLASS",
+        0x100 => "REALTIME_PRIORITY_CLASS",
+        _ => "未知",
+    };
+    format!("{v}（{name}）")
+}
+
+/// 当前进程所在 Job 的限制标志（`None`=不在 Job 内，或查询失败）。
+///
+/// `QueryInformationJobObject` 传 NULL 句柄即"查询当前 Job"，不需要打开任何句柄。
+pub fn current_job_limit_flags() -> Option<u32> {
+    if !is_self_in_job().unwrap_or(false) {
+        return None;
+    }
+    unsafe {
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        let mut ret: DWORD = 0;
+        let ok = QueryInformationJobObject(
+            std::ptr::null_mut(),
+            JobObjectExtendedLimitInformation,
+            &mut info as *mut _ as LPVOID,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as DWORD,
+            &mut ret,
+        );
+        if ok == 0 {
+            None
+        } else {
+            Some(info.BasicLimitInformation.LimitFlags)
+        }
+    }
+}
+
+/// LimitFlags 里是否含"会挡住 java"的限制：活动进程数上限、单进程内存上限、Job 总内存上限。
+pub fn job_flags_has_process_or_memory_limit(flags: u32) -> bool {
+    const MASK: u32 =
+        JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_JOB_MEMORY;
+    flags & MASK != 0
+}
+
+/// 查询"当前进程所在 Job"的限制信息（人类可读多行文本）。若不在 Job 内返回 "不在 Job 内"。
+///
+/// 全部 best-effort：任何一步 winapi 调用失败都返回说明文本，不 panic、不 unwrap。
+pub fn current_job_limits_text() -> String {
+    match is_self_in_job() {
+        Some(false) => return "不在 Job 内".to_string(),
+        None => {
+            return "不在 Job 内（IsProcessInJob 查询失败，无法判断；按不在 Job 内处理）".to_string()
+        }
+        Some(true) => {}
+    }
+    let mut out = String::new();
+    unsafe {
+        // ---- 扩展限制（含内存/进程数/时间配额）----
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        let mut ret: DWORD = 0;
+        let ok = QueryInformationJobObject(
+            std::ptr::null_mut(),
+            JobObjectExtendedLimitInformation,
+            &mut info as *mut _ as LPVOID,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as DWORD,
+            &mut ret,
+        );
+        if ok == 0 {
+            let err = GetLastError();
+            out.push_str(&format!(
+                "LimitFlags=<查询失败 GetLastError={err} ({})>\n",
+                hex_code(err)
+            ));
+        } else {
+            let b = info.BasicLimitInformation;
+            out.push_str(&format!(
+                "LimitFlags=0x{:08X}（{}）\n",
+                b.LimitFlags,
+                describe_job_limit_flags(b.LimitFlags)
+            ));
+            out.push_str(&format!(
+                "ActiveProcessLimit={}（0=不限制）\n",
+                b.ActiveProcessLimit
+            ));
+            out.push_str(&format!("Affinity=0x{:X}（0=不限制）\n", b.Affinity));
+            out.push_str(&format!(
+                "PriorityClass={}\n",
+                priority_class_text(b.PriorityClass)
+            ));
+            out.push_str(&format!(
+                "PerProcessUserTimeLimit={} ms（0=不限制）\n",
+                large_ms(&b.PerProcessUserTimeLimit)
+            ));
+            out.push_str(&format!(
+                "PerJobUserTimeLimit={} ms（0=不限制）\n",
+                large_ms(&b.PerJobUserTimeLimit)
+            ));
+            out.push_str(&format!(
+                "ProcessMemoryLimit={}（0=不限制）\n",
+                mb_text(info.ProcessMemoryLimit)
+            ));
+            out.push_str(&format!(
+                "JobMemoryLimit={}（0=不限制）\n",
+                mb_text(info.JobMemoryLimit)
+            ));
+            out.push_str(&format!(
+                "PeakProcessMemoryUsed={}\n",
+                mb_text(info.PeakProcessMemoryUsed)
+            ));
+            out.push_str(&format!(
+                "PeakJobMemoryUsed={}\n",
+                mb_text(info.PeakJobMemoryUsed)
+            ));
+        }
+        // ---- 记账信息（可选：拿不到也不影响上面的限制结论）----
+        let mut acc: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = std::mem::zeroed();
+        let mut ret2: DWORD = 0;
+        let ok2 = QueryInformationJobObject(
+            std::ptr::null_mut(),
+            JobObjectBasicAccountingInformation,
+            &mut acc as *mut _ as LPVOID,
+            std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as DWORD,
+            &mut ret2,
+        );
+        if ok2 == 0 {
+            let err = GetLastError();
+            out.push_str(&format!(
+                "活动进程数=<查询失败 GetLastError={err} ({})>\n",
+                hex_code(err)
+            ));
+        } else {
+            out.push_str(&format!(
+                "活动进程数={} 累计进程数={} 已终止进程数={}\n",
+                acc.ActiveProcesses, acc.TotalProcesses, acc.TotalTerminatedProcesses
+            ));
+        }
+    }
+    out.push_str(
+        "说明：ACTIVE_PROCESS（进程数上限）/ JOB_MEMORY、PROCESS_MEMORY（内存上限）/ JOB_TIME（时间上限）\
+         这几类限制位会拦住需要大堆的 java（创建失败或秒退），而 cmd 这类小进程看不出异常",
+    );
+    out
+}
+
+/// 当前 Job 限制的单行摘要（写 `data\launch.log` 用：多行文本压成一行，便于 grep）。
+pub fn current_job_limits_oneline() -> String {
+    current_job_limits_text().replace('\n', " ｜ ")
 }
 
 /// GetExitCodeProcess 的原始 DWORD（能看出 0xC0000142 这类 Windows 级错误码）。
@@ -1166,16 +1406,30 @@ pub fn kill_pid_tree(pid: u32) -> bool {
     false
 }
 
-// ==================== 启动诊断：三种标志组合对比 ====================
+// ==================== 启动诊断：四种启动方式对比 ====================
 //
-// 「🧪 启动诊断」依次用同一套 program/args/cwd/环境 启动三次，唯一变量是标志组合：
+// 「🧪 启动诊断」依次用同一套 program/args/cwd/环境 启动四次，唯一变量是启动方式：
 //   ① 生产组合（CREATE_NO_WINDOW + Job + stdin 管道）—— 复现工具启动失败的那套；
 //   ② 去掉 Job；
-//   ③ 去掉 CREATE_NO_WINDOW（同时不分配 Job、stdin=null，即 spawn_diagnostic 的行为）。
-// 每种都只观察 3 秒就强制结束进程树，结果写进 `data\launch.log` 并回传界面。
-// 一次点击即可确定是"哪个标志/Job 导致失败"，还是"三种都成功（那问题在 main.rs 的启动编排）"。
+//   ③ 去掉 CREATE_NO_WINDOW（同时不分配 Job、stdin=null，即 spawn_diagnostic 的行为）；
+//   ④ 绕过 cmd/bat 直接用 java 启动（CREATE_NO_WINDOW + stdin=null + 不分配 Job）。
+// 每种最多观察 12 秒：输出里出现 "Done ("、logs\latest.log 有新内容、或进程自行退出都提前结束。
+// 结果（结束原因 + 退出码 + stdout/stderr 最后 15 行 + latest.log 变化）写进
+// `data\launch.log` 并回传界面。一次点击即可确定：问题在标志/Job、在 cmd/bat 这一层，
+// 还是在 java 进程创建本身（Job 的进程数/内存上限）。
 
-/// 诊断启动的标志组合。
+/// 诊断输出保留的末尾行数（结果窗口展示每种组合的最后 15 行）
+const DIAG_TAIL_LINES: usize = 15;
+/// 单次诊断的观察窗口上限（12 秒足够覆盖"bat 打印头 → java 启动 → 写日志 → Done"）
+const DIAG_WINDOW: Duration = Duration::from_secs(12);
+/// 进程自行退出后，再多读一会儿管道，保证末尾输出不丢
+const DIAG_EXIT_DRAIN: Duration = Duration::from_millis(600);
+/// 检测到 logs\latest.log 有新内容后，再多观察这么久等 "Done (" 出现；仍没有就按"日志有新内容"结束
+const DIAG_LOG_GROW_GRACE: Duration = Duration::from_secs(3);
+/// 诊断轮询间隔
+const DIAG_POLL: Duration = Duration::from_millis(100);
+
+/// 诊断启动的方式组合。
 #[derive(Clone, Copy, Debug)]
 pub enum DiagMode {
     /// ① 当前生产组合：CREATE_NO_WINDOW + stdout/stderr 管道 + stdin 管道 + 分配 Job
@@ -1184,6 +1438,8 @@ pub enum DiagMode {
     NoJob,
     /// ③ 去掉 CREATE_NO_WINDOW：不建隐藏窗口、不分配 Job、stdin=null
     NoNoWindow,
+    /// ④ 绕过 cmd/bat 直接用 java 启动：CREATE_NO_WINDOW + stdin=null + 不分配 Job
+    DirectJava,
 }
 
 impl DiagMode {
@@ -1193,49 +1449,194 @@ impl DiagMode {
             DiagMode::Production => "① 当前生产组合（CREATE_NO_WINDOW + Job + stdin 管道）",
             DiagMode::NoJob => "② 去掉 Job（CREATE_NO_WINDOW + stdin 管道）",
             DiagMode::NoNoWindow => "③ 去掉 CREATE_NO_WINDOW（无 Job、stdin=null）",
+            DiagMode::DirectJava => {
+                "④ 直接用 java 启动（不经 cmd/bat；CREATE_NO_WINDOW + stdin=null + 无 Job）"
+            }
         }
+    }
+
+    /// 本组合的三个开关：(是否 CREATE_NO_WINDOW, stdin 是否用管道, 是否分配 Job)
+    fn flags(self) -> (bool, bool, bool) {
+        match self {
+            DiagMode::Production => (true, true, true),
+            DiagMode::NoJob => (true, true, false),
+            DiagMode::NoNoWindow => (false, false, false),
+            DiagMode::DirectJava => (true, false, false),
+        }
+    }
+}
+
+/// 一次诊断启动的结束原因（界面与日志都要分清"启动成功"还是"秒退"）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiagEndReason {
+    /// 进程在观察窗口内自行退出
+    Exited,
+    /// 观察窗口结束时仍在运行（已被诊断结束进程树）
+    WindowEnd,
+    /// stdout/stderr 出现 "Done ("：服务端已就绪
+    Done,
+    /// logs\latest.log 出现新内容（提前结束）
+    LogGrew,
+}
+
+impl DiagEndReason {
+    /// 结束原因文本（退出码只对"自行退出"有意义）。
+    pub fn text(self, raw_exit: Option<u32>) -> String {
+        match self {
+            DiagEndReason::Exited => match raw_exit {
+                Some(c) => format!("自行退出（退出码={c} / {}）", hex_code(c)),
+                None => "自行退出（退出码=未知）".to_string(),
+            },
+            DiagEndReason::WindowEnd => format!(
+                "观察窗口（{} 秒）结束仍在运行（已结束进程树）",
+                DIAG_WINDOW.as_secs()
+            ),
+            DiagEndReason::Done => "检测到 Done!（启动成功，已结束）".to_string(),
+            DiagEndReason::LogGrew => "检测到 logs\\latest.log 有新内容（提前结束）".to_string(),
+        }
+    }
+
+    /// 是否判定为"启动成功"
+    pub fn is_success(self) -> bool {
+        matches!(self, DiagEndReason::Done | DiagEndReason::LogGrew)
     }
 }
 
 /// 一次诊断启动的观测结果。
 pub struct DiagOutcome {
-    /// 子进程 PID（cmd.exe 的 PID；java 是它的子进程）
+    /// 子进程 PID（①~③ 是 cmd.exe 的 PID，java 是它的子进程；④ 就是 java 自身）
     pub pid: u32,
-    /// 前 3 秒内捕获到的 stdout 首行（空则 `<empty>`）
+    /// 观察窗口内捕获到的 stdout 首行（空则 `<empty>`）
     pub stdout_first: String,
-    /// 前 3 秒内捕获到的 stderr 首行（空则 `<empty>`）
+    /// 观察窗口内捕获到的 stderr 首行（空则 `<empty>`）
     pub stderr_first: String,
-    /// 3 秒窗口内**自行退出**时的原始退出码（可看出 0xC0000142 这类 Windows 级错误码）
+    /// stdout 末尾若干行（最多 `DIAG_TAIL_LINES` 行）
+    pub stdout_tail: Vec<String>,
+    /// stderr 末尾若干行（最多 `DIAG_TAIL_LINES` 行）
+    pub stderr_tail: Vec<String>,
+    /// **自行退出**时的原始退出码（可看出 0xC0000142 这类 Windows 级错误码）
     pub raw_exit_code: Option<u32>,
-    /// 3 秒窗口结束时是否仍在运行（其后已被诊断强制结束）
+    /// 观察窗口结束时是否仍在运行（其后已被诊断强制结束）
     pub still_running: bool,
+    /// 结束原因（自行退出 / 窗口结束仍在运行 / 检测到 Done! / 日志有新内容）
+    pub end_reason: DiagEndReason,
+    /// 实际观察时长（毫秒）
+    pub waited_ms: u128,
+    /// `logs\latest.log` 启动前后的变化描述（证明 java 是否走到了写日志这一步）
+    pub log_change: String,
     /// 附注（Job 分配结果、结束确认情况等）
     pub note: String,
 }
 
-/// 诊断用直连启动：用与生产路径相同的 program/args/cwd/环境变量启动，但**不**加
-/// CREATE_NO_WINDOW、**不**分配 Job、stdin 用 `Stdio::null()`，
-/// 并返回 (子进程 PID, stdout 首行, stderr 首行, 自行退出时的退出码)。
+/// 文件时间戳快照（诊断用：判断 logs\latest.log 启动前后是否变化）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    /// 文件是否存在
+    exists: bool,
+    /// 字节数
+    len: u64,
+    /// 修改时间（取不到时为 None）
+    mtime: Option<SystemTime>,
+}
+
+impl FileStamp {
+    /// 读取路径的时间戳快照（读不到也算一种可比较的状态，不报错）。
+    fn read(path: &Path) -> Self {
+        match std::fs::metadata(path) {
+            Ok(m) => Self {
+                exists: true,
+                len: m.len(),
+                mtime: m.modified().ok(),
+            },
+            Err(_) => Self {
+                exists: false,
+                len: 0,
+                mtime: None,
+            },
+        }
+    }
+
+    /// 人类可读文本（大小 + mtime）
+    fn text(&self) -> String {
+        if !self.exists {
+            return "不存在".to_string();
+        }
+        let t = match self.mtime {
+            Some(t) => chrono::DateTime::<chrono::Local>::from(t)
+                .format("%Y-%m-%d %H:%M:%S%.3f")
+                .to_string(),
+            None => "mtime未知".to_string(),
+        };
+        format!("{} 字节 / mtime={t}", self.len)
+    }
+}
+
+/// `logs\latest.log` 的路径（服务端日志；java 真跑起来后 log4j 会立刻创建/追加它）。
+fn latest_log_path(dir: &Path) -> PathBuf {
+    dir.join("logs").join("latest.log")
+}
+
+/// 启动前后 latest.log 的变化描述（"java 是否走到写日志那一步"的直接证据）。
+fn latest_log_change_text(before: &FileStamp, after: &FileStamp) -> String {
+    if before == after {
+        return format!("变化=无（前={} 后={}）", before.text(), after.text());
+    }
+    let delta = after.len as i64 - before.len as i64;
+    format!(
+        "变化=有（前={} 后={} 字节增量={delta}）",
+        before.text(),
+        after.text()
+    )
+}
+
+/// 末尾行 → 单行文本（写日志用；空则 `<empty>`）。
+fn tail_text(lines: &[String]) -> String {
+    if lines.is_empty() {
+        return "<empty>".to_string();
+    }
+    lines.join(" ⏎ ")
+}
+
+/// 把一行追加进末尾行槽位（超过 `DIAG_TAIL_LINES` 行丢最旧的）；纯诊断用途，失败忽略。
+fn record_tail_line(slot: &Arc<Mutex<VecDeque<String>>>, line: &str) {
+    let mut t = slot.lock().unwrap_or_else(|e| e.into_inner());
+    t.push_back(line.to_string());
+    while t.len() > DIAG_TAIL_LINES {
+        t.pop_front();
+    }
+}
+
+/// 末尾行槽位取值（不足 `DIAG_TAIL_LINES` 行则全取）。
+fn tail_lines(slot: &Arc<Mutex<VecDeque<String>>>) -> Vec<String> {
+    let t = slot.lock().unwrap_or_else(|e| e.into_inner());
+    t.iter().cloned().collect()
+}
+
+/// 诊断用直连启动（组合③）：用与生产路径相同的 program/args/cwd/环境变量启动，但**不**加
+/// CREATE_NO_WINDOW、**不**分配 Job、stdin 用 `Stdio::null()`。
+/// 结果与其余组合同构（`DiagOutcome`），便于界面并列对比。
 ///
-/// 启动后最多观察 3 秒即强制结束整棵进程树（`kill_pid_tree` + 句柄兜底），
-/// 保证诊断本身不会留下孤儿进程或占用端口。
+/// 结束时会强制结束整棵进程树（`kill_pid_tree` + 句柄兜底），保证诊断本身不留孤儿进程或占用端口。
 pub fn spawn_diagnostic(
     cmd: &str,
     args: &[&str],
     cwd: &Path,
     envs: &[(String, String)],
-) -> Result<(u32, String, String, Option<u32>), String> {
+) -> Result<DiagOutcome, String> {
     // 调用方未提供服务器名时用目录名兜底，保证这批日志行也能自解释
     let name = cwd
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
     let ctx = LaunchCtx::new(&name, cwd, DiagMode::NoNoWindow.label());
-    let o = spawn_diagnostic_mode(cmd, args, cwd, envs, DiagMode::NoNoWindow, &ctx)?;
-    Ok((o.pid, o.stdout_first, o.stderr_first, o.raw_exit_code))
+    spawn_diagnostic_mode(cmd, args, cwd, envs, DiagMode::NoNoWindow, &ctx)
 }
 
-/// 按指定标志组合做一次诊断启动（「🧪 启动诊断」用；`ctx` 决定日志里的服务器与编号）。
+/// 按指定方式组合做一次诊断启动（「🧪 启动诊断」用；`ctx` 决定日志里的服务器与编号）。
+///
+/// 观察规则：最多 `DIAG_WINDOW`（12 秒）；出现 "Done (" → 结束原因=Done（启动成功）；
+/// `logs\latest.log` 有新内容 → 再宽限 `DIAG_LOG_GROW_GRACE` 等 Done，其后按 LogGrew 结束；
+/// 进程自行退出 → 结束原因=Exited（附退出码）。结束时一律结束整棵进程树。
 pub fn spawn_diagnostic_mode(
     cmd: &str,
     args: &[&str],
@@ -1247,15 +1648,13 @@ pub fn spawn_diagnostic_mode(
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-    let use_no_window = !matches!(mode, DiagMode::NoNoWindow);
-    let use_stdin_pipe = !matches!(mode, DiagMode::NoNoWindow);
-    let use_job = matches!(mode, DiagMode::Production);
+    let (use_no_window, use_stdin_pipe, use_job) = mode.flags();
 
     launch_log_ctx(
         ctx,
         &format!(
             "阶段=诊断启动 组合={} program={} args=[{}] cwd={} cwd存在={} stdin={} stdout=piped stderr=piped 标志={} Job={} \
-             继承环境_TEMP={} 继承环境_TMP={} 继承环境_PATH={} 注入环境={} 本进程完整性rid={} 本进程在Job内={} 本进程cwd={}",
+             继承环境_TEMP={} 继承环境_TMP={} 继承环境_PATH={} 注入环境={} 本进程完整性rid={} 本进程在Job内={} 本进程Job限制={} 本进程cwd={}",
             mode.label(),
             cmd,
             args.join(", "),
@@ -1270,11 +1669,16 @@ pub fn spawn_diagnostic_mode(
             env_pairs_text(envs),
             integrity_rid_text(),
             self_in_job_text(),
+            current_job_limits_oneline(),
             std::env::current_dir()
                 .map(|d| d.display().to_string())
                 .unwrap_or_else(|_| "?".to_string())
         ),
     );
+
+    // latest.log 基线（必须在 CreateProcess 之前取；java 一启动 log4j 就会动这个文件）
+    let log_path = latest_log_path(cwd);
+    let log_before = FileStamp::read(&log_path);
 
     let mut command = Command::new(cmd);
     command
@@ -1349,16 +1753,27 @@ pub fn spawn_diagnostic_mode(
     // 而这正是要对比的差异之一，不能让诊断自己把管道提前关掉。
     let _stdin_hold = if use_stdin_pipe { child.stdin.take() } else { None };
 
-    // 只记录首行的两个槽位（读者线程把管道读干，避免子进程写满管道阻塞）
+    // 采集槽位：首行 + 末尾 15 行 + "Done (" 标记（读者线程把管道读干，避免子进程写满管道阻塞）
     let first_out: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let first_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let out_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let err_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let done_flag = Arc::new(AtomicBool::new(false));
     if let Some(out) = child.stdout.take() {
         let slot = first_out.clone();
+        let tail = out_tail.clone();
+        let done = done_flag.clone();
         thread::spawn(move || {
             let reader = BufReader::new(out);
             for line in reader.lines() {
                 match line {
-                    Ok(l) => record_first_line(&slot, &l),
+                    Ok(l) => {
+                        record_first_line(&slot, &l);
+                        record_tail_line(&tail, &l);
+                        if l.contains("Done (") {
+                            done.store(true, Ordering::Relaxed);
+                        }
+                    }
                     Err(_) => break,
                 }
             }
@@ -1366,40 +1781,79 @@ pub fn spawn_diagnostic_mode(
     }
     if let Some(err) = child.stderr.take() {
         let slot = first_err.clone();
+        let tail = err_tail.clone();
+        let done = done_flag.clone();
         thread::spawn(move || {
             let reader = BufReader::new(err);
             for line in reader.lines() {
                 match line {
-                    Ok(l) => record_first_line(&slot, &l),
+                    Ok(l) => {
+                        record_first_line(&slot, &l);
+                        record_tail_line(&tail, &l);
+                        if l.contains("Done (") {
+                            done.store(true, Ordering::Relaxed);
+                        }
+                    }
                     Err(_) => break,
                 }
             }
         });
     }
 
-    // 观察窗口：固定 3 秒（进程提前退出也等满，好让读者线程把已到达的输出放进槽位）
+    // ---- 观察窗口：最多 12 秒，Done / latest.log 有新内容 / 自行退出都会提前结束 ----
     let started = Instant::now();
     let mut raw_exit: Option<u32> = None;
-    while started.elapsed() < Duration::from_secs(3) {
+    let mut end_reason = DiagEndReason::WindowEnd;
+    let mut log_grew = false;
+    let mut log_grew_at: Option<Instant> = None;
+    loop {
+        // ① 服务端就绪（优先于"进程退出"：先打到 Done 就按启动成功算）
+        if done_flag.load(Ordering::Relaxed) {
+            end_reason = DiagEndReason::Done;
+            break;
+        }
+        // ② 自行退出
         if raw_exit.is_none() {
             if let Ok(Some(_)) = child.try_wait() {
                 raw_exit = raw_exit_code(&child);
             }
         }
-        thread::sleep(Duration::from_millis(50));
+        if raw_exit.is_some() {
+            end_reason = DiagEndReason::Exited;
+            // 进程已退出，再等一会儿让读者线程把已到达的末尾输出收进槽位
+            thread::sleep(DIAG_EXIT_DRAIN);
+            break;
+        }
+        // ③ logs\latest.log 有新内容：java 至少跑到了写日志这一步；再宽限几秒等 Done
+        if !log_grew && FileStamp::read(&log_path) != log_before {
+            log_grew = true;
+            log_grew_at = Some(Instant::now());
+        }
+        if let Some(t) = log_grew_at {
+            if t.elapsed() >= DIAG_LOG_GROW_GRACE {
+                end_reason = DiagEndReason::LogGrew;
+                break;
+            }
+        }
+        // ④ 观察窗口上限
+        if started.elapsed() >= DIAG_WINDOW {
+            end_reason = DiagEndReason::WindowEnd;
+            break;
+        }
+        thread::sleep(DIAG_POLL);
     }
-    thread::sleep(Duration::from_millis(200));
-    let stdout_first = first_line_text(&first_out);
-    let stderr_first = first_line_text(&first_err);
+    let waited_ms = started.elapsed().as_millis();
     let still_running = raw_exit.is_none();
 
     // 每次尝试结束都必须结束子进程及其整棵树（cmd -> java），避免留下孤儿进程或占用端口
+    let killed = kill_pid_tree(pid);
     if still_running {
-        let killed = kill_pid_tree(pid);
         let _ = child.kill();
-        note.push_str(&format!("已结束进程树(kill_pid_tree={killed})；"));
+        note.push_str(&format!("观察结束时仍在运行，已结束进程树(kill_pid_tree={killed})；"));
     } else {
-        note.push_str("进程在观察窗口内自行退出；");
+        note.push_str(&format!(
+            "进程在观察窗口内自行退出，已兜底清理进程树(kill_pid_tree={killed})；"
+        ));
     }
     // 有上限地确认退出（taskkill 之后可能还要几百毫秒）
     let mut confirmed = !still_running;
@@ -1417,6 +1871,10 @@ pub fn spawn_diagnostic_mode(
     if !confirmed {
         note.push_str("⚠ 结束后仍未确认退出，请在任务管理器确认；");
     }
+    // 强制结束后再给读者线程一点时间收尾（自行退出时上面已经等过）
+    if still_running {
+        thread::sleep(Duration::from_millis(300));
+    }
 
     if let Some(j) = job_handle {
         unsafe {
@@ -1424,17 +1882,34 @@ pub fn spawn_diagnostic_mode(
         }
     }
 
+    let stdout_first = first_line_text(&first_out);
+    let stderr_first = first_line_text(&first_err);
+    let stdout_tail = tail_lines(&out_tail);
+    let stderr_tail = tail_lines(&err_tail);
+    let log_after = FileStamp::read(&log_path);
+    let log_change = latest_log_change_text(&log_before, &log_after);
+    let end_text = end_reason.text(raw_exit);
+
     launch_log_ctx(
         ctx,
         &format!(
-            "阶段=诊断结束 仍在运行={} 退出码={} 退出码(hex)={} stdout首行=\"{}\" stderr首行=\"{}\" 附注={}",
+            "阶段=诊断结束 结束原因={} 判定启动成功={} 观察时长={}ms 仍在运行={} 退出码={} 退出码(hex)={} {} \
+             stdout首行=\"{}\" stdout末{}行=\"{}\" stderr首行=\"{}\" stderr末{}行=\"{}\" 附注={}",
+            end_text,
+            end_reason.is_success(),
+            waited_ms,
             still_running,
             raw_exit
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "无（未自行退出）".to_string()),
             raw_exit.map(hex_code).unwrap_or_else(|| "无".to_string()),
+            log_change,
             stdout_first,
+            stdout_tail.len(),
+            tail_text(&stdout_tail),
             stderr_first,
+            stderr_tail.len(),
+            tail_text(&stderr_tail),
             note
         ),
     );
@@ -1443,8 +1918,13 @@ pub fn spawn_diagnostic_mode(
         pid,
         stdout_first,
         stderr_first,
+        stdout_tail,
+        stderr_tail,
         raw_exit_code: raw_exit,
         still_running,
+        end_reason,
+        waited_ms,
+        log_change,
         note,
     })
 }
