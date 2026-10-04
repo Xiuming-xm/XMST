@@ -24,3 +24,7 @@ Desktop.ini
 /target/
 /temp/
 /backup/
+# 发布产物（改由 GitHub Release 附件分发，不入库避免仓库膨胀）
+
+
+/versions/

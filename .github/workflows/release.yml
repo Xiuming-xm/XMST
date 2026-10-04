@@ -30,6 +30,5 @@ jobs:
               --title "XMST $ver" --notes "见 CHANGELOG.md。产物校验值见附件 SHA256.txt。" --prerelease \
               || gh release upload "$tag" "versions/$ver"/*.exe "versions/$ver"/SHA256.txt --clobber
           else
-            gh release create "$tag" --title "XMST $ver" --notes "该标签没有对应产物目录 versions/$ver/。" --prerelease \
-              || true
+            echo "跳过：仓库内不存在产物目录 versions/$ver/（产物改由 Release 附件或本地发布脚本管理）"
           fi
