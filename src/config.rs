@@ -284,7 +284,9 @@ impl Default for GlobalConfig {
         Self {
             java_path: String::new(),
             java_homes: Vec::new(),
-            default_jvm_args: "-Xmx4G -Xms2G".to_string(),
+            // 默认留空 = 按物理内存自动推荐（-Xms1G -Xmx<内存的 50%，钳制 2..16G> + G1）；
+            // 用户填了就一律以用户填的为准
+            default_jvm_args: String::new(),
             max_log_lines: 2000,
             lang: "zh".to_string(),
             servers: Vec::new(),

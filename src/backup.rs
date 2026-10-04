@@ -275,7 +275,9 @@ static SNAP_TOTAL_CACHE: std::sync::OnceLock<
     std::sync::Mutex<HashMap<PathBuf, ((u64, u128), u64)>>,
 > = std::sync::OnceLock::new();
 
-/// 排除表默认值：日志/崩溃报告/锁文件/缓存/调试/备份自身目录
+/// 排除表默认值：日志/崩溃报告/锁文件/缓存/调试/备份自身目录，
+/// 以及服务器自带临时目录 `tmp`（JNA/SQLite 会把 dll 解压到这里，不排除会让快照"变化数"虚高）
+/// 和它们可能在服务器根目录留下的 `hsperfdata_*` / `jna-*` / `sqlite-*`。
 pub fn default_excludes() -> Vec<String> {
     [
         "logs",
@@ -286,10 +288,41 @@ pub fn default_excludes() -> Vec<String> {
         "debug",
         ".mcsrv_backups",
         ".mcsrv_trash",
+        "tmp",
+        "hsperfdata_*",
+        "jna-*",
+        "sqlite-*",
     ]
     .iter()
     .map(|s| s.to_string())
     .collect()
+}
+
+/// 给**已有**用户配置的排除表补齐新增的默认项（只补，不删、不改顺序）。
+/// 返回是否有改动（调用方据此决定是否落盘）。若传入列表为空，则直接用 default_excludes() 填满。
+///
+/// 比较时忽略首尾空白与大小写（Windows 路径不区分大小写），
+/// 用户已有的自定义项（哪怕与默认项同名但大小写不同）不会被重复追加。
+pub fn migrate_excludes(list: &mut Vec<String>) -> bool {
+    let defaults = default_excludes();
+    if list.is_empty() {
+        if defaults.is_empty() {
+            return false;
+        }
+        *list = defaults;
+        return true;
+    }
+    // 归一化：去首尾空白 + 反斜杠转正斜杠 + 小写
+    let norm = |s: &str| s.trim().replace('\\', "/").to_ascii_lowercase();
+    let existing: HashSet<String> = list.iter().map(|s| norm(s)).collect();
+    let mut changed = false;
+    for d in defaults {
+        if !existing.contains(&norm(&d)) {
+            list.push(d);
+            changed = true;
+        }
+    }
+    changed
 }
 
 // ---------- 创建快照 ----------
@@ -1417,9 +1450,10 @@ fn file_name_of(p: &Path) -> String {
 }
 
 /// 排除表匹配：
-/// - `*.lock` 之类的通配后缀按文件名/相对路径结尾匹配；
+/// - 以 `*` 开头（`*.lock`）：按文件名/相对路径结尾匹配；
+/// - 以 `*` 结尾（`hsperfdata_*` / `jna-*` / `sqlite-*`）：按文件名或任一路径段**前缀**匹配；
 /// - 含 `/` 的模式按相对路径匹配；
-/// - 其余按"任一路径段精确相等"匹配（目录名，如 logs / cache / session.lock）
+/// - 其余按"任一路径段精确相等"匹配（目录名，如 logs / tmp / session.lock）
 fn is_excluded(rel: &str, name: &str, excludes: &[String]) -> bool {
     let rel_l = rel.to_ascii_lowercase();
     let name_l = name.to_ascii_lowercase();
@@ -1430,6 +1464,15 @@ fn is_excluded(rel: &str, name: &str, excludes: &[String]) -> bool {
         }
         if let Some(suffix) = pat.strip_prefix('*') {
             if !suffix.is_empty() && (name_l.ends_with(suffix) || rel_l.ends_with(suffix)) {
+                return true;
+            }
+            continue;
+        }
+        if let Some(prefix) = pat.strip_suffix('*') {
+            let prefix = prefix.trim_end_matches('/');
+            if !prefix.is_empty()
+                && (name_l.starts_with(prefix) || rel_l.split('/').any(|s| s.starts_with(prefix)))
+            {
                 return true;
             }
             continue;

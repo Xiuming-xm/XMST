@@ -12,7 +12,10 @@
 //! 5. `logs/latest.log` 首部的 "Starting minecraft server version X"（兜底）
 //! 6. `mods/` / `plugins/` 目录是否存在（弱证据，用于区分模组端/插件端）
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// 服务端平台类别。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +113,9 @@ impl PlatformInfo {
         }
     }
 }
+
+/// 识别结果的别名（对外统一叫法）：与 `PlatformInfo` 是同一个类型。
+pub type ServerInfo = PlatformInfo;
 
 /// 从 jar 文件里读 `version.json` 的 `id`/`name`（原版与 Paper 系服务端 jar 都带）。
 fn mc_version_from_jar(path: &Path) -> Option<String> {
@@ -467,6 +473,313 @@ pub fn detect(dir: &Path) -> PlatformInfo {
         mod_count,
         plugin_count,
     }
+}
+
+// ---------- 缓存层（渲染路径每帧调用 detect() 会反复读盘，这里做记忆化） ----------
+
+/// detect 缓存：规范化目录 → (写入时刻, 识别结果)
+static DETECT_CACHE: OnceLock<Mutex<HashMap<PathBuf, (Instant, PlatformInfo)>>> = OnceLock::new();
+/// mods 元数据缓存：规范化目录 → (目录指纹, 写入时刻, 清单)
+static MOD_META_CACHE: OnceLock<Mutex<HashMap<PathBuf, ModMetaCacheEntry>>> = OnceLock::new();
+/// 单个缓存的条目上限：超出后整表清空（避免服务器很多时无限增长）
+const CACHE_MAX_ENTRIES: usize = 64;
+/// mods 元数据最长复用时间（即使指纹没变也定期重扫一次，避免极端的"指纹巧合"）
+const MOD_META_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn detect_cache() -> &'static Mutex<HashMap<PathBuf, (Instant, PlatformInfo)>> {
+    DETECT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn mod_meta_cache() -> &'static Mutex<HashMap<PathBuf, ModMetaCacheEntry>> {
+    MOD_META_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 缓存键：规范化的绝对路径，并整体转小写（Windows 路径不区分大小写；
+/// 相对路径 / `..` / 短名 8.3 会让同一目录算出不同的键，缓存就形同虚设）。
+/// 取不到 canonicalize（目录刚被删除等）时退化成"绝对化 + 小写"。
+fn normalize_cache_key(dir: &Path) -> PathBuf {
+    let abs = std::fs::canonicalize(dir).unwrap_or_else(|_| {
+        if dir.is_absolute() {
+            dir.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|c| c.join(dir))
+                .unwrap_or_else(|_| dir.to_path_buf())
+        }
+    });
+    PathBuf::from(abs.to_string_lossy().to_lowercase())
+}
+
+/// 带 TTL 记忆化的 `detect`：同一目录在 `ttl` 内直接返回缓存（`ttl` 为 0 时等价于强制刷新）。
+/// 签名与既有 `detect` 无关，`detect` 行为完全不变。建议 UI 用 3～5 秒。
+pub fn detect_cached(dir: &Path, ttl: Duration) -> ServerInfo {
+    let key = normalize_cache_key(dir);
+    if ttl > Duration::ZERO {
+        let cache = detect_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, info)) = cache.get(&key) {
+            if at.elapsed() < ttl {
+                return info.clone();
+            }
+        }
+    }
+    let info = detect(dir);
+    {
+        let mut cache = detect_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= CACHE_MAX_ENTRIES && !cache.contains_key(&key) {
+            cache.clear();
+        }
+        cache.insert(key, (Instant::now(), info.clone()));
+    }
+    info
+}
+
+/// 主动失效某个目录的缓存（用户改动目录内容 / 重命名 / 换核心后调用）。
+/// 该目录的识别结果与 mods 元数据缓存一起失效。
+pub fn invalidate_cache(dir: &Path) {
+    let key = normalize_cache_key(dir);
+    detect_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
+    mod_meta_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
+}
+
+/// 清空全部缓存（切换服务器 / 手动刷新时可用）。
+pub fn clear_cache() {
+    detect_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    mod_meta_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
+// ---------- mods/*.jar 元数据扫描（逐个开 jar 是重活，按目录指纹缓存） ----------
+
+/// 单个模组 jar 的元数据。
+#[derive(Debug, Clone, Default)]
+pub struct ModMeta {
+    /// jar 文件名（含扩展名）
+    pub file_name: String,
+    /// 模组 id（fabric.mod.json 的 id / mods.toml 的 modId）
+    pub mod_id: Option<String>,
+    /// 显示名（fabric.mod.json 的 name / mods.toml 的 displayName）
+    pub name: Option<String>,
+    /// 模组版本
+    pub version: Option<String>,
+    /// 元数据来源：fabric / quilt / forge / neoforge
+    pub loader: Option<String>,
+}
+
+impl ModMeta {
+    /// 兼容"别名列表"用法（modid + 显示名，去重、去空），便于按名字匹配日志/报告。
+    pub fn aliases(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for v in [&self.mod_id, &self.name] {
+            if let Some(s) = v {
+                if !s.is_empty() && !out.contains(s) {
+                    out.push(s.clone());
+                }
+            }
+        }
+        out
+    }
+}
+
+struct ModMetaCacheEntry {
+    /// 目录指纹：(jar 数量, jar 总字节, 最新 mtime 纳秒)
+    fingerprint: (usize, u64, i64),
+    at: Instant,
+    list: Vec<ModMeta>,
+}
+
+/// 元数据文本清洗：空 / 形如 `${version}` `%version%` 的未替换占位符一律当作"没有"。
+fn clean_meta_value(v: Option<&str>) -> Option<String> {
+    let s = v?.trim();
+    if s.is_empty() || s.contains("${") || s.starts_with('%') {
+        return None;
+    }
+    Some(s.to_string())
+}
+
+/// 目录指纹：只做一次 read_dir + metadata，比逐个开 jar 便宜得多。
+fn mods_fingerprint(dir: &Path) -> (usize, u64, i64) {
+    let mut count = 0usize;
+    let mut total = 0u64;
+    let mut newest = 0i64;
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return (0, 0, 0);
+    };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !name.to_lowercase().ends_with(".jar") {
+            continue;
+        }
+        let Ok(md) = e.metadata() else { continue };
+        if !md.is_file() {
+            continue;
+        }
+        count += 1;
+        total = total.saturating_add(md.len());
+        if let Ok(mtime) = md.modified() {
+            if let Ok(d) = mtime.duration_since(std::time::UNIX_EPOCH) {
+                let ns = d.as_nanos().min(i64::MAX as u128) as i64;
+                if ns > newest {
+                    newest = ns;
+                }
+            }
+        }
+    }
+    (count, total, newest)
+}
+
+/// 读单个 jar 的元数据；损坏 / 无元数据的 jar 只返回文件名，绝不 panic。
+fn read_mod_meta(path: &Path, file_name: String) -> ModMeta {
+    let mut meta = ModMeta {
+        file_name,
+        ..Default::default()
+    };
+    let Ok(file) = std::fs::File::open(path) else {
+        return meta;
+    };
+    let Ok(mut z) = zip::ZipArchive::new(file) else {
+        return meta;
+    };
+    // ---- Fabric / Quilt：fabric.mod.json / quilt.mod.json ----
+    for (entry, loader) in [("fabric.mod.json", "fabric"), ("quilt.mod.json", "quilt")] {
+        let Ok(mut f) = z.by_name(entry) else { continue };
+        let mut s = String::new();
+        if std::io::Read::read_to_string(&mut f, &mut s).is_err() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) else {
+            continue;
+        };
+        let q = v.get("quilt_loader");
+        meta.mod_id = clean_meta_value(
+            v.get("id")
+                .and_then(|x| x.as_str())
+                .or_else(|| q.and_then(|q| q.get("id")).and_then(|x| x.as_str())),
+        );
+        meta.name = clean_meta_value(
+            v.get("name").and_then(|x| x.as_str()).or_else(|| {
+                q.and_then(|q| q.get("metadata"))
+                    .and_then(|m| m.get("name"))
+                    .and_then(|x| x.as_str())
+            }),
+        );
+        meta.version = clean_meta_value(
+            v.get("version")
+                .and_then(|x| x.as_str())
+                .or_else(|| q.and_then(|q| q.get("version")).and_then(|x| x.as_str())),
+        );
+        meta.loader = Some(loader.to_string());
+        break;
+    }
+    // ---- Forge / NeoForge：META-INF/mods.toml（取第一条 [[mods]]） ----
+    if meta.mod_id.is_none() {
+        for (entry, loader) in [
+            ("META-INF/neoforge.mods.toml", "neoforge"),
+            ("META-INF/mods.toml", "forge"),
+        ] {
+            let Ok(mut f) = z.by_name(entry) else { continue };
+            let mut s = String::new();
+            if std::io::Read::read_to_string(&mut f, &mut s).is_err() {
+                continue;
+            }
+            if let Ok(v) = toml::from_str::<toml::Value>(&s) {
+                if let Some(m) = v
+                    .get("mods")
+                    .and_then(|m| m.as_array())
+                    .and_then(|a| a.first())
+                {
+                    meta.mod_id = clean_meta_value(m.get("modId").and_then(|x| x.as_str()));
+                    meta.name = clean_meta_value(m.get("displayName").and_then(|x| x.as_str()));
+                    meta.version = clean_meta_value(m.get("version").and_then(|x| x.as_str()));
+                }
+            }
+            meta.loader = Some(loader.to_string());
+            break;
+        }
+    }
+    // ---- 兜底：MANIFEST.MF 的 Implementation-Version ----
+    if meta.version.is_none() {
+        if let Ok(mut f) = z.by_name("META-INF/MANIFEST.MF") {
+            let mut s = String::new();
+            if std::io::Read::read_to_string(&mut f, &mut s).is_ok() {
+                for line in s.lines() {
+                    if let Some(v) = line.strip_prefix("Implementation-Version:") {
+                        meta.version = clean_meta_value(Some(v));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    meta
+}
+
+/// 真正扫描 mods 目录（不查缓存）：只认 `.jar`，按文件名排序。
+fn scan_mod_metadata_uncached(dir: &Path) -> Vec<ModMeta> {
+    let mut out: Vec<ModMeta> = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !name.to_lowercase().ends_with(".jar") {
+            continue;
+        }
+        let p = e.path();
+        if !p.is_file() {
+            continue;
+        }
+        out.push(read_mod_meta(&p, name));
+    }
+    out.sort_by(|a, b| {
+        a.file_name
+            .to_lowercase()
+            .cmp(&b.file_name.to_lowercase())
+    });
+    out
+}
+
+/// 扫描 mods 目录内的 jar，读取 fabric.mod.json / mods.toml / META-INF 元数据（modid、名称、版本）。
+/// 结果按 (目录 + 目录内文件总大小/mtime 指纹) 缓存，避免每次重开所有 jar：
+/// 指纹不变直接复用，指纹变了立即重扫；即使指纹没变，超过 24 小时也会重扫一次。
+/// 损坏的 jar 会被跳过（只保留文件名），不会 panic。
+pub fn scan_mod_metadata(dir: &Path) -> Vec<ModMeta> {
+    let key = normalize_cache_key(dir);
+    let fp = mods_fingerprint(dir);
+    {
+        let cache = mod_meta_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = cache.get(&key) {
+            if entry.fingerprint == fp && entry.at.elapsed() < MOD_META_TTL {
+                return entry.list.clone();
+            }
+        }
+    }
+    let list = scan_mod_metadata_uncached(dir);
+    {
+        let mut cache = mod_meta_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= CACHE_MAX_ENTRIES && !cache.contains_key(&key) {
+            cache.clear();
+        }
+        cache.insert(
+            key,
+            ModMetaCacheEntry {
+                fingerprint: fp,
+                at: Instant::now(),
+                list: list.clone(),
+            },
+        );
+    }
+    list
 }
 
 /// 从文件名里找形如 1.21 / 1.21.1 的 MC 版本号。

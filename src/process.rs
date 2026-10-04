@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
@@ -10,9 +11,11 @@ use winapi::shared::minwindef::{BOOL, DWORD, LPVOID};
 use winapi::um::handleapi::CloseHandle;
 use winapi::um::jobapi2::{AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject};
 use winapi::um::winnt::{
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JobObjectExtendedLimitInformation,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
 };
+
+/// stderr 末尾保留行数（崩溃诊断要展示"最后 30 行"，这里多留一些便于后续扩展）
+const STDERR_TAIL_LINES: usize = 200;
 
 /// 进程包装：持有子进程 + 日志通道
 pub struct ManagedProcess {
@@ -20,8 +23,17 @@ pub struct ManagedProcess {
     pub log_rx: Receiver<String>,
     /// 是否允许优雅停止（向 stdin 发送 stop）
     pub allow_stdin: bool,
-    /// Windows Job Object（KILL_ON_JOB_CLOSE）：句柄关闭时整树终止。
-    /// 主进程（本工具）崩溃 / 退出或 ManagedProcess 被 drop 时，MC 子进程不会成孤儿。
+    /// stderr 独立留存的末尾若干行（`STDERR_TAIL_LINES` 上限）。
+    /// stdout/stderr 仍然合并进 log_rx（日志栏显示不变），这里额外留一份"只属于 stderr"的
+    /// 副本：JVM 启动失败（例如 UnsupportedClassVersionError / 找不到主类）时错误只出现在
+    /// stderr，崩溃弹窗需要把它单独列出来，不能靠日志栏去猜。
+    pub stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    /// 本次启动的完整命令行（诊断信息展示用；cmd /c run.bat 形式则为 cmd /c run.bat）
+    pub cmdline: String,
+    /// Windows Job Object 句柄。**不再设置 KILL_ON_JOB_CLOSE**：
+    /// 目的是让"本工具被崩溃/被任务管理器强杀"时服务器（java）继续运行，避免玩家集体掉线。
+    /// 优雅退出（点关闭/菜单退出）由调用方显式结束进程树（见 `kill_tree`）；
+    /// 句柄本身只用于把子进程归组，关闭它不会终止任何进程。
     _job: Option<*mut winapi::ctypes::c_void>,
 }
 
@@ -30,7 +42,7 @@ unsafe impl Send for ManagedProcess {}
 
 impl Drop for ManagedProcess {
     fn drop(&mut self) {
-        // 关闭 Job 句柄：KILL_ON_JOB_CLOSE 会终止仍存活在作业内的全部进程（含孙子进程）。
+        // 仅关闭作业句柄（作业未设置 KILL_ON_JOB_CLOSE，关闭不会终止进程）。
         if let Some(j) = self._job.take() {
             unsafe {
                 CloseHandle(j as _);
@@ -39,15 +51,20 @@ impl Drop for ManagedProcess {
     }
 }
 
-/// 创建带 KILL_ON_JOB_CLOSE 的 Job Object；失败返回 None（调用方静默降级为无作业托管）。
-fn create_kill_on_close_job() -> Option<*mut winapi::ctypes::c_void> {
+/// 创建不带任何限制标志的 Job Object，仅用于把子进程归组。
+///
+/// 历史行为（已改）：这里曾设置 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`，好处是工具崩溃时
+/// 服务器一起被回收，代价是"工具闪退 = 玩家全部掉线、世界可能未保存"。
+/// 现在改为不设该标志：异常退出时服务器继续运行，下次启动工具会自动识别并提示接管。
+fn create_process_job() -> Option<*mut winapi::ctypes::c_void> {
     unsafe {
         let job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
         if job.is_null() {
             return None;
         }
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // LimitFlags = 0：不设任何限制，尤其不设 KILL_ON_JOB_CLOSE
+        info.BasicLimitInformation.LimitFlags = 0;
         let ret: BOOL = SetInformationJobObject(
             job,
             JobObjectExtendedLimitInformation,
@@ -103,10 +120,9 @@ pub fn spawn_hidden_env(
 
     let mut child = command.spawn()?;
 
-    // kill-on-drop：spawn 后立刻把子进程挂入 KILL_ON_JOB_CLOSE 作业。
-    // 主进程崩溃 / 退出 / 托管对象被 drop 时整树自动终止，杜绝 MC 子进程成孤儿。
+    // 把子进程挂入一个不带任何限制的作业（分组用，不再 kill-on-close）。
     // 挂载失败（如子进程已被其它 Job 托管）时静默降级为无作业托管，不影响启动。
-    let mut job = create_kill_on_close_job();
+    let mut job = create_process_job();
     if let Some(j) = job {
         let hproc = child.as_raw_handle();
         unsafe {
@@ -126,6 +142,12 @@ pub fn spawn_hidden_env(
     })?;
 
     let (tx, rx) = mpsc::channel::<String>();
+    let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let cmdline = if args.is_empty() {
+        cmd.to_string()
+    } else {
+        format!("{} {}", cmd, args.join(" "))
+    };
 
     // stdout 读取线程
     let tx_out = tx.clone();
@@ -143,12 +165,20 @@ pub fn spawn_hidden_env(
         }
     });
 
-    // stderr 读取线程
+    // stderr 读取线程：既并入日志通道（保持既有显示），又单独留末尾若干行供崩溃弹窗展示
+    let tail_shared = stderr_tail.clone();
     thread::spawn(move || {
         let reader = BufReader::new(stderr);
         for line in reader.lines() {
             match line {
                 Ok(l) => {
+                    {
+                        let mut tail = tail_shared.lock().unwrap_or_else(|e| e.into_inner());
+                        tail.push_back(l.clone());
+                        while tail.len() > STDERR_TAIL_LINES {
+                            tail.pop_front();
+                        }
+                    }
                     if tx.send(l).is_err() {
                         break;
                     }
@@ -162,25 +192,49 @@ pub fn spawn_hidden_env(
         child: Arc::new(Mutex::new(child)),
         log_rx: rx,
         allow_stdin,
+        stderr_tail,
+        cmdline,
         _job: job,
     })
 }
 
+/// 取该进程 stderr 的末尾 `max` 行（不足则全取；从未产生 stderr 时返回空 Vec，不算错误）。
+pub fn stderr_tail_lines(proc: &ManagedProcess, max: usize) -> Vec<String> {
+    let tail = proc.stderr_tail.lock().unwrap_or_else(|e| e.into_inner());
+    let n = tail.len();
+    tail.iter().skip(n.saturating_sub(max)).cloned().collect()
+}
+
 /// 向进程 stdin 写一行（用于 send console command 如 stop）
 pub fn write_stdin(proc: &ManagedProcess, line: &str) -> std::io::Result<()> {
-    use std::io::Write;
     if !proc.allow_stdin {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
             "stdin 未启用",
         ));
     }
-    let mut child = proc.child.lock().unwrap_or_else(|e| e.into_inner());
+    write_stdin_child(&proc.child, line)
+}
+
+/// 同 write_stdin，但直接作用于共享的子进程句柄（`ManagedProcess.child` 的克隆）。
+///
+/// 用途：系统关机/注销时窗口过程要向所有服务器发 stop，但它拿不到 ManagedProcess
+/// （那是 App 的字段，窗口过程不能借用 App），因此启动时把 child 句柄登记到全局表里，
+/// 关机路径只用这个句柄。不检查 allow_stdin（由调用方判断）。
+pub fn write_stdin_child(child: &Arc<Mutex<Child>>, line: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut child = child.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(stdin) = child.stdin.as_mut() {
         writeln!(stdin, "{}", line)?;
         stdin.flush()?;
     }
     Ok(())
+}
+
+/// 子进程是否仍在运行（按共享句柄查询，不阻塞）。
+pub fn child_running(child: &Arc<Mutex<Child>>) -> bool {
+    let mut child = child.lock().unwrap_or_else(|e| e.into_inner());
+    matches!(child.try_wait(), Ok(None))
 }
 
 /// 获取主进程 PID（用于性能采样）
@@ -562,4 +616,324 @@ pub fn drain_logs_discard(proc: &ManagedProcess) -> usize {
         n += 1;
     }
     n
+}
+
+// ==================== 外部启动实例识别（不在本工具托管内的 java 进程） ====================
+//
+// 场景：用户在工具外双击 run.bat 启动了服务器。工具只能按文件尾随读到日志，
+// 却既不知道"它在跑"，也无法停止/判定崩溃。这里提供识别它所需的三件事：
+//   1) 列出全部 java/javaw 进程（PID + 映像名 + 命令行 + 工作集）；
+//   2) 读取任意进程的命令行（优先 PEB，拿不到就给 None，由调用方退化判定）；
+//   3) 按 PID 结束整棵进程树（外部进程没有 Child 句柄，只能走 taskkill /T /F）。
+// 全部使用既有 winapi 依赖，不引入新库。
+
+/// 一个 java/javaw 进程的快照。
+#[derive(Clone, Debug, Default)]
+pub struct JavaProc {
+    /// 进程 ID
+    pub pid: u32,
+    /// 映像名（java.exe / javaw.exe，小写）
+    pub exe: String,
+    /// 命令行；读取失败（权限不足 / 32 位系统 / 系统保护进程）时为 None
+    pub cmdline: Option<String>,
+    /// 工作集（MB）
+    pub mem_mb: f32,
+}
+
+/// 枚举当前所有 java/javaw 进程。
+///
+/// 单次快照 + 逐个补命令行与内存，成本约几毫秒，请按秒级节流调用，不要每帧调用。
+pub fn list_java_processes() -> Vec<JavaProc> {
+    use winapi::um::handleapi::INVALID_HANDLE_VALUE;
+    use winapi::um::tlhelp32::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let mut out: Vec<JavaProc> = Vec::new();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return out;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        if Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                let pid = entry.th32ProcessID;
+                let name = wide_to_string(&entry.szExeFile).to_lowercase();
+                if pid != 0 && (name == "java.exe" || name == "javaw.exe") {
+                    out.push(JavaProc {
+                        pid,
+                        exe: name,
+                        cmdline: None,
+                        mem_mb: 0.0,
+                    });
+                }
+                if Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+    }
+    for p in out.iter_mut() {
+        p.cmdline = process_command_line(p.pid);
+        p.mem_mb = pid_memory_mb(p.pid);
+    }
+    out
+}
+
+/// 定长 UTF-16 数组 → String（遇到 NUL 截断）。
+fn wide_to_string(buf: &[u16]) -> String {
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..end]).trim().to_string()
+}
+
+/// 进程是否存活（OpenProcess 能拿到句柄且未被信号化）。PID 复用窗口极小，够用。
+pub fn pid_alive(pid: u32) -> bool {
+    use winapi::um::processthreadsapi::OpenProcess;
+    use winapi::um::winbase::WAIT_OBJECT_0;
+    use winapi::um::winnt::{PROCESS_QUERY_LIMITED_INFORMATION, SYNCHRONIZE};
+    if pid == 0 {
+        return false;
+    }
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid);
+        if h.is_null() {
+            return false;
+        }
+        let r = winapi::um::synchapi::WaitForSingleObject(h, 0);
+        CloseHandle(h);
+        r != WAIT_OBJECT_0
+    }
+}
+
+/// 单个进程的工作集（MB）；取不到返回 0。
+pub fn pid_memory_mb(pid: u32) -> f32 {
+    use winapi::um::processthreadsapi::OpenProcess;
+    use winapi::um::psapi::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
+    if pid == 0 {
+        return 0.0;
+    }
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return 0.0;
+        }
+        let mut pmc: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+        let ok = GetProcessMemoryInfo(
+            h,
+            &mut pmc,
+            std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        );
+        CloseHandle(h);
+        if ok == 0 {
+            0.0
+        } else {
+            pmc.WorkingSetSize as f32 / 1_048_576.0
+        }
+    }
+}
+
+/// 某个进程的全部后代 PID（不含自身）。
+///
+/// 用途：判断"外部启动实例"时必须把本工具托管进程的**整棵进程树**都排除掉。
+/// 通过 `cmd /c run.bat` 启动时，本工具直接持有的是 cmd.exe，真正的 java 是它的子进程；
+/// 只排除 cmd.exe 的 PID 会把自家托管的 java 误判成别台服务器的"外部实例"。
+pub fn pid_descendants(root: u32) -> Vec<u32> {
+    use winapi::um::handleapi::INVALID_HANDLE_VALUE;
+    use winapi::um::tlhelp32::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    let mut entries: Vec<(u32, u32)> = Vec::new();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return Vec::new();
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        if Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                entries.push((entry.th32ProcessID, entry.th32ParentProcessID));
+                if Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+    }
+    let mut out: Vec<u32> = Vec::new();
+    let mut frontier: Vec<u32> = vec![root];
+    while let Some(pid) = frontier.pop() {
+        for &(child, parent) in entries.iter() {
+            if parent == pid && child != root && !out.contains(&child) {
+                out.push(child);
+                frontier.push(child);
+            }
+        }
+    }
+    out
+}
+
+/// 按 PID 结束整棵进程树（外部实例用；没有 Child 句柄，只能靠 taskkill /T /F）。
+/// 返回值必须真实：taskkill 报告成功、或进程已查不到，才算成功。
+pub fn kill_pid_tree(pid: u32) -> bool {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    if pid == 0 {
+        return false;
+    }
+    let ok = Command::new("taskkill")
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|st| st.success())
+        .unwrap_or(false);
+    if ok || !pid_alive(pid) {
+        return true;
+    }
+    // 有上限地等一次：taskkill /F 之后进程可能在几百毫秒内才真正退出
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if !pid_alive(pid) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    false
+}
+
+/// 读取任意进程的命令行。
+///
+/// 手段：OpenProcess(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ) →
+/// `NtQueryInformationProcess(ProcessBasicInformation)` 取 PEB →
+/// `ReadProcessMemory` 读 PEB.ProcessParameters →
+/// 读 RTL_USER_PROCESS_PARAMETERS.CommandLine（UNICODE_STRING）。
+/// 64 位下这两个结构的偏移是固定的（0x20 / 0x70），本工具只出 x86_64 产物，
+/// 因此按 64 位偏移读取；非 64 位目标直接返回 None，由调用方退化判定。
+pub fn process_command_line(pid: u32) -> Option<String> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        read_command_line_x64(pid)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn read_command_line_x64(pid: u32) -> Option<String> {
+    use winapi::ctypes::c_void;
+    use winapi::um::memoryapi::ReadProcessMemory;
+    use winapi::um::processthreadsapi::OpenProcess;
+    use winapi::um::winnt::{PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
+
+    #[repr(C)]
+    struct ProcessBasicInformation {
+        reserved1: *mut c_void,
+        peb_base_address: *mut c_void,
+        reserved2: [*mut c_void; 2],
+        unique_process_id: usize,
+        reserved3: *mut c_void,
+    }
+
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtQueryInformationProcess(
+            handle: *mut c_void,
+            info_class: u32,
+            info: *mut c_void,
+            info_len: u32,
+            ret_len: *mut u32,
+        ) -> i32;
+    }
+
+    const PROCESS_BASIC_INFORMATION_CLASS: u32 = 0;
+    const PEB_PROCESS_PARAMETERS_OFFSET: usize = 0x20;
+    const PARAMS_COMMAND_LINE_OFFSET: usize = 0x70;
+    /// 命令行长度上限（UTF-16 字节数）：Windows 上限约 32767 字符，超过必然是读错了
+    const MAX_CMDLINE_BYTES: usize = 65536;
+
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid);
+        if h.is_null() {
+            return None;
+        }
+        let mut pbi: ProcessBasicInformation = std::mem::zeroed();
+        let mut got = 0u32;
+        let st = NtQueryInformationProcess(
+            h,
+            PROCESS_BASIC_INFORMATION_CLASS,
+            &mut pbi as *mut _ as *mut c_void,
+            std::mem::size_of::<ProcessBasicInformation>() as u32,
+            &mut got,
+        );
+        if st < 0 || pbi.peb_base_address.is_null() {
+            CloseHandle(h);
+            return None;
+        }
+        let mut read = 0usize;
+        let mut params: usize = 0;
+        let ok = ReadProcessMemory(
+            h,
+            (pbi.peb_base_address as usize + PEB_PROCESS_PARAMETERS_OFFSET) as *const c_void,
+            &mut params as *mut usize as *mut c_void,
+            std::mem::size_of::<usize>(),
+            &mut read,
+        );
+        if ok == 0 || params == 0 {
+            CloseHandle(h);
+            return None;
+        }
+        // UNICODE_STRING: Length(u16) MaximumLength(u16) 对齐填充(u32) Buffer(ptr)
+        let mut us = [0u8; 16];
+        let ok = ReadProcessMemory(
+            h,
+            (params + PARAMS_COMMAND_LINE_OFFSET) as *const c_void,
+            us.as_mut_ptr() as *mut c_void,
+            us.len(),
+            &mut read,
+        );
+        if ok == 0 {
+            CloseHandle(h);
+            return None;
+        }
+        let len = u16::from_le_bytes([us[0], us[1]]) as usize;
+        let buf_ptr = usize::from_le_bytes([us[8], us[9], us[10], us[11], us[12], us[13], us[14], us[15]]);
+        if len == 0 || len > MAX_CMDLINE_BYTES || buf_ptr == 0 || len % 2 != 0 {
+            CloseHandle(h);
+            return None;
+        }
+        let mut raw = vec![0u8; len];
+        let ok = ReadProcessMemory(
+            h,
+            buf_ptr as *const c_void,
+            raw.as_mut_ptr() as *mut c_void,
+            len,
+            &mut read,
+        );
+        CloseHandle(h);
+        if ok == 0 || read < len {
+            return None;
+        }
+        let wide: Vec<u16> = raw
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let s = wide_to_string(&wide);
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    }
 }

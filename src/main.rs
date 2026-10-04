@@ -33,7 +33,8 @@ use std::os::windows::process::CommandExt;
 /// �?run.bat 提取 Java 路径：支�?`set JAVA=...` / `set JAVA_PATH=...` /
 /// `set JAVA_HOME=...` 以及行内出现 `"C:\...\java.exe"` / `javaw.exe` 的形式�?
 fn extract_java_from_bat(bat: &Path) -> Option<String> {
-    let content = std::fs::read_to_string(bat).ok()?;
+    // 按原编码读取：GBK 脚本里有中文注释时 read_to_string 会失败，Java 路径就提取不到
+    let content = read_text_auto_encoding(bat).ok()?.0;
     for line in content.lines() {
         let line = line.trim();
         let lower = line.to_lowercase();
@@ -190,6 +191,445 @@ fn prepare_private_tmp(dir: &Path, sc: &ServerConfig) -> Result<Option<PathBuf>,
     std::fs::create_dir_all(&p)
         .map_err(|e| format!("创建独立临时目录 {} 失败: {e}", p.display()))?;
     Ok(Some(p))
+}
+
+// ---------- 物理内存与 JVM 参数推荐 ----------
+
+/// 物理内存总量（GB，向下取整；读取失败回退 8GB）。
+/// 结果缓存：设置页每帧都要显示推荐值，GlobalMemoryStatusEx 虽是系统调用也不该每帧打一次。
+fn physical_memory_gb() -> u64 {
+    static MEM_GB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MEM_GB.get_or_init(|| unsafe {
+        let mut ms: winapi::um::sysinfoapi::MEMORYSTATUSEX = std::mem::zeroed();
+        ms.dwLength = std::mem::size_of::<winapi::um::sysinfoapi::MEMORYSTATUSEX>() as u32;
+        if winapi::um::sysinfoapi::GlobalMemoryStatusEx(&mut ms) != 0 {
+            (ms.ullTotalPhys / (1024 * 1024 * 1024)).max(1)
+        } else {
+            8
+        }
+    })
+}
+
+/// 按物理内存推荐 JVM 参数：-Xmx 取物理内存的 50%（向下取整到 GB）并钳制在 [2G, 16G]，
+/// 同时打开 G1 与 200ms 停顿目标（大堆上默认 GC 的停顿明显更长）。
+/// 用户已填 JVM 参数时一律不覆盖。
+fn recommended_jvm_args(phys_gb: u64) -> String {
+    let xmx = (phys_gb / 2).clamp(2, 16);
+    format!("-Xms1G -Xmx{xmx}G -XX:+UseG1GC -XX:MaxGCPauseMillis=200")
+}
+
+// ---------- 文本文件编码：读写必须保持原编码 ----------
+
+/// 文本文件编码标记（读取时探测，写回时沿用）。
+///
+/// 为什么必须保持原编码：把 GBK 编码的 run.bat 按 UTF-8 读出来再按 UTF-8 写回，
+/// 中文会变成乱码，cmd 解析脚本失败 → 服务器完全起不来（真实事故，排查了很久）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TextEncoding {
+    /// 无 BOM 的 UTF-8
+    Utf8,
+    /// 带 UTF-8 BOM（EF BB BF）
+    Utf8Bom,
+    /// UTF-16 小端（FF FE）
+    Utf16Le,
+    /// UTF-16 大端（FE FF）
+    Utf16Be,
+    /// 系统 ANSI 代码页（中文 Windows 即 GBK/CP936）；cmd 也是按它解析 .bat 的
+    Gbk,
+}
+
+impl TextEncoding {
+    fn label(self) -> &'static str {
+        match self {
+            TextEncoding::Utf8 => "UTF-8",
+            TextEncoding::Utf8Bom => "UTF-8 (BOM)",
+            TextEncoding::Utf16Le => "UTF-16 LE",
+            TextEncoding::Utf16Be => "UTF-16 BE",
+            TextEncoding::Gbk => "GBK",
+        }
+    }
+}
+
+/// 编辑器打开的文件元信息：原编码 + 原换行风格（保存时按它写回，不改动编码与换行）。
+#[derive(Clone, Copy)]
+struct TextMeta {
+    enc: TextEncoding,
+    crlf: bool,
+}
+
+/// 是否批处理脚本（.bat/.cmd）：cmd 按 ANSI 代码页解析脚本，这类文件必须按 GBK 读写。
+fn is_bat_file(path: &Path) -> bool {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(e) => e.eq_ignore_ascii_case("bat") || e.eq_ignore_ascii_case("cmd"),
+        None => false,
+    }
+}
+
+/// 新建文件（目标不存在）时的默认编码：批处理用 GBK，其余用 UTF-8。
+fn default_text_encoding(path: &Path) -> TextEncoding {
+    if is_bat_file(path) {
+        TextEncoding::Gbk
+    } else {
+        TextEncoding::Utf8
+    }
+}
+
+/// ANSI(CP_ACP) 字节 → String。CP_ACP 在中文 Windows 上就是 GBK(CP936)。
+/// 走 winapi 的 MultiByteToWideChar（stringapiset），不引入额外的编码库。
+fn ansi_bytes_to_string(bytes: &[u8]) -> Result<String, String> {
+    use winapi::um::stringapiset::MultiByteToWideChar;
+    use winapi::um::winnls::CP_ACP;
+    if bytes.is_empty() {
+        return Ok(String::new());
+    }
+    let len = bytes.len().min(i32::MAX as usize) as i32;
+    unsafe {
+        let need = MultiByteToWideChar(
+            CP_ACP,
+            0,
+            bytes.as_ptr() as *const i8,
+            len,
+            std::ptr::null_mut(),
+            0,
+        );
+        if need <= 0 {
+            return Err("按系统 ANSI 代码页(GBK) 解码失败".to_string());
+        }
+        let mut buf: Vec<u16> = vec![0u16; need as usize];
+        let got = MultiByteToWideChar(
+            CP_ACP,
+            0,
+            bytes.as_ptr() as *const i8,
+            len,
+            buf.as_mut_ptr(),
+            need,
+        );
+        if got <= 0 {
+            return Err("按系统 ANSI 代码页(GBK) 解码失败".to_string());
+        }
+        buf.truncate(got as usize);
+        Ok(String::from_utf16_lossy(&buf))
+    }
+}
+
+/// String → ANSI(CP_ACP) 字节。
+/// 为什么 .bat 必须走 CP_ACP：cmd 按控制台的 ANSI 代码页解析批处理文件，
+/// 工具若按 UTF-8 写 .bat，中文会乱码、脚本解析失败，服务器直接起不来（用户踩过）；
+/// 反过来把 CP_ACP 写好的 bat 按 UTF-8 读进来再写回去，同样会写坏。
+/// WC_NO_BEST_FIT_CHARS + lpUsedDefaultChar：无法映射的字符（如 emoji）会被判出来，
+/// 由调用方拒绝保存，绝不静默写成 '?'。
+fn string_to_ansi_bytes(text: &str) -> Result<Vec<u8>, String> {
+    use winapi::um::stringapiset::WideCharToMultiByte;
+    use winapi::um::winnls::{CP_ACP, WC_NO_BEST_FIT_CHARS};
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    let len = wide.len().min(i32::MAX as usize) as i32;
+    const UNMAPPABLE: &str =
+        "内容含无法用 GBK(ANSI) 表示的字符（如 emoji），已取消保存以免写成乱码或问号";
+    unsafe {
+        let mut used_default: i32 = 0;
+        let need = WideCharToMultiByte(
+            CP_ACP,
+            WC_NO_BEST_FIT_CHARS,
+            wide.as_ptr(),
+            len,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+            &mut used_default,
+        );
+        if need <= 0 || used_default != 0 {
+            return Err(UNMAPPABLE.to_string());
+        }
+        let mut buf: Vec<u8> = vec![0u8; need as usize];
+        let mut used_default2: i32 = 0;
+        let got = WideCharToMultiByte(
+            CP_ACP,
+            WC_NO_BEST_FIT_CHARS,
+            wide.as_ptr(),
+            len,
+            buf.as_mut_ptr() as *mut i8,
+            need,
+            std::ptr::null(),
+            &mut used_default2,
+        );
+        if got <= 0 || used_default2 != 0 {
+            return Err(UNMAPPABLE.to_string());
+        }
+        buf.truncate(got as usize);
+        Ok(buf)
+    }
+}
+
+/// 探测换行风格：出现 "\r\n" 即视为 CRLF（Windows 上的文本文件基本都是）。
+fn detect_crlf(text: &str) -> bool {
+    text.contains("\r\n")
+}
+
+/// 统一换行风格：CRLF/CR 先归一成 LF，再按目标风格展开。编辑器内部统一用 LF
+/// （egui 只按 \n 断行，残留的 \r 会显示成多余字符），写回时再还原成原文件的换行风格。
+fn normalize_newlines(text: &str, crlf: bool) -> String {
+    let mut out = String::with_capacity(text.len() + text.len() / 16);
+    let mut it = text.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '\r' => {
+                if it.peek() == Some(&'\n') {
+                    it.next();
+                }
+                out.push_str(if crlf { "\r\n" } else { "\n" });
+            }
+            '\n' => out.push_str(if crlf { "\r\n" } else { "\n" }),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// 读取文本文件并识别编码：UTF-8 BOM / UTF-16 BOM / 合法 UTF-8 / 否则按 GBK(CP_ACP) 解码。
+/// 返回 (内容, 编码标记)。
+/// 文件不存在时返回 (空串, 按扩展名推断的默认编码)，便于调用方直接进「新建」分支。
+fn read_text_auto_encoding(path: &Path) -> Result<(String, TextEncoding), String> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((String::new(), default_text_encoding(path)));
+        }
+        Err(e) => return Err(format!("读取失败: {e}")),
+    };
+    if bytes.is_empty() {
+        return Ok((String::new(), default_text_encoding(path)));
+    }
+    // ① UTF-8 BOM
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        let body = bytes.get(3..).unwrap_or(&[]);
+        return match std::str::from_utf8(body) {
+            Ok(s) => Ok((s.to_string(), TextEncoding::Utf8Bom)),
+            // BOM 之后不是合法 UTF-8：按 ANSI 解码，宁可显示可能不准也不丢内容
+            Err(_) => Ok((ansi_bytes_to_string(body)?, TextEncoding::Gbk)),
+        };
+    }
+    // ② UTF-16 BOM（小端 FF FE / 大端 FE FF）
+    let utf16_le = bytes.starts_with(&[0xFF, 0xFE]);
+    if utf16_le || bytes.starts_with(&[0xFE, 0xFF]) {
+        let body = bytes.get(2..).unwrap_or(&[]);
+        let mut units: Vec<u16> = Vec::with_capacity(body.len() / 2);
+        for pair in body.chunks_exact(2) {
+            if let [a, b] = pair {
+                units.push(if utf16_le {
+                    u16::from_le_bytes([*a, *b])
+                } else {
+                    u16::from_be_bytes([*a, *b])
+                });
+            }
+        }
+        return match String::from_utf16(&units) {
+            Ok(s) => Ok((
+                s,
+                if utf16_le {
+                    TextEncoding::Utf16Le
+                } else {
+                    TextEncoding::Utf16Be
+                },
+            )),
+            Err(_) => Err("UTF-16 解码失败（文件可能已损坏）".to_string()),
+        };
+    }
+    // ③ 合法 UTF-8
+    if let Ok(s) = std::str::from_utf8(&bytes) {
+        return Ok((s.to_string(), TextEncoding::Utf8));
+    }
+    // ④ 其余按系统 ANSI（GBK）解码
+    Ok((ansi_bytes_to_string(&bytes)?, TextEncoding::Gbk))
+}
+
+/// 编辑器读取入口：在 read_text_auto_encoding 之上探测换行风格，并把内容归一成 LF。
+/// 空文件/新文件按 Windows 习惯记为 CRLF。
+fn read_text_for_edit(path: &Path) -> Result<(String, TextMeta), String> {
+    let (text, enc) = read_text_auto_encoding(path)?;
+    let crlf = if text.is_empty() {
+        true
+    } else {
+        detect_crlf(&text)
+    };
+    Ok((normalize_newlines(&text, false), TextMeta { enc, crlf }))
+}
+
+/// 取文件所在目录（无父目录或父目录为空串时用当前目录），用于临时文件与备份。
+fn parent_dir_of(path: &Path) -> PathBuf {
+    match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
+/// 覆盖前备份：原文件复制成 `<名字>.bak_<时间戳>`，同名前缀只保留最近 3 份（多的删掉）。
+fn backup_before_overwrite(path: &Path) -> Result<(), String> {
+    let dir = parent_dir_of(path);
+    let file_name = match path.file_name() {
+        Some(n) => n.to_string_lossy().to_string(),
+        None => return Ok(()),
+    };
+    let bak = dir.join(format!(
+        "{}.bak_{}",
+        file_name,
+        Local::now().format("%Y%m%d_%H%M%S")
+    ));
+    std::fs::copy(path, &bak).map_err(|e| format!("备份原文件失败（已取消保存）: {e}"))?;
+    // 只保留最近 3 份（名字带时间戳，按名字排序即按时间排序）
+    let prefix = format!("{file_name}.bak_");
+    let mut list: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .map(|n| n.to_string_lossy().starts_with(&prefix))
+                        .unwrap_or(false)
+                })
+                .collect::<Vec<PathBuf>>()
+        })
+        .unwrap_or_default();
+    list.sort();
+    while list.len() > 3 {
+        let oldest = list.remove(0);
+        let _ = std::fs::remove_file(oldest);
+    }
+    Ok(())
+}
+
+/// 按指定编码写回（UTF-8 BOM / UTF-8 / GBK），保持原文件的换行风格（CRLF/LF）。
+///
+/// 流程（任何一步失败都不破坏原文件）：
+///   ① 按目标编码编码内容：无法表示（如 GBK 下出现 emoji）直接返回 Err，绝不静默写成 '?'；
+///   ② 写同目录临时文件；
+///   ③ 原文件存在则先备份成 `<名字>.bak_<时间戳>`（只保留最近 3 份）；
+///   ④ rename 原子覆盖原文件。
+fn write_text_same_encoding(
+    path: &Path,
+    text: &str,
+    enc: TextEncoding,
+    crlf: bool,
+) -> Result<(), String> {
+    let body = normalize_newlines(text, crlf);
+    let bytes: Vec<u8> = match enc {
+        TextEncoding::Utf8 => body.as_bytes().to_vec(),
+        TextEncoding::Utf8Bom => {
+            let mut b: Vec<u8> = vec![0xEF, 0xBB, 0xBF];
+            b.extend_from_slice(body.as_bytes());
+            b
+        }
+        TextEncoding::Utf16Le => {
+            let mut b: Vec<u8> = vec![0xFF, 0xFE];
+            for u in body.encode_utf16() {
+                b.extend_from_slice(&u.to_le_bytes());
+            }
+            b
+        }
+        TextEncoding::Utf16Be => {
+            let mut b: Vec<u8> = vec![0xFE, 0xFF];
+            for u in body.encode_utf16() {
+                b.extend_from_slice(&u.to_be_bytes());
+            }
+            b
+        }
+        TextEncoding::Gbk => string_to_ansi_bytes(&body)?,
+    };
+    let dir = parent_dir_of(path);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
+    let file_name = match path.file_name() {
+        Some(n) => n.to_string_lossy().to_string(),
+        None => return Err("文件名无效".to_string()),
+    };
+    let tmp = dir.join(format!("{file_name}.xmst.tmp"));
+    std::fs::write(&tmp, &bytes).map_err(|e| format!("写入临时文件失败: {e}"))?;
+    if path.exists() {
+        if let Err(e) = backup_before_overwrite(path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(format!("替换原文件失败: {e}"))
+        }
+    }
+}
+
+/// 生成 run.bat 的内容。要点（都是踩过的坑）：
+///   · 不写 pause：工具托管时 pause 会让进程永不退出，工具无法判定「正常关服」，
+///     会漏掉关服自动快照；需要手动双击调试时自行在末尾加一行 pause；
+///   · MAX_RESTARTS=1：重启交给工具，避免脚本自身的重启循环与工具的崩溃自动重启叠加成「停不下来」；
+///   · TEMP/TMP 与 -Djava.io.tmpdir 都指向 %~dp0tmp：JNA / sqlite-jdbc 要把原生 DLL 解压到
+///     java.io.tmpdir，全局临时目录有残留时会加载失败；
+///   · -Dfile.encoding=UTF-8：中文日志/插件输出更稳；
+///   · 不写 chcp：批处理文件本身按 GBK 保存，改代码页会与文件编码打架。
+/// 内容里的换行统一用 \n，落盘时由 write_text_same_encoding 转成 CRLF。
+fn build_run_bat(java: &str, jvm_args: &str, core_jar: &str) -> String {
+    let jvm = if jvm_args.trim().is_empty() {
+        recommended_jvm_args(physical_memory_gb())
+    } else {
+        jvm_args.trim().to_string()
+    };
+    // 与「公式化启动」同一套判断：已经写过的参数不重复追加
+    let mut extra: Vec<&str> = Vec::new();
+    if !jvm.contains("-Dfile.encoding") {
+        extra.push("-Dfile.encoding=UTF-8");
+    }
+    if !jvm.contains("-Djava.io.tmpdir") {
+        // 引号内联：%~dp0 展开后可能含空格，写成 "…=%~dp0tmp" 才不会被拆成两个参数
+        extra.push("\"-Djava.io.tmpdir=%~dp0tmp\"");
+    }
+    let extra = if extra.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", extra.join(" "))
+    };
+    let java = if java.trim().is_empty() {
+        "java"
+    } else {
+        java.trim()
+    };
+    let core = if core_jar.trim().is_empty() {
+        "server.jar"
+    } else {
+        core_jar.trim()
+    };
+    let mut s = String::new();
+    s.push_str("@echo off\n");
+    s.push_str("rem ===== XMST 生成的启动脚本（本文件按 GBK/ANSI 保存，勿用 UTF-8 另存，否则 cmd 读中文会乱码）=====\n");
+    s.push_str("rem 不写 pause：XMST 托管时 pause 会让进程卡住不退出，工具无法判断「正常关服」而漏掉关服快照。\n");
+    s.push_str("rem 需要手动双击调试时，自行在最后加一行 pause。\n");
+    s.push_str("rem MAX_RESTARTS 取 1：重启交给 XMST，避免脚本自身重启与工具崩溃重启叠加。\n");
+    s.push_str("set \"MAX_RESTARTS=1\"\n");
+    s.push_str("rem 独立临时目录：JNA / sqlite-jdbc 要把原生 DLL 解压到 java.io.tmpdir，指向 %~dp0tmp 避免加载失败。\n");
+    s.push_str("set \"TEMP=%~dp0tmp\"\n");
+    s.push_str("set \"TMP=%~dp0tmp\"\n");
+    s.push_str("if not exist \"%~dp0tmp\" mkdir \"%~dp0tmp\"\n");
+    s.push_str(&format!(
+        "\"{java}\" {jvm}{extra} -jar {core} nogui\n"
+    ));
+    s
+}
+
+/// 生成/覆盖服务器目录下的 run.bat（GBK + CRLF、无 BOM）。
+/// 覆盖前由 write_text_same_encoding 把原文件备份成 run.bat.bak_<时间戳>。
+/// 必须按 GBK(CP_ACP) 写：cmd 按 ANSI 代码页解析 .bat，UTF-8 会让中文乱码、脚本解析失败。
+fn generate_run_bat(
+    dir: &Path,
+    java: &str,
+    jvm_args: &str,
+    core_jar: &str,
+) -> Result<PathBuf, String> {
+    let content = build_run_bat(java, jvm_args, core_jar);
+    std::fs::create_dir_all(dir).map_err(|e| format!("创建服务器目录失败: {e}"))?;
+    let path = dir.join("run.bat");
+    write_text_same_encoding(&path, &content, TextEncoding::Gbk, true)?;
+    Ok(path)
 }
 
 /// ===== 服务端核心检测：目录/JAR/ZIP 整合包（拖入自动识别） =====
@@ -1157,10 +1597,16 @@ struct ServerRuntime {
     log_tail: Option<process::LogFileTail>,
     // 脚本编辑状�? (run.bat 内容, user_jvm_args 内容)
     run_bat_edit: Option<String>,
+    /// run.bat 原编码与换行风格（保存时按它写回，避免把 GBK 脚本写成 UTF-8 导致乱码）
+    run_bat_meta: Option<TextMeta>,
     jvm_args_edit: Option<String>,
+    /// user_jvm_args.txt 原编码与换行风格
+    jvm_args_meta: Option<TextMeta>,
     // server.properties 编辑状�? (键值对缓存, 高级文本缓冲, 是否高级模式)
     server_props_map: Option<std::collections::BTreeMap<String, String>>,
     server_props_text: Option<String>,
+    /// server.properties 原编码与换行风格
+    server_props_meta: Option<TextMeta>,
     server_props_advanced: bool,
     // 文件浏览
     file_tab: String,
@@ -1170,6 +1616,8 @@ struct ServerRuntime {
     file_sub: Vec<String>,
     file_list: Vec<(String, u64, bool)>, // (name, size, is_dir)
     file_content_edit: Option<(String, String)>, // (path, content)
+    /// 文件编辑器里当前文件的原编码与换行风格（保存时按它写回）
+    file_content_meta: Option<TextMeta>,
     /// 文件浏览搜索关键字（过滤文件名）
     file_search: String,
     /// 收藏的文件名（置顶显示）
@@ -1289,6 +1737,50 @@ struct ServerRuntime {
     mod_jar_index: Option<Vec<spark_analysis::ModJarInfo>>,
     /// 文件浏览：滚动定位目标（命中后滚动到该行并清空）
     file_scroll_to: Option<String>,
+    // ---------- 外部启动实例（用户在本工具之外双击 run.bat 启动的服务器）----------
+    /// 识别到的外部实例（None=未检测到）。仅当本工具没有该服务器的托管进程时才有值。
+    external: Option<ExternalInstance>,
+    /// 已接管的外部实例 PID（接管后按"运行中"处理：可停止/强停/判定关服/崩溃检测）
+    adopted_pid: Option<u32>,
+    /// 已接管实例的命令行（诊断信息展示）
+    adopted_cmdline: String,
+    /// 已接管实例的工作集（MB，UI 展示）
+    adopted_mem_mb: f32,
+    /// 已接管实例的内存显示是否尚未采样（接管首帧先补一次采样）
+    adopted_mem_at: Option<std::time::Instant>,
+    /// 本工具最后一次停止（优雅/强杀）该服务器的时刻：外部实例判定与日志尾随的基准线
+    last_stopped_at: Option<std::time::SystemTime>,
+    /// 本次启动时刻（SystemTime）：崩溃分析只认这次运行产生的报告
+    run_started: Option<std::time::SystemTime>,
+    /// 本次启动的完整命令行（崩溃弹窗/诊断信息用）
+    run_cmdline: String,
+    /// 上一次进程退出码（崩溃弹窗展示）
+    last_exit_code: Option<i32>,
+    /// 上一次运行 stderr 的末尾 30 行（崩溃弹窗展示；stderr 为空时是空列表，不算错误）
+    last_stderr: Vec<String>,
+    // ---------- 启动前预检 ----------
+    /// 预检结果窗口是否打开
+    precheck_open: bool,
+    /// 预检是否在后台执行中
+    precheck_busy: bool,
+    /// 预检结果（每项：通过/警告/失败 + 标题 + 说明 + 建议）
+    precheck_items: Vec<PrecheckItem>,
+    // ---------- 模组检查更新（BETA_MOD_UPDATE）----------
+    /// 检查更新结果窗口是否打开
+    modupd_open: bool,
+    /// 检查更新执行中
+    modupd_busy: bool,
+    /// 检查更新结果行
+    modupd_rows: Vec<ModUpdateRow>,
+    /// 检查更新进度文本
+    modupd_progress: String,
+    /// 检查更新取消标志（后台线程每检查完一个模组看一次）
+    modupd_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    // ---------- 备份锁定 / 转存 ----------
+    /// 正在锁定/解锁的快照目录名（None=空闲）
+    pin_busy: Option<String>,
+    /// 正在转存的快照目录名（None=空闲）
+    sync_busy: Option<String>,
 }
 
 /// Spark 性能分析进行中状态（问题2：开始分析后本地计时推进，到期自动发送 stop --save-to-file）
@@ -1351,6 +1843,8 @@ struct ToastMsg {
     /// 崩溃自动重启通知：附带「取消自动重启」按钮的目标服务器序号（None = 普通通知）。
     /// 该字段为 Some 且重启仍在倒计时时，通知不随滞留时间消失，避免用户来不及点取消。
     cancel_server: Option<usize>,
+    /// 通知附带「打开所在目录」按钮的目标目录（如诊断包导出后指向其所在目录）。
+    open_dir: Option<PathBuf>,
 }
 
 impl Default for ServerRuntime {
@@ -1361,15 +1855,19 @@ impl Default for ServerRuntime {
             log_pending: 0,
             log_tail: None,
             run_bat_edit: None,
+            run_bat_meta: None,
             jvm_args_edit: None,
+            jvm_args_meta: None,
             server_props_map: None,
             server_props_text: None,
+            server_props_meta: None,
             server_props_advanced: false,
             file_tab: "mods".to_string(),
             file_tab_sub: String::new(),
             file_sub: Vec::new(),
             file_list: Vec::new(),
             file_content_edit: None,
+            file_content_meta: None,
             file_search: String::new(),
             file_favs: Vec::new(),
             file_client_mods: None,
@@ -1432,6 +1930,26 @@ impl Default for ServerRuntime {
             spark_mod_detail: None,
             mod_jar_index: None,
             file_scroll_to: None,
+            external: None,
+            adopted_pid: None,
+            adopted_cmdline: String::new(),
+            adopted_mem_mb: 0.0,
+            adopted_mem_at: None,
+            last_stopped_at: None,
+            run_started: None,
+            run_cmdline: String::new(),
+            last_exit_code: None,
+            last_stderr: Vec::new(),
+            precheck_open: false,
+            precheck_busy: false,
+            precheck_items: Vec::new(),
+            modupd_open: false,
+            modupd_busy: false,
+            modupd_rows: Vec::new(),
+            modupd_progress: String::new(),
+            modupd_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pin_busy: None,
+            sync_busy: None,
         }
     }
 }
@@ -1597,8 +2115,10 @@ struct App {
     /// 自定义标题栏拖拽起始位置（窗口外框左上角�?
     // (已改�?ViewportCommand::StartDrag 系统拖拽，此字段保留备用)
     title_drag_start: Option<egui::Pos2>,
-    /// 系统托盘图标（最小化到托�?/ 关闭行为=tray 时使用）
+    /// 系统托盘图标（最小化到托盘 / 关闭行为=tray 时使用）
     tray: Option<tray_icon::TrayIcon>,
+    /// 托盘菜单句柄：Explorer 重启后按同一菜单重建图标（菜单项 ID 不变，回调仍能匹配）
+    tray_menu: Option<tray_icon::menu::Menu>,
     /// 托盘菜单「显示主窗口」项 ID
     tray_show_id: Option<tray_icon::menu::MenuId>,
     /// 托盘菜单「退出」项 ID
@@ -1842,6 +2362,296 @@ struct App {
     shot_path: Option<std::path::PathBuf>,
     shot_frames: u32,
     shot_done: bool,
+    // ---------- 外部实例接管 / 诊断包 / 一次性后台任务 ----------
+    /// 外部实例扫描节流时刻（每次扫描要枚举进程 + 读命令行，不能每帧做）
+    external_scan_at: Option<std::time::Instant>,
+    /// 「结束外部进程」二次确认目标：(服务器下标, PID)
+    confirm_kill_external: Option<(usize, u32)>,
+    /// 检测到外部实例时用户点"启动"的提示目标（服务器下标）
+    confirm_start_external: Option<usize>,
+    /// 启动时发现"上次未正常退出仍在运行"的提示内容（服务器下标列表）；Some 时弹一次
+    resume_notice: Option<Vec<usize>>,
+    /// 一次性后台任务回传（锁定/转存/诊断包/预检/检查更新）
+    bg_tx: std::sync::mpsc::Sender<BgMsg>,
+    bg_rx: std::sync::mpsc::Receiver<BgMsg>,
+    /// 进行中的后台任务（任务标识 -> 状态文本）；用于按钮置灰与"进行中"提示
+    bg_busy: HashMap<String, String>,
+    /// 快照锁定状态缓存（快照目录 -> 是否已锁定）。
+    /// `backup::is_snapshot_pinned` 要读 meta.json，不能放在每帧渲染路径里逐个读盘：
+    /// 随 `backup_list_cached` 的 2 秒节流一起刷新。
+    snapshot_pins: HashMap<PathBuf, bool>,
+    /// 模组检查更新的会话内缓存（modid -> 结果），同一会话不重复请求同一个 mod
+    modupd_cache: HashMap<String, ModUpdateRow>,
+    /// 启动时未正常退出的服务器记录是否已写过（每次运行只写一次 data 日志）
+    resume_logged: bool,
+    /// 「本次运行未生成崩溃报告」弹窗：(下标, 服务器名, 说明, 退出码, stderr 末尾, 启动命令行)
+    crash_no_report: Option<(usize, String, String, Option<i32>, Vec<String>, String)>,
+    /// 上面弹窗里展示的系统 Java 版本（弹窗创建时算一次；渲染路径不能每帧跑 java -version）
+    crash_no_report_java: String,
+    /// 最近一次诊断包所在目录（服务器详情页给出持久入口，免得通知过期后找不到）
+    diag_last_dir: Option<PathBuf>,
+}
+
+// ==================== 外部启动实例：识别 / 接管 ====================
+
+/// 判定为"由外部启动"的服务器实例（不是本工具拉起的子进程）。
+#[derive(Clone, Default)]
+struct ExternalInstance {
+    /// java 进程 PID；命令行不可读时可能为 0（表示"疑似在跑但拿不到 PID"）
+    pid: u32,
+    /// 映像名（java.exe / javaw.exe）
+    exe: String,
+    /// 读到的命令行（None = 权限不足等原因读不到）
+    cmdline: Option<String>,
+    /// 工作集（MB）
+    mem_mb: f32,
+    /// 判定依据（展示给用户，避免"为什么说它在运行"没有解释）
+    evidence: String,
+    /// 是否属于退化判定（命令行不可读，靠日志 mtime 推断）
+    weak: bool,
+}
+
+/// 服务器运行态分类：区分"本工具拉起的"与"外部启动的"。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunKind {
+    /// 未运行
+    Stopped,
+    /// 本工具拉起的子进程
+    Managed,
+    /// 外部启动（尚未接管）：能看日志，但不能停、不能判定崩溃
+    External,
+    /// 外部启动且已被接管：可停止/强停/判定关服
+    Adopted,
+}
+
+/// 目录匹配用的规整串：小写、分隔符统一成 `\`、去掉结尾分隔符。
+fn norm_path_key(p: &Path) -> String {
+    let s = p.to_string_lossy().replace('/', "\\").to_lowercase();
+    s.trim_end_matches('\\').to_string()
+}
+
+/// 扫描所有已知服务器，返回与之对应的"外部实例"。
+///
+/// 判据优先级：
+/// 1. **命令行包含服务器目录**（最强，能区分同名的两个核心 jar）；
+/// 2. **命令行包含 `-jar <该服务器核心 jar>`**（弱一档，识别不到目录时才用）；
+/// 3. 命令行完全读不到（权限不足/受保护进程）时退化：
+///    `logs\latest.log` 的 mtime 在最近 20 秒内，且晚于本工具上次停止该服务器的时刻。
+///
+/// 每个 java 进程最多归属一台服务器，避免同一 PID 被两台服务器同时认领。
+fn scan_external_instances(
+    servers: &[ServerConfig],
+    exclude_pids: &[u32],
+    last_stopped: &[Option<std::time::SystemTime>],
+) -> Vec<Option<ExternalInstance>> {
+    let mut out: Vec<Option<ExternalInstance>> = vec![None; servers.len()];
+    if servers.is_empty() {
+        return out;
+    }
+    let procs = process::list_java_processes();
+    if procs.is_empty() {
+        return out;
+    }
+    let excluded: HashSet<u32> = exclude_pids.iter().copied().collect();
+    let dir_keys: Vec<String> = servers.iter().map(|s| norm_path_key(&s.dir)).collect();
+    let cores: Vec<String> = servers
+        .iter()
+        .map(|s| detect_core_jar(&s.dir).to_lowercase())
+        .collect();
+    let mut used: HashSet<u32> = HashSet::new();
+
+    // 第一轮：目录路径命中
+    for i in 0..servers.len() {
+        if dir_keys[i].is_empty() {
+            continue;
+        }
+        for p in procs.iter() {
+            if excluded.contains(&p.pid) || used.contains(&p.pid) {
+                continue;
+            }
+            let Some(cmd) = &p.cmdline else { continue };
+            let c = cmd.replace('/', "\\").to_lowercase();
+            if c.contains(&dir_keys[i]) {
+                used.insert(p.pid);
+                out[i] = Some(ExternalInstance {
+                    pid: p.pid,
+                    exe: p.exe.clone(),
+                    cmdline: Some(cmd.clone()),
+                    mem_mb: p.mem_mb,
+                    evidence: format!("命令行包含服务器目录 {}", servers[i].dir.display()),
+                    weak: false,
+                });
+                break;
+            }
+        }
+    }
+
+    // 第二轮：核心 jar 名命中（只认 `-jar <核心>` 形式，避免把仅提到同名文件的进程算进来）
+    for i in 0..servers.len() {
+        if out[i].is_some() || cores[i].is_empty() {
+            continue;
+        }
+        let pat_plain = format!("-jar {}", cores[i]);
+        let pat_dot = format!("-jar .\\{}", cores[i]);
+        for p in procs.iter() {
+            if excluded.contains(&p.pid) || used.contains(&p.pid) {
+                continue;
+            }
+            let Some(cmd) = &p.cmdline else { continue };
+            let c = cmd.replace('/', "\\").to_lowercase();
+            if c.contains(&pat_plain) || c.contains(&pat_dot) {
+                used.insert(p.pid);
+                out[i] = Some(ExternalInstance {
+                    pid: p.pid,
+                    exe: p.exe.clone(),
+                    cmdline: Some(cmd.clone()),
+                    mem_mb: p.mem_mb,
+                    evidence: format!("命令行包含 -jar {}", cores[i]),
+                    weak: false,
+                });
+                break;
+            }
+        }
+    }
+
+    // 第三轮：命令行不可读时的退化判定
+    let unknown: Vec<&process::JavaProc> = procs
+        .iter()
+        .filter(|p| p.cmdline.is_none() && !excluded.contains(&p.pid) && !used.contains(&p.pid))
+        .collect();
+    if !unknown.is_empty() {
+        let mut pool = unknown.iter();
+        for i in 0..servers.len() {
+            if out[i].is_some() {
+                continue;
+            }
+            let log = servers[i].dir.join("logs").join("latest.log");
+            let Ok(md) = std::fs::metadata(&log) else { continue };
+            let Ok(mtime) = md.modified() else { continue };
+            // 最近 20 秒内被写过 → 说明有进程正在往里写日志
+            let fresh = std::time::SystemTime::now()
+                .duration_since(mtime)
+                .map(|d| d.as_secs() <= 20)
+                .unwrap_or(false);
+            if !fresh {
+                continue;
+            }
+            // 日志写入时刻必须晚于本工具上次停止该服务器（否则可能是我们刚停完的残留）
+            if let Some(t) = last_stopped.get(i).copied().flatten() {
+                if mtime <= t {
+                    continue;
+                }
+            }
+            let Some(p) = pool.next() else { break };
+            out[i] = Some(ExternalInstance {
+                pid: p.pid,
+                exe: p.exe.clone(),
+                cmdline: None,
+                mem_mb: p.mem_mb,
+                evidence: "命令行不可读：logs\\latest.log 在最近 20 秒内被写入".to_string(),
+                weak: true,
+            });
+        }
+    }
+    out
+}
+
+// ==================== 启动前预检 ====================
+
+/// 预检单项严重级别
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CheckLevel {
+    Pass,
+    Warn,
+    Fail,
+}
+
+impl CheckLevel {
+    fn icon(self) -> &'static str {
+        match self {
+            CheckLevel::Pass => "✅",
+            CheckLevel::Warn => "⚠️",
+            CheckLevel::Fail => "❌",
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            CheckLevel::Pass => "通过",
+            CheckLevel::Warn => "警告",
+            CheckLevel::Fail => "失败",
+        }
+    }
+}
+
+/// 预检单项结果
+#[derive(Clone)]
+struct PrecheckItem {
+    level: CheckLevel,
+    title: String,
+    detail: String,
+    advice: String,
+}
+
+impl PrecheckItem {
+    fn pass(title: &str, detail: String) -> Self {
+        Self {
+            level: CheckLevel::Pass,
+            title: title.to_string(),
+            detail,
+            advice: String::new(),
+        }
+    }
+    fn warn(title: &str, detail: String, advice: String) -> Self {
+        Self {
+            level: CheckLevel::Warn,
+            title: title.to_string(),
+            detail,
+            advice,
+        }
+    }
+    fn fail(title: &str, detail: String, advice: String) -> Self {
+        Self {
+            level: CheckLevel::Fail,
+            title: title.to_string(),
+            detail,
+            advice,
+        }
+    }
+}
+
+/// 模组检查更新的单行结果
+#[derive(Clone)]
+struct ModUpdateRow {
+    /// 模组 id（用于会话内缓存，避免同一 mod 重复请求）
+    mod_id: String,
+    /// 模组名（显示名优先，回退到文件名）
+    name: String,
+    /// 本地版本
+    local: String,
+    /// Modrinth 上的最新版本（None = 未找到或查询失败）
+    latest: Option<String>,
+    /// 项目页地址（可点开）
+    url: String,
+    /// 说明（未找到/失败原因/已是最新）
+    note: String,
+}
+
+// ==================== 一次性后台任务回传 ====================
+
+/// 后台一次性任务的回传消息（避免为每个动作单开一个通道）
+enum BgMsg {
+    /// 快照锁定完成：(服务器下标, 快照目录名, 结果)
+    Pinned(usize, String, Result<u64, String>),
+    /// 快照转存完成：(服务器下标, 快照目录名, 结果=复制的字节数)
+    Synced(usize, String, Result<u64, String>),
+    /// 诊断包：(zip 路径, 字节数) 或错误
+    Diag(Result<(PathBuf, u64), String>),
+    /// 启动前预检：(服务器下标, 结果)
+    Precheck(usize, Vec<PrecheckItem>),
+    /// 模组检查更新进度：已完成数 / 总数 / 当前模组名
+    ModUpdProgress(usize, usize, String),
+    /// 模组检查更新结果：(服务器下标, 行)
+    ModUpdDone(usize, Vec<ModUpdateRow>),
 }
 
 impl App {
@@ -1899,6 +2709,8 @@ impl App {
         let (frp_tx, frp_rx) = std::sync::mpsc::channel();
         let (frp_task_tx, frp_task_rx) = std::sync::mpsc::channel();
         let (players_tx, players_rx) = std::sync::mpsc::channel();
+        // 一次性后台任务（快照锁定/转存、诊断包、启动前预检、模组检查更新）
+        let (bg_tx, bg_rx) = std::sync::mpsc::channel();
         // 正式功能（下载/玩家/插件）默认开启：启动时按持久化 feature 恢复运行态。
         // Bug4：此前 dl 硬编码 None，导致「设置已开启、重启后入口误判未开启」。
         let dl_init = features::is_enabled(&cfg.features, features::BETA_DOWNLOAD);
@@ -1988,6 +2800,7 @@ impl App {
             title_drag_start: None,
             tray: None,
             tray_show_id: None,
+            tray_menu: None,
             tray_quit_id: None,
             tray_hidden: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tray_restoring_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2041,6 +2854,19 @@ impl App {
             shot_path: std::env::var("XMST_SHOT").ok().map(std::path::PathBuf::from),
             shot_frames: 0,
             shot_done: false,
+            external_scan_at: None,
+            confirm_kill_external: None,
+            confirm_start_external: None,
+            resume_notice: None,
+            bg_tx,
+            bg_rx,
+            bg_busy: HashMap::new(),
+            snapshot_pins: HashMap::new(),
+            modupd_cache: HashMap::new(),
+            resume_logged: false,
+            crash_no_report: None,
+            crash_no_report_java: String::new(),
+            diag_last_dir: None,
             tray_quit: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tray_quit_requested: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tray_handlers_set: false,
@@ -2131,16 +2957,23 @@ impl App {
         // 初始化系统托盘（失败不阻塞主流程，仅无托盘功能）
         // 托盘事件用全局回调线程（set_event_handler），不在 UI 线程轮询，
         // 因此把 hidden/quit 状态做成 Arc 由回调写、update 读。
-        let (tray, show_id, quit_id) = setup_tray_and_menu();
+        let (tray, menu, show_id, quit_id) = setup_tray_and_menu();
         app.tray = tray;
+        app.tray_menu = menu;
         app.tray_show_id = show_id;
         app.tray_quit_id = quit_id;
         // 托盘心跳线程：隐藏期间每秒投递一条重绘消息，让隐藏态也能跑自动行为 tick
         //（原因与开销见 spawn_tray_heartbeat / tray_hidden_tick 的注释）
         spawn_tray_heartbeat(app.tray_hidden.clone());
+        // 关机/注销路径要用到的共享数据（运行中进程句柄由 start_server 登记）：
+        // 窗口过程不能借用 App，所以配置快照与路径先在这里同步一份
+        bridge_sync_config(&app.cfg, &app.config_path, &app.data_dir());
         // 启动自检：进程完整性级别（Low IL 会让写其它目录/打开目录/调用系统程序全部失败）。
         // 检测到 Low 时登记一条可关闭的提示，由 update 内的 ui_low_il_notice 弹出一次。
         app.check_integrity_level();
+        // 启动时扫描"上次未正常退出仍在运行"的服务器：异常退出不再连带杀死服务器，
+        // 所以这里很可能真的扫到东西；扫到就弹一次可关闭的提示（全部接管 / 忽略）。
+        app.detect_startup_leftovers();
         app
     }
 
@@ -2199,6 +3032,11 @@ impl App {
     /// 标记配置已修改，延迟落盘（600ms 去抖）。拖动滑块/输入框时每帧都会调用它，
     /// 此前每次都整文件重写：既伤磁盘，又提高“写一半崩溃”的概率。真正的写在 flush_config。
     fn save_config(&mut self) {
+        // 关机路径要能强制落盘：配置首次置脏时同步一份快照给窗口过程侧的桥
+        //（只在 !cfg_dirty 时做，拖动滑块每帧调用 save_config 也不会反复克隆配置）
+        if !self.cfg_dirty {
+            bridge_sync_config(&self.cfg, &self.config_path, &self.data_dir());
+        }
         self.cfg_dirty = true;
         self.cfg_save_at = Some(std::time::Instant::now() + std::time::Duration::from_millis(600));
     }
@@ -2234,6 +3072,8 @@ impl App {
             Ok(()) => {
                 self.cfg_dirty = false;
                 self.cfg_save_at = None;
+                // 同步快照：关机时窗口过程若已收到 WM_ENDSESSION，用的是这一份
+                bridge_sync_config(&self.cfg, &self.config_path, &self.data_dir());
             }
             Err(e) => {
                 self.cfg_save_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
@@ -2359,11 +3199,17 @@ impl App {
             // 服务器指定列表项 -> 服务器自定义路径 -> run.bat 提取 -> 按版本自动匹�?-> 全局兜底 -> PATH
             let cfg = self.cfg.clone();
             let java = resolve_java_for_server(&cfg, &sc);
+            // JVM 参数优先级：服务器级 jvm_args → 全局默认 JVM 参数 → 按物理内存推荐
+            //（推荐值只在用户两处都没填时生效，不覆盖用户填的任何参数）
             let jvm = sc
                 .jvm_args
                 .clone()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| self.cfg.default_jvm_args.clone());
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| {
+                    let d = self.cfg.default_jvm_args.trim().to_string();
+                    if d.is_empty() { None } else { Some(d) }
+                })
+                .unwrap_or_else(|| recommended_jvm_args(physical_memory_gb()));
             let cmd_tpl = sc.launch_cmd.clone();
             let core = detect_core_jar(&dir);
             // 公式化启动：{core} 占位符或 "-jar server.jar" 自动替换为实际核�?jar
@@ -2382,12 +3228,30 @@ impl App {
                     args.insert(0, format!("-Djava.io.tmpdir={}", p.display()));
                 }
             }
+            // 追加 -Dfile.encoding=UTF-8（中文日志与插件输出更稳）；
+            // 与上面的 tmpdir 一样按参数包含判断，用户自己填过就不重复追加。
+            if !args.iter().any(|a| a.contains("-Dfile.encoding")) {
+                args.insert(0, "-Dfile.encoding=UTF-8".to_string());
+            }
             let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
             process::spawn_hidden_env(&prog, &arg_refs, &dir, true, &tmp_env)
         };
         match spawn_res {
             Ok(mp) => {
+                // 关机/注销时窗口过程要直接向这个句柄写 stop（拿不到 App），先登记一份
+                bridge_register_proc(idx, mp.child.clone(), mp.allow_stdin);
+                // 本次启动的命令行与时刻：崩溃分析只认"这次运行"产生的报告，
+                // 弹窗要能展示实际启动命令行（不是模板字符串）。
+                rt.run_cmdline = mp.cmdline.clone();
+                rt.run_started = Some(std::time::SystemTime::now());
+                rt.last_exit_code = None;
+                rt.last_stderr.clear();
                 rt.proc = Some(mp);
+                // 本工具已接管这条进程：清掉外部实例标记，避免状态显示成"外部启动"
+                rt.external = None;
+                rt.adopted_pid = None;
+                rt.adopted_cmdline.clear();
+                rt.adopted_mem_mb = 0.0;
                 rt.log_buf.clear();
                 rt.startup_notified = false;
                 rt.startup_warned = false;
@@ -2442,6 +3306,30 @@ impl App {
         if self.stop_inflight.contains(&idx) {
             return;
         }
+        // 已接管的外部实例：写不进 stdin（不是我们拉起的进程），只能结束进程树。
+        // 但结束前先按"正常关服"的判定基准准备：清掉 adopted 标记 + 置 stopping，
+        // 让日志尾随与关服快照（reason=stop）照常工作。
+        let adopted = self
+            .runtimes
+            .get(idx)
+            .and_then(|rt| rt.adopted_pid)
+            .filter(|pid| *pid != 0)
+            .filter(|pid| process::pid_alive(*pid));
+        if let Some(pid) = adopted {
+            if let Some(rt) = self.runtimes.get_mut(idx) {
+                rt.stopping = true;
+                rt.adopted_pid = None;
+                rt.last_msg = "正在停止外部实例…（已接管的进程无法接收控制台命令，将直接结束进程树）"
+                    .to_string();
+            }
+            let tx = self.stop_tx.clone();
+            self.stop_inflight.insert(idx);
+            std::thread::spawn(move || {
+                let ok = process::kill_pid_tree(pid);
+                let _ = tx.send((idx, ok));
+            });
+            return;
+        }
         if let Some(rt) = self.runtimes.get_mut(idx) {
             if let Some(p) = rt.proc.take() {
                 rt.stopping = true;
@@ -2473,7 +3361,7 @@ impl App {
         let had_proc = self
             .runtimes
             .get(idx)
-            .map(|rt| rt.proc.is_some())
+            .map(|rt| rt.proc.is_some() || rt.adopted_pid.is_some())
             .unwrap_or(false);
         if let Some(rt) = self.runtimes.get_mut(idx) {
             if let Some(p) = &rt.proc {
@@ -2481,6 +3369,17 @@ impl App {
                 rt.stopping = false;
                 rt.last_msg = "已强制结束（含进程树）".to_string();
                 rt.proc = None;
+            }
+            // 已接管的外部实例：结束整棵进程树并把停止时刻记为基准线
+            if let Some(pid) = rt.adopted_pid.take() {
+                let ok = process::kill_pid_tree(pid);
+                rt.stopping = false;
+                rt.last_stopped_at = Some(std::time::SystemTime::now());
+                rt.last_msg = if ok {
+                    "已结束外部实例（含进程树）".to_string()
+                } else {
+                    "结束外部实例失败（可能权限不足），请在任务管理器确认".to_string()
+                };
             }
         }
         if had_proc {
@@ -2495,8 +3394,13 @@ impl App {
         let pid = self
             .runtimes
             .get(idx)
-            .and_then(|rt| rt.proc.as_ref())
-            .and_then(crate::process::pid)
+            .and_then(|rt| {
+                // 已接管的外部实例没有 Child 句柄，用接管的 PID
+                rt.proc
+                    .as_ref()
+                    .and_then(crate::process::pid)
+                    .or(rt.adopted_pid)
+            })
             .unwrap_or(0);
         if pid == 0 {
             self.notify("XMST", "该服务器未运行，无法强制结束");
@@ -2614,6 +3518,10 @@ impl App {
         self.tick_download();
         self.tick_mod_update();
         self.tick_create_server();
+        // 外部启动实例扫描 + 一次性后台任务回传（托盘态同样要跑：
+        // 用户常在托盘态下从游戏里停服，外部实例的关服判定不能漏）
+        self.tick_external();
+        self.tick_bg();
     }
 
     /// 启动自检：当前进程的完整性级别（只做一次）。
@@ -2732,12 +3640,505 @@ impl App {
         }
     }
 
+    // ==================== 外部实例 / 预检 / 崩溃补充信息 / 检查更新 弹窗 ====================
+
+    /// 外部实例相关弹窗：启动时"仍有服务器在运行"提示、点启动时的接管提示、结束外部进程二次确认。
+    fn ui_external_dialogs(&mut self, ctx: &egui::Context) {
+        // ① 启动时检测到"上次未正常退出仍在运行"的服务器：可关闭提示，提供「全部接管」「忽略」
+        if let Some(list) = self.resume_notice.clone() {
+            let mut open = true;
+            let mut adopt_all = false;
+            let mut ignore = false;
+            let lines: Vec<String> = list
+                .iter()
+                .map(|i| {
+                    let name = self
+                        .cfg
+                        .servers
+                        .get(*i)
+                        .map(|s| s.name.clone())
+                        .unwrap_or_default();
+                    match self.runtimes.get(*i).and_then(|rt| rt.external.as_ref()) {
+                        Some(e) if e.pid != 0 => {
+                            format!("· {name}（PID {}，内存 {:.0} MB）", e.pid, e.mem_mb)
+                        }
+                        Some(e) => format!("· {name}（{}）", e.evidence),
+                        None => format!("· {name}"),
+                    }
+                })
+                .collect();
+            egui::Window::new("检测到未正常退出的服务器")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.set_max_width(560.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "检测到 {} 个服务器仍在运行（上次可能异常退出，工具未连带关闭它们）：",
+                            list.len()
+                        ))
+                        .strong(),
+                    );
+                    for l in &lines {
+                        ui.label(RichText::new(l).small());
+                    }
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(
+                            "接管后：停止/强停/崩溃检测/关服自动快照都对它们生效（外部实例无法接收控制台命令）；\
+                             忽略则只在状态里显示「运行中（外部启动）」。",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("全部接管").clicked() {
+                            adopt_all = true;
+                        }
+                        if ui.button("忽略").clicked() {
+                            ignore = true;
+                        }
+                    });
+                });
+            if adopt_all {
+                for i in list.iter() {
+                    self.adopt_external(*i);
+                }
+                self.resume_notice = None;
+            } else if ignore || !open {
+                self.resume_notice = None;
+            }
+        }
+
+        // ② 检测到外部实例时用户点"启动"：提示接管或结束，避免起第二个实例抢端口
+        if let Some(idx) = self.confirm_start_external {
+            let mut open = true;
+            let mut do_adopt = false;
+            let mut do_kill = false;
+            let mut do_force_start = false;
+            let mut cancel = false;
+            let name = self
+                .cfg
+                .servers
+                .get(idx)
+                .map(|s| s.name.clone())
+                .unwrap_or_default();
+            let pid = self
+                .runtimes
+                .get(idx)
+                .and_then(|rt| rt.external.as_ref())
+                .map(|e| e.pid)
+                .unwrap_or(0);
+            egui::Window::new("该服务器似乎已在运行")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.set_max_width(520.0);
+                    ui.label(format!(
+                        "「{name}」似乎已在运行（外部启动，PID {}）。",
+                        if pid == 0 { "未知".to_string() } else { pid.to_string() }
+                    ));
+                    ui.label("直接启动会出现第二个实例并抢占用端口，通常两个都起不来。");
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("建议：接管现有实例（纳入工具的停止/崩溃判定），或结束它之后再启动。").small());
+                    ui.add_space(8.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("接管现有实例").clicked() {
+                            do_adopt = true;
+                        }
+                        if ui.button("结束现有实例").clicked() {
+                            do_kill = true;
+                        }
+                        if ui
+                            .button("仍然启动")
+                            .on_hover_text("不推荐：可能出现两个服务器抢同一端口")
+                            .clicked()
+                        {
+                            do_force_start = true;
+                        }
+                        if ui.button("取消").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if do_adopt {
+                self.adopt_external(idx);
+                self.confirm_start_external = None;
+            } else if do_kill {
+                self.end_external_instance(idx, pid);
+                self.confirm_start_external = None;
+            } else if do_force_start {
+                if let Some(rt) = self.runtimes.get_mut(idx) {
+                    rt.crash_count = 0;
+                    rt.crash_first_at = None;
+                    rt.crash_restart_at = None;
+                    rt.external = None;
+                }
+                self.start_server(idx);
+                self.confirm_start_external = None;
+            } else if cancel || !open {
+                self.confirm_start_external = None;
+            }
+        }
+
+        // ③ 结束外部进程二次确认
+        if let Some((idx, pid)) = self.confirm_kill_external {
+            let mut open = true;
+            let mut do_it = false;
+            let name = self
+                .cfg
+                .servers
+                .get(idx)
+                .map(|s| s.name.clone())
+                .unwrap_or_default();
+            let mem = self
+                .runtimes
+                .get(idx)
+                .and_then(|rt| rt.external.as_ref())
+                .map(|e| e.mem_mb)
+                .unwrap_or(0.0);
+            egui::Window::new("结束外部进程二次确认")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.set_max_width(520.0);
+                    ui.heading("⛔ 确认结束外部进程");
+                    ui.add_space(6.0);
+                    ui.label(format!("服务器：{name}"));
+                    ui.label(format!("PID：{} ｜ 内存：{:.0} MB", pid, mem));
+                    ui.label("影响：将强制结束该进程及其全部子进程（进程树），正在游戏的玩家会掉线，");
+                    ui.label("未保存的世界进度可能丢失。若只是想让工具能管理它，请改用「接管」。");
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("✅ 确认结束").clicked() {
+                            do_it = true;
+                        }
+                        if ui.button("取消").clicked() {
+                            self.confirm_kill_external = None;
+                        }
+                    });
+                });
+            if do_it {
+                self.end_external_instance(idx, pid);
+                self.confirm_kill_external = None;
+            } else if !open {
+                self.confirm_kill_external = None;
+            }
+        }
+    }
+
+    /// 启动前预检结果窗口：每项一行（图标 + 标题 + 说明 + 建议），底部「关闭」「复制全部」。
+    fn ui_precheck_window(&mut self, ctx: &egui::Context) {
+        // 找出当前要显示的服务器（打开标记为 true 的那台）
+        let Some(idx) = self
+            .runtimes
+            .iter()
+            .position(|rt| rt.precheck_open)
+        else {
+            return;
+        };
+        let name = self
+            .cfg
+            .servers
+            .get(idx)
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+        let items = self.runtimes[idx].precheck_items.clone();
+        let mut open = true;
+        let mut close = false;
+        let mut copy_all = false;
+        egui::Window::new("🩺 启动前检查")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(620.0)
+            .show(ctx, |ui| {
+                ui.label(RichText::new(format!("{name} 启动前检查结果")).strong());
+                ui.label(
+                    RichText::new("检查不会阻断启动；按建议修完再点「启动服务器」成功率更高。")
+                        .small()
+                        .weak(),
+                );
+                ui.separator();
+                let fails = items.iter().filter(|i| i.level == CheckLevel::Fail).count();
+                let warns = items.iter().filter(|i| i.level == CheckLevel::Warn).count();
+                let passes = items.iter().filter(|i| i.level == CheckLevel::Pass).count();
+                ui.label(format!("通过 {passes} 项 ｜ 警告 {warns} 项 ｜ 失败 {fails} 项"));
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .max_height(420.0)
+                    .show(ui, |ui| {
+                        for it in &items {
+                            let col = match it.level {
+                                CheckLevel::Pass => self.fg(Color32::from_rgb(80, 200, 120)),
+                                CheckLevel::Warn => self.fg(Color32::from_rgb(240, 176, 96)),
+                                CheckLevel::Fail => self.fg(Color32::from_rgb(220, 90, 90)),
+                            };
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new(it.level.icon()).color(col));
+                                ui.label(RichText::new(&it.title).strong().color(col));
+                                ui.label(RichText::new(format!("[{}]", it.level.label())).small().color(col));
+                            });
+                            if !it.detail.is_empty() {
+                                ui.label(RichText::new(&it.detail).small());
+                            }
+                            if !it.advice.is_empty() {
+                                ui.label(
+                                    RichText::new(format!("建议：{}", it.advice))
+                                        .small()
+                                        .color(self.fg(Color32::from_rgb(120, 200, 255))),
+                                );
+                            }
+                            ui.add_space(6.0);
+                        }
+                    });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("复制全部").clicked() {
+                        copy_all = true;
+                    }
+                    if ui.button("关闭").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if copy_all {
+            let mut text = format!("{name} 启动前检查结果\n");
+            for it in &items {
+                text.push_str(&format!(
+                    "{} [{}] {}\n  {}\n",
+                    it.level.icon(),
+                    it.level.label(),
+                    it.title,
+                    it.detail
+                ));
+                if !it.advice.is_empty() {
+                    text.push_str(&format!("  建议：{}\n", it.advice));
+                }
+            }
+            ctx.copy_text(text);
+            self.set_toast("检查结果已复制".to_string());
+        }
+        if close || !open {
+            if let Some(rt) = self.runtimes.get_mut(idx) {
+                rt.precheck_open = false;
+            }
+        }
+    }
+
+    /// 「本次运行未生成崩溃报告」补充信息弹窗：退出码 + stderr 最后 30 行 + 启动命令行。
+    fn ui_crash_no_report(&mut self, ctx: &egui::Context) {
+        let Some((idx, name, msg, code, stderr, cmdline)) = self.crash_no_report.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut close = false;
+        let mut copy = false;
+        let java = self.crash_no_report_java.clone();
+        let code_txt = code.map(|c| c.to_string()).unwrap_or_else(|| "?".to_string());
+        egui::Window::new("⚠ 启动失败（本次运行无崩溃报告）")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(620.0)
+            .show(ctx, |ui| {
+                ui.label(RichText::new(format!("{name} 异常退出")).size(15.0).strong());
+                ui.label(
+                    RichText::new("本次运行未生成崩溃报告，通常意味着 JVM 还没启动成功就退出了")
+                        .color(self.fg(Color32::from_rgb(240, 176, 96)))
+                        .strong(),
+                );
+                if !msg.is_empty() {
+                    ui.label(RichText::new(&msg).small().weak());
+                }
+                ui.separator();
+                ui.label(RichText::new(format!("退出码：{code_txt}")).strong());
+                ui.label(RichText::new(format!("Java 版本：{java}")).small());
+                ui.add_space(4.0);
+                ui.label(RichText::new("stderr 最后 30 行：").strong());
+                if stderr.is_empty() {
+                    ui.label(
+                        RichText::new("（本次运行没有捕获到 stderr 输出；也可能 stderr 已并入日志，见「日志」页）")
+                            .small()
+                            .weak(),
+                    );
+                } else {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .max_height(220.0)
+                        .show(ui, |ui| {
+                            for l in &stderr {
+                                ui.label(RichText::new(l).monospace().small());
+                            }
+                        });
+                }
+                ui.add_space(4.0);
+                ui.collapsing("启动命令行", |ui| {
+                    ui.label(
+                        RichText::new(if cmdline.is_empty() { "（未记录）" } else { cmdline.as_str() })
+                            .monospace()
+                            .small(),
+                    );
+                });
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("📂 打开日志目录").clicked() {
+                        if let Some(s) = self.cfg.servers.get(idx) {
+                            self.open_folder(&s.dir.join("logs"));
+                        }
+                    }
+                    if ui.button("📂 打开崩溃报告目录").clicked() {
+                        if let Some(s) = self.cfg.servers.get(idx) {
+                            self.open_folder(&s.dir.join("crash-reports"));
+                        }
+                    }
+                    if ui.button("复制诊断信息").clicked() {
+                        copy = true;
+                    }
+                    if ui.button("关闭").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if copy {
+            let mut text = String::new();
+            text.push_str(&format!("服务器：{name}\n"));
+            text.push_str(&format!("命令行：{}\n", if cmdline.is_empty() { "（未记录）" } else { cmdline.as_str() }));
+            text.push_str(&format!("退出码：{code_txt}\n"));
+            text.push_str(&format!("系统 Java 版本：{java}\n"));
+            text.push_str("stderr 末尾：\n");
+            if stderr.is_empty() {
+                text.push_str("（无 stderr 输出）\n");
+            } else {
+                for l in &stderr {
+                    text.push_str(l);
+                    text.push('\n');
+                }
+            }
+            ctx.copy_text(text);
+            self.set_toast("诊断信息已复制".to_string());
+        }
+        if close || !open {
+            self.crash_no_report = None;
+        }
+    }
+
+    /// 模组"检查更新"结果窗口（BETA_MOD_UPDATE）：只报告，不自动替换/下载。
+    fn ui_mod_update_window(&mut self, ctx: &egui::Context) {
+        let Some(idx) = self.runtimes.iter().position(|rt| rt.modupd_open) else {
+            return;
+        };
+        let name = self
+            .cfg
+            .servers
+            .get(idx)
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+        let rows = self.runtimes[idx].modupd_rows.clone();
+        let busy = self.runtimes[idx].modupd_busy;
+        let progress = self.runtimes[idx].modupd_progress.clone();
+        let mut open = true;
+        let mut close = false;
+        let mut reopen = false;
+        let mut cancel_now = false;
+        egui::Window::new("🔄 模组检查更新")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(660.0)
+            .show(ctx, |ui| {
+                ui.label(RichText::new(format!("{name}：模组更新检查结果")).strong());
+                ui.label(
+                    RichText::new("只检查、只报告，不会自动替换或下载；点项目名可打开项目页。")
+                        .small()
+                        .weak(),
+                );
+                if busy {
+                    ui.label(RichText::new(format!("检查中… {progress}")).small());
+                }
+                ui.separator();
+                let updatable = rows
+                    .iter()
+                    .filter(|r| r.note == "可更新")
+                    .count();
+                ui.label(format!(
+                    "共 {} 个模组 ｜ 可更新 {updatable} 个",
+                    rows.len()
+                ));
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .max_height(440.0)
+                    .show(ui, |ui| {
+                        for r in &rows {
+                            let col = if r.note == "可更新" {
+                                self.fg(Color32::from_rgb(240, 176, 96))
+                            } else if r.note == "已是最新" {
+                                self.fg(Color32::from_rgb(80, 200, 120))
+                            } else {
+                                self.fg(Color32::from_rgb(160, 160, 166))
+                            };
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new(&r.name).strong());
+                                let latest = r.latest.clone().unwrap_or_else(|| "—".to_string());
+                                ui.label(
+                                    RichText::new(format!("{} → {}", r.local, latest)).color(col),
+                                );
+                                ui.label(RichText::new(&r.note).small().weak());
+                                if !r.url.is_empty() && ui.small_button("项目页").clicked() {
+                                    open_url(&r.url);
+                                }
+                            });
+                        }
+                    });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if busy && ui.button("取消检查").clicked() {
+                        cancel_now = true;
+                    }
+                    if ui.button("重新检查（忽略缓存）").clicked() {
+                        reopen = true;
+                    }
+                    if ui.button("关闭").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if cancel_now {
+            if let Some(rt) = self.runtimes.get_mut(idx) {
+                rt.modupd_cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.set_toast("已请求取消检查（已完成的部分会保留）".to_string());
+        } else if reopen {
+            self.modupd_cache.clear();
+            if let Some(rt) = self.runtimes.get_mut(idx) {
+                rt.modupd_open = false;
+            }
+            self.spawn_mod_update_check(idx);
+        } else if close || !open {
+            if let Some(rt) = self.runtimes.get_mut(idx) {
+                rt.modupd_open = false;
+            }
+        }
+    }
+
     /// 处理优雅停止后台线程回传结果
     fn tick_stop(&mut self) {
         while let Ok((idx, ok)) = self.stop_rx.try_recv() {
             self.stop_inflight.remove(&idx);
             if let Some(rt) = self.runtimes.get_mut(idx) {
                 rt.stopping = false;
+                // 停止时刻即"外部实例判定"的基准线：此后若日志再被写入，说明又有实例在跑
+                rt.last_stopped_at = Some(std::time::SystemTime::now());
                 rt.last_msg = if ok {
                     "已优雅停止".to_string()
                 } else {
@@ -2777,11 +4178,612 @@ impl App {
                 .runtimes
                 .iter()
                 .enumerate()
-                .any(|(i, rt)| rt.proc.is_some() || self.stop_inflight.contains(&i));
+                .any(|(i, rt)| {
+                    rt.proc.is_some() || rt.adopted_pid.is_some() || self.stop_inflight.contains(&i)
+                });
             if !any_active && self.exit_snapshot_inflight.is_empty() {
                 self.closing_exit = false;
                 self.ctx_close_pending = true;
             }
+        }
+    }
+
+    // ==================== 外部启动实例：扫描 / 接管 / 结束 ====================
+
+    /// 外部实例扫描（节流：枚举进程 + 读命令行不能每帧做）。
+    ///
+    /// 只对"本工具没有托管进程、也没有已接管实例"的服务器做扫描；但必须把**全部**
+    /// 已托管/已接管的 PID 一起排除，否则 A 服的 java 会被算成 B 服的外部实例。
+    fn tick_external(&mut self) {
+        const SCAN_SECS: u64 = 5;
+        if self.cfg.servers.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let due = self
+            .external_scan_at
+            .map(|t| now.duration_since(t).as_secs() >= SCAN_SECS)
+            .unwrap_or(true);
+        if !due {
+            // 已接管实例的内存占用按 2 秒刷新一次（UI 要显示"内存占用"）
+            self.refresh_adopted_mem(now);
+            return;
+        }
+        self.external_scan_at = Some(now);
+        let mut managed_pids: Vec<u32> = Vec::new();
+        for rt in self.runtimes.iter() {
+            if let Some(p) = &rt.proc {
+                if let Some(pid) = process::pid(p) {
+                    managed_pids.push(pid);
+                    // 关键：cmd /c run.bat 场景下本工具持有的是 cmd.exe，真正的 java 是它的子进程。
+                    // 必须把整棵进程树都排除，否则自家托管的 java 会被当成别台服务器的"外部实例"。
+                    managed_pids.extend(process::pid_descendants(pid));
+                }
+            }
+            if let Some(pid) = rt.adopted_pid {
+                managed_pids.push(pid);
+                managed_pids.extend(process::pid_descendants(pid));
+            }
+        }
+        // 隧道进程（frpc/rathole）同样是本工具拉起的，排除它们的进程树
+        if let Some(p) = &self.frp_proc {
+            if let Some(pid) = process::pid(p) {
+                managed_pids.push(pid);
+                managed_pids.extend(process::pid_descendants(pid));
+            }
+        }
+        for rt in self.tunnel_runtimes.iter() {
+            if let Some(p) = &rt.proc {
+                if let Some(pid) = process::pid(p) {
+                    managed_pids.push(pid);
+                    managed_pids.extend(process::pid_descendants(pid));
+                }
+            }
+        }
+        let last_stopped: Vec<Option<std::time::SystemTime>> =
+            self.runtimes.iter().map(|rt| rt.last_stopped_at).collect();
+        let servers: Vec<ServerConfig> = self.cfg.servers.clone();
+        let found = scan_external_instances(&servers, &managed_pids, &last_stopped);
+        let mut changed = false;
+        for (i, f) in found.into_iter().enumerate() {
+            let Some(rt) = self.runtimes.get_mut(i) else { continue };
+            // 已由本工具托管 / 已接管 → 外部标记一律清空，避免状态显示重叠
+            if rt.proc.is_some() || rt.adopted_pid.is_some() {
+                if rt.external.take().is_some() {
+                    changed = true;
+                }
+                continue;
+            }
+            let same = match (&rt.external, &f) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.pid == b.pid && a.weak == b.weak,
+                _ => false,
+            };
+            if !same {
+                changed = true;
+                rt.external = f;
+            }
+        }
+        self.refresh_adopted_mem(now);
+        if changed {
+            self.egui_ctx.request_repaint();
+        }
+    }
+
+    /// 刷新已接管实例的内存占用（2 秒节流，避免每帧 OpenProcess）。
+    fn refresh_adopted_mem(&mut self, now: std::time::Instant) {
+        let due = self
+            .runtimes
+            .iter()
+            .any(|rt| rt.adopted_pid.is_some())
+            && self
+                .runtimes
+                .iter()
+                .filter_map(|rt| rt.adopted_mem_at)
+                .min()
+                .map(|t| now.duration_since(t).as_secs() >= 2)
+                .unwrap_or(true);
+        if !due {
+            return;
+        }
+        for rt in self.runtimes.iter_mut() {
+            if let Some(pid) = rt.adopted_pid {
+                rt.adopted_mem_mb = process::pid_memory_mb(pid);
+                rt.adopted_mem_at = Some(now);
+            }
+        }
+    }
+
+    /// 接管外部实例：把该 PID 纳入运行时状态。
+    ///
+    /// 接管后：
+    /// · 「停止」= 结束整棵进程树（写不进 stdin，无法发送 stop 命令）；
+    /// · 「强停」= 同上；
+    /// · 崩溃检测 = 按 PID 探活，进程消失即触发与托管进程相同的关服/崩溃判定；
+    /// · 日志尾随与"正常关服 → reason=stop 快照"照常工作。
+    fn adopt_external(&mut self, idx: usize) {
+        let Some(ext) = self.runtimes.get(idx).and_then(|rt| rt.external.clone()) else {
+            self.set_toast("未检测到外部实例，可能已经退出".to_string());
+            return;
+        };
+        let dir = match self.cfg.servers.get(idx) {
+            Some(s) => s.dir.clone(),
+            None => return,
+        };
+        let name = self.cfg.servers.get(idx).map(|s| s.name.clone()).unwrap_or_default();
+        if ext.pid != 0 && !process::pid_alive(ext.pid) {
+            self.set_toast("该外部实例已经退出".to_string());
+            if let Some(rt) = self.runtimes.get_mut(idx) {
+                rt.external = None;
+            }
+            return;
+        }
+        if let Some(rt) = self.runtimes.get_mut(idx) {
+            rt.adopted_pid = if ext.pid == 0 { None } else { Some(ext.pid) };
+            rt.adopted_cmdline = ext.cmdline.clone().unwrap_or_default();
+            rt.adopted_mem_mb = ext.mem_mb;
+            rt.adopted_mem_at = Some(std::time::Instant::now());
+            rt.external = None;
+            rt.stopping = false;
+            rt.log_buf.clear();
+            rt.log_pending = 0;
+            rt.startup_notified = true;
+            rt.startup_warned = true;
+            rt.plugin_start_emitted = false;
+            rt.started_at = Some(std::time::Instant::now());
+            rt.run_started = Some(std::time::SystemTime::now());
+            rt.last_exit_code = None;
+            rt.last_stderr.clear();
+            // 从当前文件末尾开始尾随：只关心接管之后的关服日志，不回灌旧日志
+            rt.log_tail = process::LogFileTail::new(&dir);
+            if let Some(t) = &mut rt.log_tail {
+                t.seek_end();
+            }
+            rt.last_msg = if ext.pid == 0 {
+                format!("已接管外部实例（未能取得 PID；依据：{}）", ext.evidence)
+            } else {
+                format!(
+                    "已接管外部实例（PID {}，{}）——停止将结束进程树，无法发送控制台命令",
+                    ext.pid, ext.evidence
+                )
+            };
+        }
+        if ext.pid != 0 {
+            self.notify("XMST - 已接管外部实例", &format!("{name}：PID {}", ext.pid));
+        } else {
+            // 拿不到 PID 时无法在系统关机路径里结束它，只能靠日志尾随与存活判定；
+            // 这种情况明确告知用户，避免误以为"关机时它一定会被处理"。
+            self.notify(
+                "XMST - 已接管外部实例",
+                &format!("{name}：未能取得 PID，仅按日志尾随与存活判定接管（关机时无法代为结束）"),
+            );
+        }
+    }
+
+    /// 结束外部实例（二次确认后调用）：结束整棵树，并记下停止时刻作为判定基准线。
+    fn end_external_instance(&mut self, idx: usize, pid: u32) {
+        let name = self.cfg.servers.get(idx).map(|s| s.name.clone()).unwrap_or_default();
+        let ok = if pid == 0 {
+            false
+        } else {
+            process::kill_pid_tree(pid)
+        };
+        if let Some(rt) = self.runtimes.get_mut(idx) {
+            rt.adopted_pid = None;
+            rt.external = None;
+            rt.stopping = false;
+            rt.last_stopped_at = Some(std::time::SystemTime::now());
+            rt.last_msg = if ok {
+                "已结束外部进程（含进程树）".to_string()
+            } else {
+                "结束外部进程失败（可能权限不足），请在任务管理器中确认".to_string()
+            };
+        }
+        self.set_toast(if ok {
+            format!("已结束「{name}」的外部进程")
+        } else {
+            format!("结束「{name}」的外部进程失败，请在任务管理器中确认")
+        });
+    }
+
+    /// 启动时扫描"上次未正常退出仍在运行"的服务器：弹一次可关闭的提示，并写一行 data 日志。
+    ///
+    /// 为什么要在启动时做：异常退出（崩溃/被强杀）不再连带杀死服务器，因此下次打开工具时
+    /// 很可能有服务器还在跑；用户需要一眼看到，并能一键接管，而不是稀里糊涂又启动第二个实例。
+    fn detect_startup_leftovers(&mut self) {
+        if self.cfg.servers.is_empty() {
+            return;
+        }
+        let servers: Vec<ServerConfig> = self.cfg.servers.clone();
+        let last_stopped: Vec<Option<std::time::SystemTime>> = vec![None; servers.len()];
+        let found = scan_external_instances(&servers, &[], &last_stopped);
+        let mut hit: Vec<usize> = Vec::new();
+        for (i, f) in found.into_iter().enumerate() {
+            if let Some(rt) = self.runtimes.get_mut(i) {
+                if f.is_some() {
+                    rt.external = f;
+                    hit.push(i);
+                }
+            }
+        }
+        if hit.is_empty() {
+            return;
+        }
+        if !self.resume_logged {
+            self.resume_logged = true;
+            let names: Vec<String> = hit
+                .iter()
+                .map(|i| {
+                    let n = servers
+                        .get(*i)
+                        .map(|s| s.name.clone())
+                        .unwrap_or_default();
+                    let pid = self
+                        .runtimes
+                        .get(*i)
+                        .and_then(|rt| rt.external.as_ref())
+                        .map(|e| e.pid)
+                        .unwrap_or(0);
+                    format!("{n}(PID {pid})")
+                })
+                .collect();
+            self.append_data_log(
+                "resume.log",
+                &format!(
+                    "检测到 {} 个未正常退出的服务器仍在运行：{}",
+                    hit.len(),
+                    names.join("、")
+                ),
+            );
+        }
+        self.resume_notice = Some(hit);
+    }
+
+    /// 追加一行带时间戳的记录到 `data\<file>`（失败静默；只用于留痕，不影响功能）。
+    fn append_data_log(&self, file: &str, line: &str) {
+        use std::io::Write;
+        let path = self.data_dir().join(file);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
+            return;
+        };
+        let _ = writeln!(
+            f,
+            "[{}] {}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+            line
+        );
+    }
+
+    // ==================== 一次性后台任务回传 ====================
+
+    /// 消费后台任务回传（可见态与托盘态都调用）。
+    fn tick_bg(&mut self) {
+        let msgs: Vec<BgMsg> = {
+            let mut v = Vec::new();
+            while let Ok(m) = self.bg_rx.try_recv() {
+                v.push(m);
+            }
+            v
+        };
+        if msgs.is_empty() {
+            return;
+        }
+        for m in msgs {
+            match m {
+                BgMsg::Pinned(idx, dir_name, res) => {
+                    self.bg_busy.remove(&format!("pin:{dir_name}"));
+                    if let Some(rt) = self.runtimes.get_mut(idx) {
+                        rt.pin_busy = None;
+                    }
+                    self.backup_cache = None;
+                    self.backup_stats_cache = None;
+                    match res {
+                        Ok(n) => self.set_toast(format!(
+                            "已锁定为独立归档（不再随源文件变化）：{dir_name}（实化 {n} 个文件）"
+                        )),
+                        Err(e) => self.set_toast(format!("锁定失败：{e}")),
+                    }
+                }
+                BgMsg::Synced(idx, dir_name, res) => {
+                    self.bg_busy.remove(&format!("sync:{dir_name}"));
+                    if let Some(rt) = self.runtimes.get_mut(idx) {
+                        rt.sync_busy = None;
+                    }
+                    match res {
+                        Ok(n) => self.set_toast(format!(
+                            "已转存快照 {dir_name}（本次复制 {}）",
+                            fmt_size(n)
+                        )),
+                        Err(e) => self.set_toast(format!("转存失败：{e}")),
+                    }
+                }
+                BgMsg::Diag(res) => {
+                    self.bg_busy.remove("diag");
+                    match res {
+                        Ok((path, size)) => {
+                            let parent = path
+                                .parent()
+                                .map(|p| p.to_path_buf())
+                                .unwrap_or_else(|| self.data_dir());
+                            // 通知里给完整路径 + 「打开所在目录」按钮（不留按钮时用户还得自己找文件）
+                            self.push_toast_with_dir(
+                                "XMST - 诊断包已导出",
+                                &format!("{}（{}）", path.display(), fmt_size(size)),
+                                parent.clone(),
+                            );
+                            self.diag_last_dir = Some(parent);
+                        }
+                        Err(e) => {
+                            self.push_toast("XMST - 导出诊断包失败", &e);
+                        }
+                    }
+                }
+                BgMsg::Precheck(idx, items) => {
+                    self.bg_busy.remove(&format!("precheck:{idx}"));
+                    if let Some(rt) = self.runtimes.get_mut(idx) {
+                        rt.precheck_busy = false;
+                        rt.precheck_items = items;
+                        rt.precheck_open = true;
+                    }
+                }
+                BgMsg::ModUpdProgress(done, total, cur) => {
+                    self.bg_busy
+                        .insert("modupd".to_string(), format!("检查中 {done}/{total}：{cur}"));
+                    if let Some(rt) = self.runtimes.iter_mut().find(|rt| rt.modupd_busy) {
+                        rt.modupd_progress = format!("检查中 {done}/{total}：{cur}");
+                    }
+                }
+                BgMsg::ModUpdDone(idx, rows) => {
+                    self.bg_busy.remove("modupd");
+                    // 会话内缓存：只有"确实在 Modrinth 找到了项目"的结果才缓存，
+                    // 未找到/网络失败的下一轮仍会重试，避免把一次抖动固化成永久结论。
+                    for r in rows.iter() {
+                        if !r.url.is_empty() {
+                            self.modupd_cache.insert(r.mod_id.clone(), r.clone());
+                        }
+                    }
+                    if let Some(rt) = self.runtimes.get_mut(idx) {
+                        rt.modupd_busy = false;
+                        rt.modupd_rows = rows;
+                        rt.modupd_open = true;
+                        rt.modupd_progress.clear();
+                    }
+                }
+            }
+            self.egui_ctx.request_repaint();
+        }
+    }
+
+    /// 启动前预检（后台线程执行，结果回传后自动打开结果窗口）。
+    fn spawn_precheck(&mut self, idx: usize) {
+        if idx >= self.cfg.servers.len() || idx >= self.runtimes.len() {
+            return;
+        }
+        if self.runtimes[idx].precheck_busy {
+            return;
+        }
+        self.runtimes[idx].precheck_busy = true;
+        self.bg_busy
+            .insert(format!("precheck:{idx}"), "正在执行启动前检查…".to_string());
+        let sc = self.cfg.servers[idx].clone();
+        let cfg = self.cfg.clone();
+        let tx = self.bg_tx.clone();
+        std::thread::spawn(move || {
+            let items = run_precheck(&sc, &cfg);
+            let _ = tx.send(BgMsg::Precheck(idx, items));
+        });
+    }
+
+    /// 导出诊断包（后台线程打包，完成后 toast + 打开所在目录）。
+    fn spawn_diag_zip(&mut self, idx: usize) {
+        if self.bg_busy.contains_key("diag") {
+            self.set_toast("诊断包正在打包中，请稍候".to_string());
+            return;
+        }
+        let Some(sc) = self.cfg.servers.get(idx).cloned() else {
+            self.set_toast("请先选择一台服务器".to_string());
+            return;
+        };
+        let cfg = self.cfg.clone();
+        let data_dir = self.data_dir();
+        let rid = current_integrity_rid();
+        self.bg_busy.insert("diag".to_string(), "正在打包诊断包…".to_string());
+        self.set_toast("正在后台收集日志与配置并打包…".to_string());
+        let tx = self.bg_tx.clone();
+        std::thread::spawn(move || {
+            let res = build_diag_package(&sc, &cfg, &data_dir, rid);
+            let _ = tx.send(BgMsg::Diag(res));
+        });
+    }
+
+    /// 模组"检查更新"：按 modid 查 Modrinth（串行 + 每个之间 200ms，避免打爆 API）。
+    /// 只检查、只报告，不自动替换/下载。
+    fn spawn_mod_update_check(&mut self, idx: usize) {
+        if idx >= self.cfg.servers.len() || idx >= self.runtimes.len() {
+            return;
+        }
+        if self.runtimes[idx].modupd_busy {
+            self.set_toast("检查更新正在进行中".to_string());
+            return;
+        }
+        let dir = self.cfg.servers[idx].dir.clone();
+        let pinfo = serverinfo::detect_cached(&dir, std::time::Duration::from_secs(3));
+        let mc = pinfo.mc_version.clone();
+        let loader = pinfo.kind.modrinth_loader().map(|s| s.to_string());
+        let mods_dir = dir.join("mods");
+        let mut metas = serverinfo::scan_mod_metadata(&mods_dir);
+        metas.retain(|m| {
+            let n = m.file_name.to_lowercase();
+            n.ends_with(".jar") && m.mod_id.is_some()
+        });
+        if metas.is_empty() {
+            self.set_toast("mods 目录里没有可识别 modid 的模组".to_string());
+            return;
+        }
+        // 同一会话内不重复请求同一个 modid
+        let cached: HashMap<String, ModUpdateRow> = self.modupd_cache.clone();
+        if let Some(rt) = self.runtimes.get_mut(idx) {
+            rt.modupd_busy = true;
+            rt.modupd_rows.clear();
+            rt.modupd_progress = "准备检查…".to_string();
+            rt.modupd_cancel
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        let cancel = self.runtimes[idx].modupd_cancel.clone();
+        self.bg_busy
+            .insert("modupd".to_string(), "准备检查模组更新…".to_string());
+        let tx = self.bg_tx.clone();
+        std::thread::spawn(move || {
+            let total = metas.len();
+            let mut rows: Vec<ModUpdateRow> = Vec::new();
+            for (i, m) in metas.iter().enumerate() {
+                // 用户点了「取消」：中断后续请求，已检查完的结果照常回传
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                let id = m.mod_id.clone().unwrap_or_default();
+                let local = m.version.clone().unwrap_or_else(|| "?".to_string());
+                let display = m.name.clone().unwrap_or_else(|| m.file_name.clone());
+                let _ = tx.send(BgMsg::ModUpdProgress(i + 1, total, display.clone()));
+                if let Some(hit) = cached.get(&id) {
+                    let mut r = hit.clone();
+                    r.name = display;
+                    r.local = local;
+                    rows.push(r);
+                    continue;
+                }
+                // 串行 + 限速：几十个模组并发会把 Modrinth API 打到限流
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                let mut row = ModUpdateRow {
+                    mod_id: id.clone(),
+                    name: display.clone(),
+                    local: local.clone(),
+                    latest: None,
+                    url: String::new(),
+                    note: String::new(),
+                };
+                match modrinth::project_by_slug(&id) {
+                    Ok((_pid, title, slug, source_url)) => {
+                        if !title.is_empty() {
+                            row.name = title;
+                        }
+                        row.url = if source_url.trim().is_empty() {
+                            format!("https://modrinth.com/mod/{slug}")
+                        } else {
+                            source_url
+                        };
+                        match modrinth::latest_version_for_slug(
+                            &id,
+                            mc.as_deref(),
+                            loader.as_deref(),
+                            false,
+                        ) {
+                            Ok((ver, _date, _vid, _pid)) => {
+                                row.note = if ver == local {
+                                    "已是最新".to_string()
+                                } else {
+                                    "可更新".to_string()
+                                };
+                                row.latest = Some(ver);
+                            }
+                            Err(e) => row.note = format!("未找到适配版本：{e}"),
+                        }
+                    }
+                    Err(_) => {
+                        // 找不到就跳过，不报错（很多 modid 与 Modrinth slug 不一致）
+                        row.note = "未在 Modrinth 找到该项目（已跳过）".to_string();
+                    }
+                }
+                rows.push(row);
+            }
+            let _ = tx.send(BgMsg::ModUpdDone(idx, rows));
+        });
+    }
+
+    /// 快照锁定/解锁（后台线程：会把整份快照实化成独立副本，可能复制数 GB）。
+    fn spawn_pin_snapshot(&mut self, idx: usize, snapshot_dir: PathBuf, pin: bool) {
+        let key = format!("pin:{}", snapshot_dir.display());
+        if self.bg_busy.contains_key(&key) {
+            return;
+        }
+        let dir_name = snapshot_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| snapshot_dir.display().to_string());
+        self.bg_busy.insert(key, "锁定中…".to_string());
+        if let Some(rt) = self.runtimes.get_mut(idx) {
+            rt.pin_busy = Some(dir_name.clone());
+        }
+        self.set_toast(if pin {
+            format!("正在锁定快照 {dir_name}（实化为独立副本，可能耗时较久）…")
+        } else {
+            format!("正在解锁快照 {dir_name}…")
+        });
+        let tx = self.bg_tx.clone();
+        let name_for_msg = dir_name.clone();
+        std::thread::spawn(move || {
+            let res = if pin {
+                backup::pin_snapshot(&snapshot_dir)
+            } else {
+                backup::unpin_snapshot(&snapshot_dir).map(|_| 0u64)
+            };
+            let _ = tx.send(BgMsg::Pinned(idx, name_for_msg, res));
+        });
+    }
+
+    /// 快照转存到"远端备份目标"（本地目录 / UNC）：后台执行，返回复制的字节数。
+    fn spawn_sync_snapshot(&mut self, idx: usize, snapshot_dir: PathBuf) {
+        let target = self.cfg.servers[idx].backup.remote_target.trim().to_string();
+        if target.is_empty() {
+            self.set_toast("请先在「存储与远程」里填写远端备份目标（本地目录或 UNC 路径）".to_string());
+            return;
+        }
+        if target.to_lowercase().starts_with("http://") || target.to_lowercase().starts_with("https://") {
+            self.set_toast("远端目标看起来是 WebDAV 地址；快照转存目前只支持本地目录与 UNC 网络共享".to_string());
+            return;
+        }
+        let key = format!("sync:{}", snapshot_dir.display());
+        if self.bg_busy.contains_key(&key) {
+            return;
+        }
+        let dir_name = snapshot_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| snapshot_dir.display().to_string());
+        self.bg_busy.insert(key, "转存中…".to_string());
+        if let Some(rt) = self.runtimes.get_mut(idx) {
+            rt.sync_busy = Some(dir_name.clone());
+        }
+        self.set_toast(format!("正在转存快照 {dir_name} 到 {target} …"));
+        let tx = self.bg_tx.clone();
+        let dest_root = PathBuf::from(target);
+        std::thread::spawn(move || {
+            let res = backup::sync_snapshot_dir(&snapshot_dir, &dest_root);
+            let _ = tx.send(BgMsg::Synced(idx, dir_name, res));
+        });
+    }
+
+    /// Explorer 崩溃/重启后重建托盘图标（R1）。
+    ///
+    /// 为什么要做：任务栏（Explorer）重启会丢掉托盘图标，若此时窗口正隐藏到托盘，
+    /// 用户既看不到图标、也没有其它入口恢复窗口，只能去任务管理器杀进程。
+    /// 窗口过程收到 "TaskbarCreated" 广播后置标记，这里重建一次：
+    /// 重建 TrayIcon 内部即 `Shell_NotifyIconW(NIM_ADD)`，菜单沿用同一个（ID 不变，
+    /// 已注册的全局事件回调才能继续匹配「显示主窗口/退出」）。
+    fn handle_tray_recreate(&mut self, _ctx: &egui::Context) {
+        if !TRAY_RECREATE_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let menu = match self.tray_menu.clone() {
+            Some(m) => m,
+            None => return, // 该机器托盘初始化失败过，没有可重建的东西
+        };
+        self.tray = build_tray_icon(&menu);
+        if self.tray.is_some() {
+            self.set_toast("任务栏已重启，托盘图标已重建".to_string());
         }
     }
 
@@ -2902,16 +4904,41 @@ impl App {
             .runtimes
             .iter()
             .enumerate()
-            .filter(|(_, rt)| rt.proc.is_some() && process::is_running(rt.proc.as_ref().unwrap()))
+            .filter(|(_, rt)| {
+                rt.proc.as_ref().map(process::is_running).unwrap_or(false)
+                    || rt.adopted_pid.map(process::pid_alive).unwrap_or(false)
+            })
             .map(|(i, _)| i)
             .collect();
         if running.is_empty() {
+            // 优雅退出路径：此刻可能还有"已被本工具 stop 但句柄未收"的服务器，
+            // 显式结束它们的进程树，确保退出后不留残留子进程。
+            self.kill_all_children_on_exit();
             self.ctx_close_pending = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
         if self.confirm_close.is_none() {
             self.confirm_close = Some(running.len());
+        }
+    }
+
+    /// 优雅退出前的兜底：显式结束本工具拉起的所有服务器进程树。
+    ///
+    /// 为什么需要它：Job Object 已不再设置 KILL_ON_JOB_CLOSE（异常退出时服务器要继续运行），
+    /// "子进程随父进程退出被回收"的语义只能在优雅退出时由这里显式补上。
+    /// 正常情况下走到这里时 proc 已被 stop_server 取空，本函数是幂等的空操作。
+    fn kill_all_children_on_exit(&mut self) {
+        for rt in self.runtimes.iter_mut() {
+            if let Some(p) = rt.proc.take() {
+                let _ = process::kill(&p);
+            }
+            if let Some(pid) = rt.adopted_pid.take() {
+                let _ = process::kill_pid_tree(pid);
+            }
+        }
+        if let Some(p) = self.frp_proc.take() {
+            let _ = process::kill(&p);
         }
     }
 
@@ -2924,6 +4951,8 @@ impl App {
             // 退出程序即终止崩溃重启循环：此时可能还有服务器是"崩溃后待重启"状态
             // （进程已退出、不在 running 列表里），不清空会被工具在退出过程中重新拉起
             self.clear_all_pending_crash_restarts();
+            // 优雅退出：显式结束本工具拉起的所有子进程（Job 已不再 kill-on-close）
+            self.kill_all_children_on_exit();
             return true;
         }
         // 已确认退出但仍有服务器在停止中：继续等待
@@ -2976,12 +5005,15 @@ impl App {
             });
             return false;
         }
-        // 收集运行中的服务�?
+        // 收集运行中的服务器（含已接管的外部实例：它们同样需要用户确认后再退出）
         let running: Vec<usize> = self
             .runtimes
             .iter()
             .enumerate()
-            .filter(|(_, rt)| rt.proc.is_some() && process::is_running(rt.proc.as_ref().unwrap()))
+            .filter(|(_, rt)| {
+                rt.proc.as_ref().map(process::is_running).unwrap_or(false)
+                    || rt.adopted_pid.map(process::pid_alive).unwrap_or(false)
+            })
             .map(|(i, _)| i)
             .collect();
         if running.is_empty() {
@@ -3067,10 +5099,32 @@ impl App {
                     plugin_evts.push(PluginEvt::ServerStarted(name));
                 }
             }
-            // 非用户主动停止时进程消失：先判定是否属于"正常关闭"（控制台输入 /stop 等），
-            // 只有确认异常才当作崩溃处理，并触发崩溃相关提示/重启/备份策略。
+        }
+        // 非用户主动停止时进程消失：先判定是否属于"正常关闭"（控制台输入 /stop 等），
+        // 只有确认异常才当作崩溃处理，并触发崩溃相关提示/重启/备份策略。
+        //
+        // 必须放在 `if let Some(p) = &rt.proc` 之外：已接管的外部实例 rt.proc 为 None，
+        // 若写在里面，adopted 分支永远不可达（外部实例的退出/关服永远检测不到）。
+        // 这里同时覆盖两种运行态：
+        //   · 本工具拉起的子进程（rt.proc）——退出码/退出前 stderr 都能拿到；
+        //   · 已接管的外部实例（rt.adopted_pid）——只能按 PID 探活，退出码拿不到。
+        // 两者的后续判定完全一致，所以先收集成 exit_evt 再统一处理。
+        let mut exit_evt: Option<(Option<i32>, Vec<String>, String)> = None;
+        if let Some(p) = &rt.proc {
             if !rt.stopping && !process::is_running(p) {
-                let code_opt = process::exit_code(p);
+                exit_evt = Some((
+                    process::exit_code(p),
+                    process::stderr_tail_lines(p, 30),
+                    p.cmdline.clone(),
+                ));
+            }
+        } else if let Some(apid) = rt.adopted_pid {
+            if !process::pid_alive(apid) {
+                rt.adopted_pid = None;
+                exit_evt = Some((None, Vec::new(), rt.adopted_cmdline.clone()));
+            }
+        }
+            if let Some((code_opt, stderr_tail, run_cmdline)) = exit_evt {
                 let code = code_opt
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| "?".to_string());
@@ -3078,8 +5132,11 @@ impl App {
                 // 三重信号取或：日志出现 Stopping server/Saving worlds 或 退出码为 0，
                 // 且自本次启动以来没有新增崩溃报告
                 let since = rt
-                    .started_at
-                    .and_then(|t| std::time::SystemTime::now().checked_sub(t.elapsed()))
+                    .run_started
+                    .or_else(|| {
+                        rt.started_at
+                            .and_then(|t| std::time::SystemTime::now().checked_sub(t.elapsed()))
+                    })
                     .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
                 let new_crash = self
                     .cfg
@@ -3092,6 +5149,12 @@ impl App {
                     buf.chars().skip(n.saturating_sub(4000)).collect()
                 };
                 let normal = backup::looks_normal_shutdown(&tail, code_opt, new_crash);
+                // 退出码 / stderr / 命令行留在运行时状态里，供崩溃弹窗展示
+                rt.last_exit_code = code_opt;
+                rt.last_stderr = stderr_tail.clone();
+                if !run_cmdline.is_empty() {
+                    rt.run_cmdline = run_cmdline.clone();
+                }
                 // 关服/崩溃快照统一入口（本帧先登记，循环结束后再起线程）
                 exit_events.push((idx, code_opt, tail, new_crash));
                 if normal {
@@ -3102,21 +5165,52 @@ impl App {
                     }
                 } else {
                     notify_queue.push(("XMST - 服务器异常退出".to_string(), format!("{name} 进程已退出（code {code}），未经过正常停止")));
-                    // 崩溃根因分析：从日志/crash-report 里提取可操作的原因（缺少前置、Java 版本、
-                    // 内存、端口、Mixin 冲突…），随后弹出小窗提示，而不是只丢一句"异常退出"。
+                    // 崩溃根因分析：只认**本次运行**产生的崩溃报告。没有报告通常意味着
+                    // JVM 还没起来就退了（Java 版本不对/缺前置/内存不足），这类情况
+                    // 必须把退出码 + stderr 末尾 + 启动命令行直接摆出来，而不是只报"没报告"。
                     let sdir = self.cfg.servers.get(idx).map(|s| s.dir.clone());
                     if let Some(sdir) = sdir {
-                        if let Some(finding) = crashscan::analyze(&sdir) {
-                            let first = finding
-                                .causes
-                                .first()
-                                .map(|c| c.title.clone())
-                                .unwrap_or_else(|| "疑似启动失败".to_string());
-                            notify_queue.push((
-                                "XMST - 崩溃原因分析".to_string(),
-                                format!("{name}：{first}（详见「崩溃分析」窗口）"),
-                            ));
-                            self.crash_report = Some((idx, name.clone(), finding));
+                        match crashscan::analyze_since(&sdir, since) {
+                            Ok(finding) => {
+                                let first = finding
+                                    .causes
+                                    .first()
+                                    .map(|c| c.title.clone())
+                                    .unwrap_or_else(|| "疑似启动失败".to_string());
+                                notify_queue.push((
+                                    "XMST - 崩溃原因分析".to_string(),
+                                    format!("{name}：{first}（详见「崩溃分析」窗口）"),
+                                ));
+                                self.crash_report = Some((idx, name.clone(), finding));
+                            }
+                            Err(msg) => {
+                                // 本次运行没有崩溃报告：展示退出码 + stderr 最后 30 行 + 命令行
+                                // （这些值来自本次退出事件本身，不再回读 self.runtimes —— rt 已可变借用）
+                                notify_queue.push((
+                                    "XMST - 启动失败".to_string(),
+                                    format!("{name}：本次运行未生成崩溃报告，通常意味着 JVM 还没启动成功就退出了"),
+                                ));
+                                // 系统 Java 版本在这里算一次（渲染路径不能每帧跑 java -version）
+                                let java_txt = self
+                                    .cfg
+                                    .servers
+                                    .get(idx)
+                                    .map(|s| {
+                                        let jp = resolve_java_for_server(&self.cfg, s);
+                                        java_version_text(&jp)
+                                            .unwrap_or_else(|e| format!("无法获取（{e}）"))
+                                    })
+                                    .unwrap_or_else(|| "无法获取".to_string());
+                                self.crash_no_report_java = java_txt;
+                                self.crash_no_report = Some((
+                                    idx,
+                                    name.clone(),
+                                    msg,
+                                    code_opt,
+                                    stderr_tail.clone(),
+                                    run_cmdline.clone(),
+                                ));
+                            }
                         }
                     }
                     rt.proc = None;
@@ -3181,7 +5275,6 @@ impl App {
                     }
                 }
             }
-        }
 
         // 插件事件：服务器启动完成 / 新日志行 / 玩家加入离开（BETA_PLUGINS 启用且目录已就绪才收集）
         if plugins_active {
@@ -3797,6 +5890,15 @@ impl App {
             .map(|s| s.dir.clone())
             .unwrap_or_default();
         let list = backup::list_backups(&dir);
+        // 顺带刷新"锁定状态"缓存：is_snapshot_pinned 要读 meta.json，
+        // 与列表共用同一个 2 秒节流周期，避免每帧逐个读盘。
+        let mut pins: HashMap<PathBuf, bool> = HashMap::new();
+        for b in list.iter() {
+            if b.is_snapshot {
+                pins.insert(b.path.clone(), backup::is_snapshot_pinned(&b.path));
+            }
+        }
+        self.snapshot_pins = pins;
         self.backup_cache = Some((idx, std::time::Instant::now(), list.clone()));
         list
     }
@@ -4927,6 +7029,12 @@ impl App {
             return;
         }
         let target = self.file_tab_target(idx);
+        // 文件列表被刷新（刷新按钮 / 启用禁用模组 / 重命名 / 删除 / 更新完成）意味着数据可能变了，
+        // 立刻失效平台识别与 mods 元数据缓存，让 UI 立即反映变化（不依赖 3 秒 TTL 自然过期）。
+        if let Some(sc) = self.cfg.servers.get(idx) {
+            serverinfo::invalidate_cache(&sc.dir);
+            serverinfo::invalidate_cache(&sc.dir.join("mods"));
+        }
         let mut list: Vec<(String, u64, bool)> = Vec::new();
         if let Ok(rd) = std::fs::read_dir(&target) {
             for e in rd.flatten() {
@@ -4972,17 +7080,40 @@ impl App {
     fn open_file_edit(&mut self, idx: usize, name: &str) {
         let target = self.file_tab_target(idx);
         let p = target.join(name);
-        let content = std::fs::read_to_string(&p).unwrap_or_else(|e| format!("读取失败: {e}"));
-        self.runtimes[idx].file_content_edit = Some((p.to_string_lossy().to_string(), content));
+        // 按原编码读取并记下编码与换行风格：保存时必须写回同一编码，
+        // 否则 GBK 的 .bat/.properties/配置文件会被写成乱码（真实事故：服务器起不来）。
+        match read_text_for_edit(&p) {
+            Ok((content, meta)) => {
+                self.runtimes[idx].file_content_meta = Some(meta);
+                self.runtimes[idx].file_content_edit =
+                    Some((p.to_string_lossy().to_string(), content));
+            }
+            Err(e) => {
+                self.runtimes[idx].file_content_meta = None;
+                self.runtimes[idx].file_content_edit =
+                    Some((p.to_string_lossy().to_string(), format!("读取失败: {e}")));
+            }
+        }
     }
 
     fn save_file_edit(&mut self, idx: usize) {
         if let Some((path, content)) = self.runtimes[idx].file_content_edit.take() {
-            match std::fs::write(&path, content) {
+            let path_buf = PathBuf::from(&path);
+            // TextMeta 是 Copy：不 take，保存失败时编辑器仍能正确显示原编码
+            let (enc, crlf) = match self.runtimes[idx].file_content_meta {
+                Some(m) => (m.enc, m.crlf),
+                None => (default_text_encoding(&path_buf), true),
+            };
+            match write_text_same_encoding(&path_buf, &content, enc, crlf) {
                 Ok(_) => {
-                    self.set_toast("文件已保存".to_string());
+                    self.set_toast(format!(
+                        "文件已保存（{}，原文件已备份为 .bak_ 时间戳）",
+                        enc.label()
+                    ));
                 }
                 Err(e) => {
+                    // 保存失败：把内容放回编辑器，避免用户的改动被丢掉
+                    self.runtimes[idx].file_content_edit = Some((path, content));
                     self.set_toast(format!("保存失败: {e}"));
                 }
             }
@@ -5514,7 +7645,40 @@ fn load_config(path: &Path) -> GlobalConfig {
             }
         }
     }
+    // 备份排除表补齐 tmp：工具会为每个服务器建 <服务器目录>\tmp 作为独立临时目录
+    //（JNA/SQLite 把原生 DLL 解压进去），它不在排除表里会让快照变化数与占用虚高。
+    // 空表先用默认值填满（与 backup::default_excludes 一致），再补齐 tmp；不覆盖用户自定义项、不改顺序。
+    if migrate_backup_exclude_tmp(&mut cfg) {
+        if let Ok(json) = serde_json::to_string_pretty(&cfg) {
+            if let Some(data_dir) = path.parent() {
+                let _ = std::fs::create_dir_all(data_dir);
+            }
+            let tmp = path.with_extension("json.tmp");
+            if std::fs::write(&tmp, json.as_bytes()).is_ok() {
+                let _ = std::fs::rename(&tmp, path);
+            }
+        }
+    }
     cfg
+}
+
+/// 排除表补齐默认项（独立临时目录等：JNA/SQLite 把原生 DLL 解压进去，不排除会让快照变化数虚高）。
+///
+/// 具体规则已全部收敛到 `backup::migrate_excludes`（默认表含 `tmp`/`hsperfdata_*`/`jna-*`/`sqlite-*`），
+/// 这里只做一层薄封装：保留原函数名与调用点，避免出现两套并行的迁移逻辑而互相漂移。
+fn ensure_tmp_excluded(ex: &mut Vec<String>) -> bool {
+    backup::migrate_excludes(ex)
+}
+
+/// 启动时给所有服务器的备份排除表补齐默认项（见 ensure_tmp_excluded）。返回是否有改动（有改动才回写配置）。
+fn migrate_backup_exclude_tmp(cfg: &mut GlobalConfig) -> bool {
+    let mut changed = false;
+    for sc in cfg.servers.iter_mut() {
+        if backup::migrate_excludes(&mut sc.backup.exclude) {
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// 崩溃熔断的旧默认值收敛（默认值见 config.rs 的 default_crash_*）。
@@ -5840,7 +8004,7 @@ impl App {
         if let Some(old) = self
             .toasts
             .iter_mut()
-            .find(|t| t.cancel_server.is_none() && t.title == title && t.body == body)
+            .find(|t| t.cancel_server.is_none() && t.open_dir.is_none() && t.title == title && t.body == body)
         {
             old.born = std::time::Instant::now();
             return;
@@ -5852,6 +8016,21 @@ impl App {
             body: body.to_string(),
             born: std::time::Instant::now(),
             cancel_server: None,
+            open_dir: None,
+        });
+        self.trim_toasts();
+    }
+
+    /// 带「打开所在目录」按钮的通知：用于诊断包导出完成这类"顺带告诉用户文件在哪"的场景。
+    fn push_toast_with_dir(&mut self, title: &str, body: &str, dir: PathBuf) {
+        self.next_toast_id += 1;
+        self.toasts.push(ToastMsg {
+            id: self.next_toast_id,
+            title: title.to_string(),
+            body: body.to_string(),
+            born: std::time::Instant::now(),
+            cancel_server: None,
+            open_dir: Some(dir),
         });
         self.trim_toasts();
     }
@@ -5870,6 +8049,7 @@ impl App {
             body: body.to_string(),
             born: std::time::Instant::now(),
             cancel_server: Some(idx),
+            open_dir: None,
         });
         self.trim_toasts();
     }
@@ -6021,7 +8201,7 @@ $timer.Start(); \
         let anim = if self.cfg.ui_animations { 0.25_f32 } else { 0.001_f32 }; // 进出动画时长（秒）；关闭动效时近似瞬时
         let total = hold + 2.0 * anim;
         // 逐条计算位置与透明度，渲染后移除过期项
-        // (id, 标题, 正文, 取消按钮目标服务器, 倒计时秒数, 位置, 透明度, 实测卡片高度)
+        // (id, 标题, 正文, 取消按钮目标服务器, 倒计时秒数, 位置, 透明度, 实测卡片高度, 打开目录按钮目标)
         let mut render: Vec<(
             u64,
             String,
@@ -6031,6 +8211,7 @@ $timer.Start(); \
             egui::Pos2,
             f32,
             f32,
+            Option<PathBuf>,
         )> = Vec::new();
         let mut alive: Vec<ToastMsg> = Vec::new();
         // 卡片自下往上堆叠。为什么不能再用固定卡片高度：通知卡的实际高度取决于
@@ -6057,6 +8238,7 @@ $timer.Start(); \
                 body: t.body.clone(),
                 born: t.born,
                 cancel_server: t.cancel_server,
+                open_dir: t.open_dir.clone(),
             });
             let alpha = if el < anim {
                 el / anim
@@ -6073,7 +8255,9 @@ $timer.Start(); \
                 continue;
             }
             // 按本条卡片的真实高度计算它的位置（y_bottom 逐条累加，任何高度组合都不会重叠）
-            let h = measure_toast_card_height(ctx, &t.title, &t.body, pending, text_w);
+            // 「取消自动重启」与「打开所在目录」都只占一行按钮，高度预留同理
+            let has_btn_row = pending || t.open_dir.is_some();
+            let h = measure_toast_card_height(ctx, &t.title, &t.body, has_btn_row, text_w);
             let y = y_bottom - h;
             if y < screen.top() {
                 // 屏幕高度实在放不下：本条本帧不画也不丢，等上面的通知消失后自然出现
@@ -6104,13 +8288,15 @@ $timer.Start(); \
                 egui::pos2(x, y),
                 alpha,
                 h,
+                t.open_dir.clone(),
             ));
             y_bottom = y - gap;
         }
         self.toasts = alive;
-        // 点击取消只记录，渲染循环结束后统一处理（避免与 self.toasts 的借用冲突）
+        // 点击取消 / 打开目录只记录，渲染循环结束后统一处理（避免与 self.toasts 的借用冲突）
         let mut cancel_clicked: Option<usize> = None;
-        for (id, title, body, cancel_server, countdown, pos, alpha, card_h) in render {
+        let mut open_dir_clicked: Option<PathBuf> = None;
+        for (id, title, body, cancel_server, countdown, pos, alpha, card_h, open_dir) in render {
             let mut clicked_here = false;
             // 左侧强调条按卡片实际高度铺满（上下各留 8px），不再用固定高度推算
             let bar_h = (card_h - 16.0).max(24.0);
@@ -6181,6 +8367,17 @@ $timer.Start(); \
                                             clicked_here = true;
                                         }
                                     });
+                                } else if let Some(dir) = &open_dir {
+                                    // 「打开所在目录」：诊断包导出后直接给出入口，省得用户去找文件
+                                    ui.add_space(4.0);
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .add(egui::Button::new(RichText::new("打开所在目录").size(12.0)))
+                                            .clicked()
+                                        {
+                                            open_dir_clicked = Some(dir.clone());
+                                        }
+                                    });
                                 }
                             });
                         });
@@ -6204,6 +8401,10 @@ $timer.Start(); \
                     &format!("已取消「{name}」的自动重启，服务器保持停止；需要时点「启动服务器」"),
                 );
             }
+        }
+        // 「打开所在目录」：在资源管理器里打开该目录（路径已是绝对路径）
+        if let Some(dir) = open_dir_clicked {
+            self.open_folder(&dir);
         }
     }
 }
@@ -6521,7 +8722,9 @@ fn read_bat_max_restarts(dir: &Path) -> Option<(String, i32)> {
     for e in rd.flatten() {
         let p = e.path();
         if p.extension().map(|x| x.eq_ignore_ascii_case("bat")).unwrap_or(false) {
-            let Ok(s) = std::fs::read_to_string(&p) else { continue };
+            // 按原编码读取：GBK 脚本里的中文注释会让 read_to_string 直接失败，
+            // 那样就永远探测不到 MAX_RESTARTS（工具与脚本的重启次数也就无法对齐）
+            let Ok((s, _)) = read_text_auto_encoding(&p) else { continue };
             for line in s.lines() {
                 let l = line.trim();
                 if l.to_ascii_uppercase().contains("MAX_RESTARTS") {
@@ -6543,6 +8746,8 @@ fn read_bat_max_restarts(dir: &Path) -> Option<(String, i32)> {
 }
 
 /// 把 .bat 里的 `MAX_RESTARTS` 改成指定值（保持其它内容不变）。返回被修改的文件名。
+/// 读写都走编码安全通道：脚本可能是 GBK（中文注释），按 UTF-8 读会失败、按 UTF-8 写会写坏
+/// （正是「bat 被写坏导致服务器起不来」那一类问题）。
 fn write_bat_max_restarts(dir: &Path, value: i32) -> Result<String, String> {
     let rd = std::fs::read_dir(dir).map_err(|e| e.to_string())?;
     for e in rd.flatten() {
@@ -6550,13 +8755,19 @@ fn write_bat_max_restarts(dir: &Path, value: i32) -> Result<String, String> {
         if !p.extension().map(|x| x.eq_ignore_ascii_case("bat")).unwrap_or(false) {
             continue;
         }
-        let s = std::fs::read_to_string(&p).map_err(|e| e.to_string())?;
+        let (s, enc) = read_text_auto_encoding(&p)?;
         if !s.to_ascii_uppercase().contains("MAX_RESTARTS") {
             continue;
         }
+        let crlf = if s.is_empty() { true } else { detect_crlf(&s) };
         let mut out = String::with_capacity(s.len());
         for line in s.lines() {
-            if line.to_ascii_uppercase().contains("MAX_RESTARTS") && line.contains('=') {
+            // 只改真正的赋值行（`set ["]MAX_RESTARTS=…`）：注释里的说明（rem/:: 行）与
+            // `if %RESTARTS% GEQ %MAX_RESTARTS%` 这类比较行一律保持原样。
+            let upper = line.to_ascii_uppercase();
+            let trimmed = upper.trim_start();
+            let is_comment = trimmed.starts_with("REM") || trimmed.starts_with("::");
+            if !is_comment && upper.contains("MAX_RESTARTS") && line.contains('=') {
                 let indent: String = line.chars().take_while(|c| c.is_whitespace()).collect();
                 // 保留原有的 set 写法风格
                 if line.contains('"') {
@@ -6569,7 +8780,8 @@ fn write_bat_max_restarts(dir: &Path, value: i32) -> Result<String, String> {
             }
             out.push('\n');
         }
-        std::fs::write(&p, out).map_err(|e| e.to_string())?;
+        // 按原编码 + 原换行风格写回（临时文件 → 备份 .bak_时间戳 → 原子替换）
+        write_text_same_encoding(&p, &out, enc, crlf)?;
         return Ok(p.file_name().unwrap_or_default().to_string_lossy().to_string());
     }
     Err("未找到含 MAX_RESTARTS 的 .bat".to_string())
@@ -7571,12 +9783,15 @@ fn make_tray_icon() -> tray_icon::Icon {
     tray_icon::Icon::from_rgba(make_theme_icon_rgba(S), S as u32, S as u32).expect("tray icon")
 }
 
-/// 创建系统托盘图标 + 菜单；返�?(TrayIcon, show_id, quit_id)
+/// 创建系统托盘图标 + 菜单；返回 (TrayIcon, 菜单句柄, show_id, quit_id)。
+/// 菜单句柄一并返回：Explorer 重启后要按**同一个菜单**重建图标，
+/// 菜单项 ID 不变，已注册的全局事件回调才能继续匹配（否则「显示主窗口/退出」会失灵）。
 /// 事件处理：注册全局回调（回调线程），把状态写进 Arc<AtomicBool>，
 /// 窗口显隐/退出由 update 轮询消费。避免「托盘事件在 UI 线程 try_recv 轮询、
 /// 窗口隐藏后事件循环休眠导致事件积压不响应」的根因。
 fn setup_tray_and_menu() -> (
     Option<tray_icon::TrayIcon>,
+    Option<tray_icon::menu::Menu>,
     Option<tray_icon::menu::MenuId>,
     Option<tray_icon::menu::MenuId>,
 ) {
@@ -7591,18 +9806,25 @@ fn setup_tray_and_menu() -> (
     let show_id = show_item.id().clone();
     let quit_id = quit_item.id().clone();
     if menu.append(&show_item).is_err() || menu.append(&quit_item).is_err() {
-        return (None, None, None);
+        return (None, None, None, None);
     }
+    let tray = build_tray_icon(&menu);
+    (tray, Some(menu), Some(show_id), Some(quit_id))
+}
+
+/// 用给定菜单创建托盘图标。托盘图标由 tray-icon 库持有，重建它内部即
+/// `Shell_NotifyIconW(NIM_ADD)`——Explorer 重启（TaskbarCreated）和首次初始化都走这里。
+fn build_tray_icon(menu: &tray_icon::menu::Menu) -> Option<tray_icon::TrayIcon> {
     let icon = make_tray_icon();
     match tray_icon::TrayIconBuilder::new()
-        .with_menu(Box::new(menu))
+        .with_menu(Box::new(menu.clone()))
         .with_menu_on_left_click(false)
         .with_tooltip("修暝的服务器工具 (XMST)")
         .with_icon(icon)
         .build()
     {
-        Ok(tray) => (Some(tray), Some(show_id), Some(quit_id)),
-        Err(_) => (None, None, None),
+        Ok(tray) => Some(tray),
+        Err(_) => None,
     }
 }
 
@@ -7637,6 +9859,250 @@ fn main_hwnd() -> winapi::shared::windef::HWND {
         EnumWindows(Some(find_main), &mut found as *mut HWND as LPARAM);
     }
     found
+}
+
+// ---------- 主窗口消息钩子：托盘重建（TaskbarCreated）与系统关机（会话结束） ----------
+
+/// 系统关机/注销时向服务器发 stop、并强制落盘配置所需的共享数据。
+///
+/// 为什么窗口过程不直接访问 App：窗口过程与 App::update 跑在同一线程的不同阶段，
+/// 从窗口过程借用 App 会产生别名 &mut（未定义行为）。这里只登记真正需要、且可独立共享的东西：
+///   · 运行中服务器的子进程句柄（与 ManagedProcess.child 是同一个 Arc）；
+///   · 配置快照与路径（save_config/flush_config 时同步），用于关机时强制落盘。
+struct ShutdownBridge {
+    /// 运行中的服务器：(服务器序号, 子进程句柄, 是否允许写 stdin)
+    procs: std::sync::Mutex<
+        Vec<(
+            usize,
+            std::sync::Arc<std::sync::Mutex<std::process::Child>>,
+            bool,
+        )>,
+    >,
+    /// 配置快照（含尚未去抖落盘的改动）
+    cfg: std::sync::Mutex<Option<GlobalConfig>>,
+    /// 配置文件路径
+    config_path: std::sync::Mutex<Option<PathBuf>>,
+    /// 数据目录（关机留痕日志写这里）
+    data_dir: std::sync::Mutex<Option<PathBuf>>,
+}
+
+/// 全局单例（只在启动/启动服务器/关机等非渲染路径访问）。
+fn shutdown_bridge() -> &'static ShutdownBridge {
+    static BRIDGE: std::sync::OnceLock<ShutdownBridge> = std::sync::OnceLock::new();
+    BRIDGE.get_or_init(|| ShutdownBridge {
+        procs: std::sync::Mutex::new(Vec::new()),
+        cfg: std::sync::Mutex::new(None),
+        config_path: std::sync::Mutex::new(None),
+        data_dir: std::sync::Mutex::new(None),
+    })
+}
+
+/// 登记某服务器的子进程句柄（启动成功时调用；同一服务器重新启动即覆盖旧句柄）。
+fn bridge_register_proc(
+    idx: usize,
+    child: std::sync::Arc<std::sync::Mutex<std::process::Child>>,
+    allow_stdin: bool,
+) {
+    let b = shutdown_bridge();
+    let mut g = b.procs.lock().unwrap_or_else(|e| e.into_inner());
+    g.retain(|(i, _, _)| *i != idx);
+    g.push((idx, child, allow_stdin));
+}
+
+/// 同步配置快照与路径（App::new / 配置置脏 / 落盘成功后调用，不在渲染路径里做额外工作）。
+fn bridge_sync_config(cfg: &GlobalConfig, config_path: &Path, data_dir: &Path) {
+    let b = shutdown_bridge();
+    *b.cfg.lock().unwrap_or_else(|e| e.into_inner()) = Some(cfg.clone());
+    *b.config_path.lock().unwrap_or_else(|e| e.into_inner()) = Some(config_path.to_path_buf());
+    *b.data_dir.lock().unwrap_or_else(|e| e.into_inner()) = Some(data_dir.to_path_buf());
+}
+
+/// 向所有登记在册且仍在运行的服务器发送 stop（沿用 process::write_stdin_child）。返回实际发出的条数。
+fn session_end_stop_servers() -> usize {
+    let b = shutdown_bridge();
+    let g = b.procs.lock().unwrap_or_else(|e| e.into_inner());
+    let mut sent = 0usize;
+    for (_, child, allow_stdin) in g.iter() {
+        if !*allow_stdin || !process::child_running(child) {
+            continue;
+        }
+        if process::write_stdin_child(child, "stop").is_ok() {
+            sent += 1;
+        }
+    }
+    sent
+}
+
+/// 仍在运行的服务器数量（关机等待用）。
+fn session_end_running_count() -> usize {
+    let b = shutdown_bridge();
+    let g = b.procs.lock().unwrap_or_else(|e| e.into_inner());
+    g.iter()
+        .filter(|(_, child, _)| process::child_running(child))
+        .count()
+}
+
+/// 分片等待（每片 200ms，总时长不超过 total_ms）：全部服务器退出即提前返回。
+/// 只在关机路径调用，不会长时间阻塞正常事件循环。
+fn session_end_wait(total_ms: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(total_ms);
+    loop {
+        if session_end_running_count() == 0 {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return;
+        }
+        let left = deadline.saturating_duration_since(now);
+        std::thread::sleep(left.min(std::time::Duration::from_millis(200)));
+    }
+}
+
+/// 关机路径强制落盘配置：与 flush_config 相同的原子写（临时文件 → 保留 .bak → 替换），
+/// 序列化失败绝不写空文件。
+fn flush_config_from_bridge() {
+    let b = shutdown_bridge();
+    let path = match b
+        .config_path
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        Some(p) => p,
+        None => return,
+    };
+    let json = {
+        let g = b.cfg.lock().unwrap_or_else(|e| e.into_inner());
+        match g.as_ref().and_then(|c| serde_json::to_string_pretty(c).ok()) {
+            Some(j) => j,
+            None => return,
+        }
+    };
+    let tmp = path.with_extension("json.tmp");
+    let bak = path.with_extension("json.bak");
+    if std::fs::write(&tmp, json.as_bytes()).is_err() {
+        return;
+    }
+    if path.exists() {
+        let _ = std::fs::copy(&path, &bak);
+    }
+    let _ = std::fs::rename(&tmp, &path);
+}
+
+/// 关机/注销路径留痕：追加一行到 `data\shutdown.log`（不轮转，关机事件很少）。
+fn append_shutdown_log(msg: &str) {
+    let dir = match shutdown_bridge()
+        .data_dir
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        Some(d) => d,
+        None => return,
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("shutdown.log"))
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "[{}] {}", Local::now().format("%Y-%m-%d %H:%M:%S"), msg);
+    }
+}
+
+/// TaskbarCreated 广播的消息号（Explorer 重启重建任务栏时广播）。0 = 尚未注册/注册失败。
+static TASKBAR_CREATED_MSG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Explorer 重启（托盘图标需要重建）标记：窗口过程置位，update 消费。
+static TRAY_RECREATE_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// 子类化前的窗口过程地址（0 = 未挂钩）
+static ORIG_WNDPROC: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+/// 已挂钩的窗口句柄（窗口被重建后需要重新挂钩）
+static HOOKED_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// 主窗口消息过程：只做「置标记」与关机这种必须当场做完的事，绝不借用 App。
+unsafe extern "system" fn xmst_wndproc(
+    hwnd: winapi::shared::windef::HWND,
+    msg: u32,
+    wparam: winapi::shared::minwindef::WPARAM,
+    lparam: winapi::shared::minwindef::LPARAM,
+) -> winapi::shared::minwindef::LRESULT {
+    use std::sync::atomic::Ordering;
+    use winapi::um::winuser::{DefWindowProcW, WM_ENDSESSION, WM_QUERYENDSESSION};
+    // ① Explorer 崩溃/重启：任务栏重建广播。托盘图标丢了以后，隐藏态下用户既看不到图标
+    //    也没法恢复窗口，因此必须重建（重建动作放 update 里，见 App::handle_tray_recreate）。
+    let tb = TASKBAR_CREATED_MSG.load(Ordering::Relaxed);
+    if tb != 0 && msg == tb {
+        TRAY_RECREATE_REQUESTED.store(true, Ordering::Relaxed);
+    }
+    // ② 系统关机/注销：先给所有运行中的服务器发 stop，再返回 TRUE 让系统继续结束会话。
+    //    关机路径不弹任何对话框。
+    if msg == WM_QUERYENDSESSION {
+        let n = session_end_stop_servers();
+        append_shutdown_log(&format!(
+            "系统关机/注销：已向 {n} 个运行中的服务器发送 stop，等待其保存世界"
+        ));
+        return 1; // TRUE
+    }
+    // ③ 会话确实要结束：分片等待（总计约 4 秒）让服务器保存世界，然后强制落盘配置。
+    //    等待只做 sleep + 查进程，不碰 App / UI，不会与 update 产生别名借用。
+    if msg == WM_ENDSESSION && wparam != 0 {
+        session_end_wait(4000);
+        flush_config_from_bridge();
+        let left = session_end_running_count();
+        if left > 0 {
+            append_shutdown_log(&format!(
+                "系统关机导致未能完整优雅停止：{left} 个服务器在 4 秒内未退出，进程将由系统结束（世界可能未保存）"
+            ));
+        } else {
+            append_shutdown_log("系统关机：服务器已在等待窗口内退出，配置已强制落盘");
+        }
+    }
+    let orig = ORIG_WNDPROC.load(Ordering::Relaxed);
+    if orig != 0 {
+        let f: unsafe extern "system" fn(
+            winapi::shared::windef::HWND,
+            u32,
+            winapi::shared::minwindef::WPARAM,
+            winapi::shared::minwindef::LPARAM,
+        ) -> winapi::shared::minwindef::LRESULT = std::mem::transmute(orig);
+        return f(hwnd, msg, wparam, lparam);
+    }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+/// 给主窗口装一次子类化（窗口被重建时重新装）。失败不写状态，下次 update 再试。
+fn install_main_wndproc(hwnd: winapi::shared::windef::HWND) {
+    use std::sync::atomic::Ordering;
+    use winapi::shared::minwindef::{LPARAM, LRESULT, WPARAM};
+    use winapi::shared::windef::HWND;
+    use winapi::um::winuser::{RegisterWindowMessageW, SetWindowLongPtrW, GWLP_WNDPROC};
+    if hwnd.is_null() {
+        return;
+    }
+    let cur = hwnd as isize;
+    if HOOKED_HWND.load(Ordering::Relaxed) == cur {
+        return;
+    }
+    unsafe {
+        if TASKBAR_CREATED_MSG.load(Ordering::Relaxed) == 0 {
+            // "TaskbarCreated" 由 Explorer 注册，注册同名消息即得到同一条消息号
+            let name: Vec<u16> = "TaskbarCreated\0".encode_utf16().collect();
+            let m = RegisterWindowMessageW(name.as_ptr());
+            if m != 0 {
+                TASKBAR_CREATED_MSG.store(m, Ordering::Relaxed);
+            }
+        }
+        let new_proc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT = xmst_wndproc;
+        let prev = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, new_proc as isize);
+        if prev == 0 {
+            return;
+        }
+        ORIG_WNDPROC.store(prev, Ordering::Relaxed);
+        HOOKED_HWND.store(cur, Ordering::Relaxed);
+    }
 }
 
 /// 托盘心跳线程：托盘隐藏期间每秒向主窗口投递一条 WM_PAINT，让隐藏态也能回调 update()。
@@ -7759,6 +10225,15 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // R1/R2：给主窗口装消息钩子。窗口过程只置标记（Explorer 重启）或做关机这种必须
+        // 当场完成的事（会话结束），真正的托盘重建放这里的 handle_tray_recreate ——
+        // 这样窗口过程永远不需要借用 App（同一线程的不同阶段，借用会产生别名 &mut）。
+        // install_main_wndproc 内部按句柄比对，已挂钩时几乎零开销；窗口重建后会自动重新挂钩。
+        {
+            let hwnd = resolve_main_hwnd(&mut self.hwnd_cache);
+            install_main_wndproc(hwnd);
+        }
+        self.handle_tray_recreate(ctx);
         // P0 阶段0 A1：托盘态不渲染——隐藏时立即返回，不构图、不重建纹理/字体/背景材质。
         // 但隐藏期间仍要按 1s 跑一批自动行为 tick（进程退出检测 / 正常关服快照 / 崩溃与自动重启 /
         // 下载与备份收尾），见下方 tray_hidden_tick —— 那是「关窗去托盘后再停服」能被检测到、
@@ -8066,6 +10541,9 @@ impl eframe::App for App {
         self.tick_mod_update();
         // 创建服务器下载回传（B7）
         self.tick_create_server();
+        // 外部启动实例扫描（节流 5 秒）+ 一次性后台任务回传（锁定/转存/诊断包/预检/检查更新）
+        self.tick_external();
+        self.tick_bg();
         // 插件系统：事件分发 + 消息消费（BETA_PLUGINS 关闭时零开销）
         self.emit_plugin_events(plugin_evts);
         self.tick_plugins(ctx);
@@ -8672,7 +11150,10 @@ impl eframe::App for App {
                                 .runtimes
                                 .iter()
                                 .enumerate()
-                                .filter(|(_, rt)| rt.proc.is_some() && process::is_running(rt.proc.as_ref().unwrap()))
+                                .filter(|(_, rt)| {
+                                    rt.proc.as_ref().map(process::is_running).unwrap_or(false)
+                                        || rt.adopted_pid.map(process::pid_alive).unwrap_or(false)
+                                })
                                 .map(|(i, _)| i)
                                 .collect();
                             self.confirm_close = None;
@@ -8882,6 +11363,14 @@ impl eframe::App for App {
         self.ui_bg_editor(ctx);
         // 崩溃分析小窗（服务端异常退出后自动出现）
         self.ui_crash_report(ctx);
+        // 「本次运行未生成崩溃报告」（JVM 未起来就退出）：退出码 + stderr + 命令行
+        self.ui_crash_no_report(ctx);
+        // 外部实例相关弹窗（启动时残留提示 / 点启动时接管提示 / 结束外部进程二次确认）
+        self.ui_external_dialogs(ctx);
+        // 启动前预检结果窗口
+        self.ui_precheck_window(ctx);
+        // 模组检查更新结果窗口（BETA_MOD_UPDATE）
+        self.ui_mod_update_window(ctx);
         // 低完整性（Low IL）启动提示：只弹一次（检测在 App::new，未检测到则始终为空）
         self.ui_low_il_notice(ctx);
         // “打开目录”失败提示（错误经静态槽从 open_folder 带回）
@@ -9271,6 +11760,10 @@ impl App {
             self.clear_client_mod_marks();
             // 切换服务器：特殊功能页 Spark 检测/文件列表缓存一并清除
             self.clear_special_marks();
+            // 切换服务器：平台识别 / mods 元数据缓存整体清空，避免读到上一台服务器的结果
+            serverinfo::clear_cache();
+            // 切到另一台服务器时立刻重新扫一次外部实例（不等 5 秒节流）
+            self.external_scan_at = None;
         }
         if let Some(i) = toggle_fav {
             if let Some(sc) = self.cfg.servers.get_mut(i) {
@@ -10011,73 +12504,42 @@ impl App {
         self.runtimes[idx].spark_detect = Some((available, jars));
     }
 
-    /// 扫描 mods 目录下所有 jar，提取元数据别名（fabric.mod.json id/name、mods.toml modId/displayName），缓存到 mod_jar_index
+    /// 扫描 mods 目录下所有 jar，取元数据别名（modid + 显示名），缓存到 mod_jar_index。
+    ///
+    /// 实现已切换到 `serverinfo::scan_mod_metadata`：它按"目录指纹"记忆化，
+    /// 不再由本页每次逐个打开 jar（逐个开 jar 是渲染路径上的重活，见项目已知问题）。
     fn scan_mod_jar_index(&mut self, idx: usize) {
         if idx >= self.runtimes.len() {
             return;
         }
-        let mut infos: Vec<spark_analysis::ModJarInfo> = Vec::new();
-        if let Some(sc) = self.cfg.servers.get(idx) {
-            let mods_dir = sc.dir.join("mods");
-            if let Ok(rd) = std::fs::read_dir(&mods_dir) {
-                for e in rd.flatten() {
-                    if !e.path().is_file() {
-                        continue;
-                    }
-                    let name = e.file_name().to_string_lossy().to_string();
-                    if !name.to_lowercase().ends_with(".jar") {
-                        continue;
-                    }
-                    infos.push(Self::mod_jar_info(&e.path(), name));
-                }
-            }
-        }
+        let Some(sc) = self.cfg.servers.get(idx) else {
+            return;
+        };
+        let mods_dir = sc.dir.join("mods");
+        let mut infos: Vec<spark_analysis::ModJarInfo> = serverinfo::scan_mod_metadata(&mods_dir)
+            .into_iter()
+            .map(|m| spark_analysis::ModJarInfo {
+                jar: m.file_name.clone(),
+                aliases: m.aliases(),
+            })
+            .collect();
         infos.sort_by(|a, b| a.jar.cmp(&b.jar));
         self.runtimes[idx].mod_jar_index = Some(infos);
     }
 
     /// 解析单个 jar 的模组元数据别名（fabric.mod.json 的 id/name、META-INF/mods.toml 与 neoforge.mods.toml 的 modId/displayName）
+    ///
+    /// 已由 `serverinfo::scan_mod_metadata` + `ModMeta::aliases()` 取代（见 scan_mod_jar_index），
+    /// 这里不再逐个打开 jar；逻辑统一到 serverinfo，避免两套解析规则漂移。
+    #[allow(dead_code)]
     fn mod_jar_info(path: &std::path::Path, jar: String) -> spark_analysis::ModJarInfo {
-        let mut aliases: Vec<String> = Vec::new();
-        let Ok(file) = std::fs::File::open(path) else {
-            return spark_analysis::ModJarInfo { jar, aliases };
-        };
-        let Ok(mut z) = zip::ZipArchive::new(file) else {
-            return spark_analysis::ModJarInfo { jar, aliases };
-        };
-        if let Ok(mut f) = z.by_name("fabric.mod.json") {
-            let mut buf = Vec::new();
-            if std::io::Read::read_to_end(&mut f, &mut buf).is_ok() {
-                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&buf) {
-                    if let Some(id) = v["id"].as_str() {
-                        aliases.push(id.to_string());
-                    }
-                    if let Some(n) = v["name"].as_str() {
-                        aliases.push(n.to_string());
-                    }
-                }
-            }
-        }
-        for meta in ["META-INF/mods.toml", "META-INF/neoforge.mods.toml"] {
-            if let Ok(mut f) = z.by_name(meta) {
-                let mut buf = Vec::new();
-                if std::io::Read::read_to_end(&mut f, &mut buf).is_ok() {
-                    if let Ok(v) = toml::from_str::<toml::Value>(&String::from_utf8_lossy(&buf)) {
-                        if let Some(mods) = v.get("mods").and_then(|m| m.as_array()) {
-                            for m in mods {
-                                if let Some(id) = m.get("modId").and_then(|x| x.as_str()) {
-                                    aliases.push(id.to_string());
-                                }
-                                if let Some(n) = m.get("displayName").and_then(|x| x.as_str()) {
-                                    aliases.push(n.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        aliases.retain(|a| !a.is_empty());
+        let aliases = serverinfo::scan_mod_metadata(
+            path.parent().unwrap_or_else(|| std::path::Path::new(".")),
+        )
+        .into_iter()
+        .find(|m| m.file_name == jar)
+        .map(|m| m.aliases())
+        .unwrap_or_default();
         spark_analysis::ModJarInfo { jar, aliases }
     }
 
@@ -10160,8 +12622,37 @@ impl App {
             .map(|p| process::is_running(p))
             .unwrap_or(false);
         let stopping = self.runtimes.get(idx).map(|r| r.stopping).unwrap_or(false);
-        let busy = running || stopping;
+        // 外部实例 / 已接管实例：只要本工具没有托管进程，就按外部态处理
+        let adopted_pid = self.runtimes.get(idx).and_then(|r| r.adopted_pid);
+        let adopted = adopted_pid.is_some() && !running;
+        let external = if running || adopted {
+            None
+        } else {
+            self.runtimes.get(idx).and_then(|r| r.external.clone())
+        };
+        let adopted_mem = self.runtimes.get(idx).map(|r| r.adopted_mem_mb).unwrap_or(0.0);
+        let run_kind = if running {
+            RunKind::Managed
+        } else if adopted {
+            RunKind::Adopted
+        } else if external.is_some() {
+            RunKind::External
+        } else {
+            RunKind::Stopped
+        };
+        let busy = running || stopping || adopted;
         let last_msg = self.runtimes.get(idx).map(|r| r.last_msg.clone()).unwrap_or_default();
+        // 预检结果摘要（失败数 / 警告数），用于按钮旁的提示
+        let pre_summary: Option<(usize, usize)> = self.runtimes.get(idx).and_then(|r| {
+            if r.precheck_items.is_empty() {
+                None
+            } else {
+                Some((
+                    r.precheck_items.iter().filter(|i| i.level == CheckLevel::Fail).count(),
+                    r.precheck_items.iter().filter(|i| i.level == CheckLevel::Warn).count(),
+                ))
+            }
+        });
 
         ui.add_space(6.0);
         // ===== 头部：名称 + 目录/文件夹快捷入口 =====
@@ -10187,7 +12678,8 @@ impl App {
         ui.label(RichText::new(sc.dir.display().to_string()).weak().small());
         // ===== 卡片流：状态 / 平台 / 目录 =====
         // 原实现是把这些信息一行行平铺（信息密度低、重点不突出），改为卡片流。
-        let pinfo = serverinfo::detect(&sc.dir);
+        // 平台识别走 3 秒 TTL 缓存：这里是每帧渲染路径，直接 detect 会每帧遍历目录（见任务"每帧重活"）。
+        let pinfo = serverinfo::detect_cached(&sc.dir, std::time::Duration::from_secs(3));
         let card_fill = self.theme_cur.widget_bg;
         let card_stroke = egui::Stroke::new(1.0, self.theme_cur.stroke);
         let make_card = |ui: &mut egui::Ui, title: &str, add: &mut dyn FnMut(&mut egui::Ui)| {
@@ -10205,16 +12697,67 @@ impl App {
         };
         ui.add_space(4.0);
         ui.horizontal_top(|ui| {
-            // 卡片 1：运行状态
+            // 卡片 1：运行状态（区分"本工具拉起"与"外部启动"，后者用弱化提示色）
             let (label, col) = if stopping {
                 ("正在停止…".to_string(), Color32::from_rgb(240, 200, 120))
-            } else if running {
-                ("运行中".to_string(), Color32::from_rgb(80, 200, 120))
             } else {
-                ("已停止".to_string(), Color32::from_rgb(160, 160, 166))
+                match run_kind {
+                    RunKind::Managed => ("运行中".to_string(), Color32::from_rgb(80, 200, 120)),
+                    RunKind::Adopted => (
+                        "运行中（外部启动·已接管）".to_string(),
+                        Color32::from_rgb(230, 190, 110),
+                    ),
+                    RunKind::External => (
+                        "运行中（外部启动）".to_string(),
+                        Color32::from_rgb(240, 176, 96),
+                    ),
+                    RunKind::Stopped => ("已停止".to_string(), Color32::from_rgb(160, 160, 166)),
+                }
             };
             make_card(ui, "状态", &mut |ui| {
                 ui.label(RichText::new(label.clone()).size(16.0).strong().color(col));
+                match run_kind {
+                    RunKind::External => {
+                        if let Some(e) = &external {
+                            let pid_txt = if e.pid == 0 {
+                                "PID 未知".to_string()
+                            } else {
+                                format!("PID {}", e.pid)
+                            };
+                            ui.label(
+                                RichText::new(format!(
+                                    "{pid_txt} ｜ 内存 {:.0} MB ｜ {}",
+                                    e.mem_mb, e.exe
+                                ))
+                                .small()
+                                .color(self.fg(Color32::from_rgb(240, 176, 96))),
+                            );
+                            ui.label(RichText::new(&e.evidence).small().weak());
+                            if e.weak {
+                                ui.label(
+                                    RichText::new("（命令行不可读，按日志写入时间推断，可能误判）")
+                                        .small()
+                                        .weak(),
+                                );
+                            }
+                        }
+                    }
+                    RunKind::Adopted => {
+                        if let Some(pid) = adopted_pid {
+                            ui.label(
+                                RichText::new(format!("PID {} ｜ 内存 {:.0} MB", pid, adopted_mem))
+                                    .small()
+                                    .color(self.fg(Color32::from_rgb(230, 190, 110))),
+                            );
+                        }
+                        ui.label(
+                            RichText::new("已纳入运行时状态：停止/强停/崩溃检测/关服快照均对其生效")
+                                .small()
+                                .weak(),
+                        );
+                    }
+                    _ => {}
+                }
                 if !last_msg.is_empty() {
                     ui.label(RichText::new(last_msg.clone()).small().weak());
                 }
@@ -10263,19 +12806,25 @@ impl App {
         ui.horizontal(|ui| {
             let start_btn = ui.add_enabled(!busy, egui::Button::new(RichText::new("▶ 启动服务器").size(15.0)));
             if start_btn.clicked() {
-                // 手动启动：重置崩溃重启状态（含熔断）
-                if let Some(rt) = self.runtimes.get_mut(idx) {
-                    rt.crash_count = 0;
-                    rt.crash_first_at = None;
-                    rt.crash_restart_at = None;
+                // 检测到外部实例时不要直接起第二个实例（会抢端口）：
+                // 先让用户选择"接管 / 结束 / 取消"，由 ui_external_dialogs 处理确认结果。
+                if external.is_some() {
+                    self.confirm_start_external = Some(idx);
+                } else {
+                    // 手动启动：重置崩溃重启状态（含熔断）
+                    if let Some(rt) = self.runtimes.get_mut(idx) {
+                        rt.crash_count = 0;
+                        rt.crash_first_at = None;
+                        rt.crash_restart_at = None;
+                    }
+                    self.start_server(idx);
                 }
-                self.start_server(idx);
             }
-            let stop_btn = ui.add_enabled(running, egui::Button::new(RichText::new("⏹ 停止 (stop)").size(15.0)));
+            let stop_btn = ui.add_enabled(busy, egui::Button::new(RichText::new("⏹ 停止 (stop)").size(15.0)));
             if stop_btn.clicked() {
                 self.stop_server(idx);
             }
-            let kill_btn = ui.add_enabled(running, egui::Button::new(RichText::new("⏹ 强制结束").size(15.0)));
+            let kill_btn = ui.add_enabled(busy, egui::Button::new(RichText::new("⏹ 强制结束").size(15.0)));
             if kill_btn.clicked() {
                 if features::is_enabled(&self.cfg.features, features::FEATURE_FORCE_STOP_CONFIRM) {
                     // B3 强停二次确认：先弹确认（pid + 影响），确认后带一次性 token 强杀
@@ -10285,6 +12834,84 @@ impl App {
                 }
             }
         });
+        // 外部实例专用操作行：接管（纳入运行时状态）/ 结束外部进程（二次确认）
+        if external.is_some() || adopted {
+            ui.horizontal_wrapped(|ui| {
+                if let RunKind::External = run_kind {
+                    if ui
+                        .add(egui::Button::new(RichText::new("🤝 接管").strong()))
+                        .on_hover_text("把该进程纳入运行时状态：之后停止/强停/崩溃检测/关服快照都对其生效（无法发送控制台命令）")
+                        .clicked()
+                    {
+                        self.adopt_external(idx);
+                    }
+                    let pid = external.as_ref().map(|e| e.pid).unwrap_or(0);
+                    if ui
+                        .add(egui::Button::new(RichText::new("⛔ 结束外部进程")))
+                        .on_hover_text("结束该外部进程及其子进程（需二次确认）；会影响正在游戏的玩家")
+                        .clicked()
+                    {
+                        self.confirm_kill_external = Some((idx, pid));
+                    }
+                    ui.label(
+                        RichText::new("该服务器由工具之外启动：工具能看日志，但停止/崩溃判定需先接管")
+                            .small()
+                            .color(self.fg(Color32::from_rgb(240, 176, 96))),
+                    );
+                } else if adopted {
+                    ui.label(
+                        RichText::new("已接管外部实例：可直接用「停止 / 强制结束」")
+                            .small()
+                            .color(self.fg(Color32::from_rgb(230, 190, 110))),
+                    );
+                }
+            });
+        }
+        let diag_dir = self.diag_last_dir.clone();
+        let mut open_diag_dir = false;
+        ui.horizontal_wrapped(|ui| {
+            let pre_busy = self.runtimes.get(idx).map(|r| r.precheck_busy).unwrap_or(false);
+            if ui
+                .add_enabled(!pre_busy, egui::Button::new("🩺 启动前检查"))
+                .on_hover_text("检查 Java 版本、内存、端口占用、EULA、核心文件、重复模组与缺失前置（不阻断启动）")
+                .clicked()
+            {
+                self.spawn_precheck(idx);
+            }
+            if ui
+                .button("🧷 导出诊断包")
+                .on_hover_text("把日志、崩溃报告、工具日志、脱敏配置与系统信息打包成一个 zip")
+                .clicked()
+            {
+                self.spawn_diag_zip(idx);
+            }
+            if pre_busy {
+                ui.label(RichText::new("检查中…").small().weak());
+            }
+            if let Some((fails, warns)) = pre_summary {
+                if ui.button("查看检查结果").clicked() {
+                    if let Some(rt) = self.runtimes.get_mut(idx) {
+                        rt.precheck_open = true;
+                    }
+                }
+                ui.label(
+                    RichText::new(format!("上次检查：{fails} 项失败 / {warns} 项警告"))
+                        .small()
+                        .weak(),
+                );
+            }
+            if self.bg_busy.contains_key("diag") {
+                ui.label(RichText::new("诊断包打包中…").small().weak());
+            }
+            if diag_dir.is_some() && ui.button("📂 打开诊断包目录").clicked() {
+                open_diag_dir = true;
+            }
+        });
+        if open_diag_dir {
+            if let Some(dir) = diag_dir.clone() {
+                self.open_folder(&dir);
+            }
+        }
         if !last_msg.is_empty() {
             let msg_color = if last_msg.starts_with('✅') {
                 self.fg(Color32::from_rgb(255, 180, 80))
@@ -10411,7 +13038,18 @@ impl App {
                             }
                         }
                     } else {
-                        self.set_toast("发送失败：服务器未运行，stdin 未启用".to_string());
+                        // 已接管的外部实例没有 stdin：明确告知，避免用户以为"命令发出去了"
+                        let adopted = self
+                            .runtimes
+                            .get(idx)
+                            .and_then(|rt| rt.adopted_pid)
+                            .is_some();
+                        self.set_toast(if adopted {
+                            "发送失败：该实例由外部启动后接管，无法写入它的控制台（请到服务器窗口操作）"
+                                .to_string()
+                        } else {
+                            "发送失败：服务器未运行，stdin 未启用".to_string()
+                        });
                     }
                 }
             }
@@ -10444,19 +13082,42 @@ impl App {
         ui.separator();
 
         // 初始化编辑缓�?
+        // 读取一律走 read_text_for_edit：识别 UTF-8/UTF-16/GBK 并记下原编码与换行风格，
+        // 保存时按原编码写回（否则 GBK 的 run.bat 会被写成乱码，cmd 解析失败 → 服务器起不来）。
         if self.runtimes[idx].run_bat_edit.is_none() {
-            self.runtimes[idx].run_bat_edit = Some(
-                std::fs::read_to_string(&run_bat).unwrap_or_else(|_| {
-                    "@echo off\njava -Xmx4G -Xms2G -jar server.jar nogui\npause\n".to_string()
-                }),
-            );
+            let (mut text, meta) = read_text_for_edit(&run_bat).unwrap_or_else(|_| {
+                (
+                    String::new(),
+                    TextMeta {
+                        enc: default_text_encoding(&run_bat),
+                        crlf: true,
+                    },
+                )
+            });
+            // 文件不存在：给一份可用模板（与「生成 run.bat」同一份内容，含 GBK/无 pause/独立临时目录等要点）
+            if text.is_empty() && !run_bat.exists() {
+                text = build_run_bat("java", "", "server.jar");
+            }
+            self.runtimes[idx].run_bat_edit = Some(text);
+            self.runtimes[idx].run_bat_meta = Some(meta);
         }
         if self.runtimes[idx].jvm_args_edit.is_none() {
-            self.runtimes[idx].jvm_args_edit = Some(
-                std::fs::read_to_string(&jvm_args).unwrap_or_else(|_| {
-                    "-Xmx4G -Xms2G\n".to_string()
-                }),
-            );
+            let (text, meta) = read_text_for_edit(&jvm_args).unwrap_or_else(|_| {
+                (
+                    String::new(),
+                    TextMeta {
+                        enc: default_text_encoding(&jvm_args),
+                        crlf: true,
+                    },
+                )
+            });
+            let text = if text.is_empty() && !jvm_args.exists() {
+                recommended_jvm_args(physical_memory_gb()) + "\n"
+            } else {
+                text
+            };
+            self.runtimes[idx].jvm_args_edit = Some(text);
+            self.runtimes[idx].jvm_args_meta = Some(meta);
         }
 
         // run.bat（折叠：内容长时不再占满整屏，点开才展开编辑�?
@@ -10468,9 +13129,18 @@ impl App {
             .show(ui, |ui| {
                 let sp_path = dir.join("server.properties");
                 if self.runtimes[idx].server_props_map.is_none() {
-                    let text = std::fs::read_to_string(&sp_path).unwrap_or_default();
+                    let (text, meta) = read_text_for_edit(&sp_path).unwrap_or_else(|_| {
+                        (
+                            String::new(),
+                            TextMeta {
+                                enc: default_text_encoding(&sp_path),
+                                crlf: true,
+                            },
+                        )
+                    });
                     self.runtimes[idx].server_props_map = Some(parse_properties(&text));
                     self.runtimes[idx].server_props_text = Some(text);
+                    self.runtimes[idx].server_props_meta = Some(meta);
                 }
                 if !sp_path.exists() {
                     ui.label(RichText::new("（服务器目录下暂存 server.properties，保存后自动创建").weak());
@@ -10528,8 +13198,14 @@ impl App {
                 if save_props {
                     let out = self.runtimes[idx].server_props_text.clone().unwrap_or_default();
                     let _ = std::fs::create_dir_all(&dir);
-                    match std::fs::write(&sp_path, out) {
-                        Ok(_) => self.set_toast("server.properties 已保存".to_string()),
+                    // 按原编码 + 原换行写回（临时文件 → 备份 .bak_时间戳 → 原子替换）
+                    let meta = self.runtimes[idx].server_props_meta;
+                    let (enc, crlf) = match meta {
+                        Some(m) => (m.enc, m.crlf),
+                        None => (default_text_encoding(&sp_path), true),
+                    };
+                    match write_text_same_encoding(&sp_path, &out, enc, crlf) {
+                        Ok(_) => self.set_toast(format!("server.properties 已保存（{}）", enc.label())),
                         Err(e) => self.set_toast(format!("保存失败: {e}")),
                     }
                 }
@@ -10553,10 +13229,27 @@ impl App {
                         );
                     });
                 draggable_divider(ui, &mut self.run_bat_h, &mut self.run_bat_drag_start);
+                let run_meta = self.runtimes[idx].run_bat_meta.unwrap_or(TextMeta {
+                    enc: default_text_encoding(&run_bat),
+                    crlf: true,
+                });
+                ui.label(
+                    RichText::new(format!(
+                        "编码: {} · 换行: {}（批处理文件按 GBK/ANSI 保存以免控制台中文乱码）",
+                        run_meta.enc.label(),
+                        if run_meta.crlf { "CRLF" } else { "LF" }
+                    ))
+                    .weak()
+                    .small(),
+                );
                 if ui.button("💾 保存 run.bat").clicked() {
                     let _ = std::fs::create_dir_all(&dir);
-                    match std::fs::write(&run_bat, &bat_content) {
-                        Ok(_) => self.set_toast("run.bat 已保存".to_string()),
+                    let (enc, crlf) = (run_meta.enc, run_meta.crlf);
+                    match write_text_same_encoding(&run_bat, &bat_content, enc, crlf) {
+                        Ok(_) => self.set_toast(format!(
+                            "run.bat 已保存（{}，原文件已备份为 .bak_ 时间戳）",
+                            enc.label()
+                        )),
                         Err(e) => self.set_toast(format!("保存失败: {e}")),
                     }
                 }
@@ -10570,6 +13263,73 @@ impl App {
         ui.label("run.bat 存在时启动优先执行；未使用 run.bat 时按下方自定义启动命令或工具默认设置启动");
         ui.separator();
 
+        // 生成启动脚本：按当前 Java / JVM 参数 / 核心 jar 生成一份 run.bat
+        //（GBK + CRLF + 无 BOM；覆盖前自动备份为 run.bat.bak_<时间戳>）
+        ui.horizontal(|ui| {
+            if ui
+                .button("🛠 生成 run.bat")
+                .on_hover_text(
+                    "按当前 Java 路径、JVM 参数与核心 jar 生成 GBK 编码的 run.bat（覆盖前自动备份）；\n不含 pause、MAX_RESTARTS=1、TEMP/TMP 与 java.io.tmpdir 指向 %~dp0tmp",
+                )
+                .clicked()
+            {
+                let cfg_now = self.cfg.clone();
+                let java = resolve_java_for_server(&cfg_now, &sc);
+                let jvm = self.cfg.servers[idx]
+                    .jvm_args
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| self.cfg.default_jvm_args.clone());
+                let core = detect_core_jar(&dir);
+                match generate_run_bat(&dir, &java, &jvm, &core) {
+                    Ok(p) => {
+                        // 同步刷新编辑器缓存，避免刚生成又被编辑器里的旧内容覆盖
+                        if let Ok((text, meta)) = read_text_for_edit(&p) {
+                            self.runtimes[idx].run_bat_edit = Some(text);
+                            self.runtimes[idx].run_bat_meta = Some(meta);
+                        }
+                        self.set_toast(format!("已生成 {}", p.display()));
+                    }
+                    Err(e) => self.set_toast(format!("生成失败: {e}")),
+                }
+            }
+            ui.label(
+                RichText::new("GBK 编码 · 无 pause · MAX_RESTARTS=1 · 临时目录指向 tmp")
+                    .weak()
+                    .small(),
+            );
+        });
+        ui.separator();
+
+        // JVM 参数（{jvm} 占位符展开值）：留空 = 跟随全局默认，全局也留空 = 按物理内存推荐
+        ui.label(RichText::new("JVM 参数（{jvm} 占位符）").strong());
+        let phys_gb = physical_memory_gb();
+        let rec_jvm = recommended_jvm_args(phys_gb);
+        let mut jvm_now = self.cfg.servers[idx].jvm_args.clone().unwrap_or_default();
+        let jvm_resp = ui.add(
+            TextEdit::singleline(&mut jvm_now)
+                .hint_text(format!("留空 = 全局默认；都为空则自动推荐：{rec_jvm}"))
+                .desired_width(f32::INFINITY),
+        );
+        if jvm_resp.changed() {
+            let v = jvm_now.trim().to_string();
+            self.cfg.servers[idx].jvm_args = if v.is_empty() { None } else { Some(v) };
+            self.save_config();
+        }
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("物理内存 {phys_gb} GB，推荐参数: {rec_jvm}"))
+                    .weak()
+                    .small(),
+            );
+            if ui.small_button("使用推荐值").clicked() {
+                self.cfg.servers[idx].jvm_args = Some(rec_jvm.clone());
+                self.save_config();
+                self.set_toast("已填入推荐 JVM 参数（{jvm} 展开为它）".to_string());
+            }
+        });
+        ui.separator();
+
         // user_jvm_args.txt（折叠）
         egui::CollapsingHeader::new("user_jvm_args.txt（点击展开编辑）")
             .default_open(true)
@@ -10581,10 +13341,27 @@ impl App {
                         .desired_width(f32::INFINITY)
                         .desired_rows(4),
                 );
+                let jvm_meta = self.runtimes[idx].jvm_args_meta.unwrap_or(TextMeta {
+                    enc: default_text_encoding(&jvm_args),
+                    crlf: true,
+                });
+                ui.label(
+                    RichText::new(format!(
+                        "编码: {} · 换行: {}",
+                        jvm_meta.enc.label(),
+                        if jvm_meta.crlf { "CRLF" } else { "LF" }
+                    ))
+                    .weak()
+                    .small(),
+                );
                 if ui.button("💾 保存 user_jvm_args.txt").clicked() {
                     let _ = std::fs::create_dir_all(&dir);
-                    match std::fs::write(&jvm_args, &jvm_content) {
-                        Ok(_) => self.set_toast("user_jvm_args.txt 已保存".to_string()),
+                    let (enc, crlf) = (jvm_meta.enc, jvm_meta.crlf);
+                    match write_text_same_encoding(&jvm_args, &jvm_content, enc, crlf) {
+                        Ok(_) => self.set_toast(format!(
+                            "user_jvm_args.txt 已保存（{}，原文件已备份为 .bak_ 时间戳）",
+                            enc.label()
+                        )),
                         Err(e) => self.set_toast(format!("保存失败: {e}")),
                     }
                 }
@@ -11597,7 +14374,11 @@ impl App {
                 // 功能优化：进入模组页即识别该服务端平台 ——
                 // 原版/纯插件端不支持模组，直接把「下载模组」按钮置灰并说明原因；
                 // 模组端则把识别到的加载器/版本记下来，点下载时自动套用。
-                let pinfo = serverinfo::detect(&self.cfg.servers[idx].dir);
+                // 平台识别走 3 秒 TTL 缓存（渲染路径，直接 detect 会每帧遍历目录）
+                let pinfo = serverinfo::detect_cached(
+                    &self.cfg.servers[idx].dir,
+                    std::time::Duration::from_secs(3),
+                );
                 let can_mod = pinfo.kind.is_modded();
                 let btn = ui.add_enabled(
                     can_mod,
@@ -11636,6 +14417,20 @@ impl App {
                     .clicked()
                 {
                     self.runtimes[idx].file_client_mods_confirm = true;
+                }
+                // 模组检查更新（测试功能，默认关闭）：按 modid 查 Modrinth，只报告不替换
+                if features::is_enabled(&self.cfg.features, features::BETA_MOD_UPDATE) {
+                    let busy = self.runtimes[idx].modupd_busy;
+                    if ui
+                        .add_enabled(!busy, egui::Button::new(if busy { "检查更新中…" } else { "🔄 检查更新" }))
+                        .on_hover_text("按 modid 查询 Modrinth 的最新版本（串行请求 + 限速），只报告不替换")
+                        .clicked()
+                    {
+                        self.spawn_mod_update_check(idx);
+                    }
+                    if busy && !self.runtimes[idx].modupd_progress.is_empty() {
+                        ui.label(RichText::new(self.runtimes[idx].modupd_progress.clone()).small().weak());
+                    }
                 }
             }
             ui.separator();
@@ -12141,7 +14936,10 @@ impl App {
                             | "java" | "py" | "js" | "ts" | "gradle" | "kts"
                     );
                     if !is_dir && text_like && size <= 512 * 1024 {
-                        let content = std::fs::read_to_string(&p).unwrap_or_default();
+                        // 预览同样按原编码识别（GBK 文件按 UTF-8 读会读不出内容、显示空白）
+                        let content = read_text_auto_encoding(&p)
+                            .map(|(t, _)| t)
+                            .unwrap_or_default();
                         let mut lines: Vec<&str> = content.lines().collect();
                         if lines.len() > 40 {
                             lines.truncate(40);
@@ -12181,10 +14979,33 @@ impl App {
                 .show(ui.ctx(), |ui| {
                     let is_light = self.theme_is_light();
                     let fg = |c: egui::Color32| if is_light { theme::light_adapt(c) } else { c };
+                    // 原编码/换行风格先取出来（下面要可变借用 file_content_edit，不能再借 self.runtimes）
+                    let meta_now = self.runtimes[idx].file_content_meta;
                     let Some((path, content)) = self.runtimes[idx].file_content_edit.as_mut() else {
                         return;
                     };
                     ui.label(RichText::new(path.clone()).color(fg(Color32::from_rgb(120, 180, 255))));
+                    // 显示原编码与换行风格：保存时按它写回，不会把 GBK 文件写成 UTF-8
+                    let path_buf = PathBuf::from(path.as_str());
+                    let (enc_now, crlf_now) = match meta_now {
+                        Some(m) => (m.enc, m.crlf),
+                        None => (default_text_encoding(&path_buf), true),
+                    };
+                    let is_bat = is_bat_file(&path_buf);
+                    ui.label(
+                        RichText::new(format!(
+                            "编码: {} · 换行: {}{}",
+                            enc_now.label(),
+                            if crlf_now { "CRLF" } else { "LF" },
+                            if is_bat {
+                                " · 批处理文件按 GBK 保存以免控制台乱码"
+                            } else {
+                                ""
+                            }
+                        ))
+                        .weak()
+                        .small(),
+                    );
                     egui::ScrollArea::vertical()
                         .id_salt(("file_edit_scroll", idx))
                         .auto_shrink([false, false])
@@ -12209,6 +15030,7 @@ impl App {
                         self.save_file_edit(idx);
                     } else if close {
                         self.runtimes[idx].file_content_edit = None;
+                        self.runtimes[idx].file_content_meta = None;
                     }
                 });
         }
@@ -12626,6 +15448,15 @@ impl App {
                         ui.label(RichText::new(stats.retention_days.to_string()).strong());
                         ui.label(format!("天{space_txt}）"));
                     });
+                    // 已锁定份数：锁定 = 把快照实化成独立副本，占满量空间，且不会被自动清理
+                    let pinned_n = self.snapshot_pins.values().filter(|v| **v).count();
+                    ui.label(
+                        RichText::new(format!(
+                            "已锁定 {pinned_n} 份（锁定=占满量空间，且不会被自动清理）"
+                        ))
+                        .small()
+                        .color(self.fg(Color32::from_rgb(120, 200, 255))),
+                    );
                 }
                 ui.separator();
             });
@@ -12898,6 +15729,12 @@ impl App {
             let mut delete_target: Option<(PathBuf, String)> = None;
             // (目标路径, 是否为新版快照目录)：快照是目录用「打开目录」，旧版 zip 用「定位文件」
             let mut open_target: Option<(PathBuf, bool)> = None;
+            // 锁定/解锁目标：(快照目录, 是否要锁定)
+            let mut pin_target: Option<(PathBuf, bool)> = None;
+            // 转存目标：快照目录
+            let mut sync_target: Option<PathBuf> = None;
+            let pin_busy = self.runtimes.get(idx).and_then(|rt| rt.pin_busy.clone());
+            let sync_busy = self.runtimes.get(idx).and_then(|rt| rt.sync_busy.clone());
             // 按日/月分组折叠显示（mtime 格式 %Y-%m-%d %H:%M:%S，取前 10/7 位）
             let view_mode = self.cfg.servers[idx].backup.view_mode.clone();
             let group_key = |b: &backup::BackupInfo| -> String {
@@ -12932,8 +15769,14 @@ impl App {
                                 ui.label(RichText::new(format!("[{}]", b.kind.label())).color(kind_color));
                                 ui.label(RichText::new(format!("[{}]", b.reason)).weak().small());
                                 let detail = if b.is_snapshot {
+                                    let pinned = self
+                                        .snapshot_pins
+                                        .get(&b.path)
+                                        .copied()
+                                        .unwrap_or(false);
                                     format!(
-                                        "{} ｜ 共 {} 个文件、变化 {} 个、新增 {} ｜ 总 {} ｜ {}",
+                                        "{}{} ｜ 共 {} 个文件、变化 {} 个、新增 {} ｜ 总 {} ｜ {}",
+                                        if pinned { "🔒 " } else { "" },
                                         b.name,
                                         b.files_total,
                                         b.files_copied,
@@ -12956,6 +15799,45 @@ impl App {
                                     .clicked()
                                 {
                                     open_target = Some((b.path.clone(), b.is_snapshot));
+                                }
+                                // 锁定 / 解锁：把快照实化为独立副本（不再随源文件变化，也不会被自动清理）。
+                                // 后台执行（可能复制数 GB），期间按钮置灰并显示"锁定中…"。
+                                if b.is_snapshot {
+                                    let pinned = self
+                                        .snapshot_pins
+                                        .get(&b.path)
+                                        .copied()
+                                        .unwrap_or(false);
+                                    let this_busy = pin_busy.as_deref() == Some(b.name.as_str());
+                                    let label = if this_busy {
+                                        "锁定中…"
+                                    } else if pinned {
+                                        "🔓 解锁"
+                                    } else {
+                                        "🔒 锁定"
+                                    };
+                                    if ui
+                                        .add_enabled(!this_busy, egui::Button::new(label))
+                                        .on_hover_text(if pinned {
+                                            "取消锁定标记（已实化的空间不会回收；该份此后可能被自动清理）"
+                                        } else {
+                                            "把该快照实化为独立副本：不再随源文件变化、不会被自动清理（占用整份空间）"
+                                        })
+                                        .clicked()
+                                    {
+                                        pin_target = Some((b.path.clone(), !pinned));
+                                    }
+                                    let this_sync = sync_busy.as_deref() == Some(b.name.as_str());
+                                    if ui
+                                        .add_enabled(
+                                            !this_sync,
+                                            egui::Button::new(if this_sync { "转存中…" } else { "转存" }),
+                                        )
+                                        .on_hover_text("把该快照复制到「存储与远程」里配置的远端备份目标（本地目录 / UNC 共享）")
+                                        .clicked()
+                                    {
+                                        sync_target = Some(b.path.clone());
+                                    }
                                 }
                             });
                         }
@@ -12984,6 +15866,12 @@ impl App {
                     // 旧版 zip 是文件：打开所在目录并选中它
                     self.open_file_location(&abs);
                 }
+            }
+            if let Some((path, pin)) = pin_target {
+                self.spawn_pin_snapshot(idx, path, pin);
+            }
+            if let Some(path) = sync_target {
+                self.spawn_sync_snapshot(idx, path);
             }
         }
         }
@@ -14595,7 +17483,7 @@ impl App {
     fn apply_window_round_region(&mut self, ctx: &egui::Context, r_points: f32) {
         use winapi::shared::windef::RECT;
         use winapi::um::wingdi::CreateRoundRectRgn;
-        use winapi::um::winuser::{GetWindowRect, SetWindowRgn};
+        use winapi::um::winuser::{GetWindowRect, IsIconic, SetWindowRgn};
         let hwnd = resolve_main_hwnd(&mut self.hwnd_cache);
         unsafe {
             if hwnd.is_null() {
@@ -14634,8 +17522,15 @@ impl App {
                 {
                     self.win_saved_rect = cur;
                     self.win_save_at = None;
-                    // 最大化时既不能把屏幕尺寸当窗口尺寸，也不能把最大化位置当普通位置
-                    if !maximized {
+                    // 最大化时既不能把屏幕尺寸当窗口尺寸，也不能把最大化位置当普通位置。
+                    // R4：最小化 / 托盘隐藏时同样不落盘 —— 最小化时 GetWindowRect 返回
+                    // (-32000,-32000) 占位坐标，托盘隐藏时窗口已不可见、几何没有意义，
+                    // 写进配置会让下次启动的窗口跑到屏幕外或尺寸错乱。
+                    let iconic = IsIconic(hwnd) != 0;
+                    let hidden_to_tray = self
+                        .tray_hidden
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if !maximized && !iconic && !hidden_to_tray {
                         self.cfg.window_pos =
                             [(rc.left as f32 / ppp).round(), (rc.top as f32 / ppp).round()];
                         let sz = ctx.screen_rect().size();
@@ -15541,6 +18436,17 @@ impl App {
                                 ui.horizontal(|ui| {
                                     ui.label("默认 JVM 参数:");
                                     ui.add(TextEdit::singleline(&mut self.cfg.default_jvm_args).desired_width(300.0));
+                                });
+                                let phys_gb = physical_memory_gb();
+                                let rec_jvm = recommended_jvm_args(phys_gb);
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(format!(
+                                        "留空 = 按物理内存自动推荐（当前 {phys_gb} GB → {rec_jvm}）"
+                                    )).weak().small());
+                                    if ui.small_button("使用推荐值").clicked() {
+                                        self.cfg.default_jvm_args = rec_jvm.clone();
+                                        self.save_config();
+                                    }
                                 });
                             });
                             self.settings_sections = sections;
@@ -17044,6 +19950,9 @@ impl App {
             format!("{{java}} {{jvm}} -jar {jar_name} nogui")
         };
         sc.backup.last_backup = Some(Local::now().to_rfc3339());
+        // 与 load_config 的迁移一致：新服务器也要把独立临时目录 tmp 排除在备份/变化对比之外
+        //（否则本次运行期间的快照变化数与占用会虚高，下次启动才被迁移修好）
+        ensure_tmp_excluded(&mut sc.backup.exclude);
         sc.download_count = 1;
         sc.first_download_at = Some(Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
         self.cfg.servers.push(sc);
@@ -18307,7 +21216,12 @@ impl App {
                 .map(|d| d.mod_target_dir.clone())
                 .unwrap_or_default();
             if !cur_dir.trim().is_empty() {
-                let info = serverinfo::detect(std::path::Path::new(cur_dir.trim()));
+                // 渲染路径：走 3 秒 TTL 缓存；用户点「重新识别并套用」时会在 apply_platform_from_dir
+                // 里显式失效缓存，保证"操作后立刻反映"。
+                let info = serverinfo::detect_cached(
+                    std::path::Path::new(cur_dir.trim()),
+                    std::time::Duration::from_secs(3),
+                );
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
                         RichText::new(format!("识别到目标：{}", info.summary()))
@@ -18353,7 +21267,9 @@ impl App {
     /// 只在识别到模组加载器时改加载器；MC 版本识别到就填（原版也能识别版本，
     /// 便于用户至少把版本选对）。返回识别结果供调用方展示。
     fn apply_platform_from_dir(&mut self, dir: &Path) -> serverinfo::PlatformInfo {
-        let info = serverinfo::detect(dir);
+        // 这是用户显式点「重新识别并套用」的实时路径：先失效缓存再识别，确保刚改动的内容立刻生效
+        serverinfo::invalidate_cache(dir);
+        let info = serverinfo::detect_cached(dir, std::time::Duration::ZERO);
         if let Some(dl) = self.dl.as_mut() {
             if let Some(loader) = info.kind.modrinth_loader() {
                 dl.mod_loader = loader.to_string();
@@ -18508,6 +21424,50 @@ impl App {
                                 self.set_toast("未在日志中发现可识别的崩溃原因".to_string());
                             }
                         }
+                    }
+                    if ui
+                        .button("复制诊断信息")
+                        .on_hover_text("复制：启动命令行 + 退出码 + stderr 末尾 + 系统 Java 版本")
+                        .clicked()
+                    {
+                        let rt = self.runtimes.get(idx);
+                        let cmdline = rt.map(|r| r.run_cmdline.clone()).unwrap_or_default();
+                        let code = rt.and_then(|r| r.last_exit_code);
+                        let stderr = rt.map(|r| r.last_stderr.clone()).unwrap_or_default();
+                        let java_path = self
+                            .cfg
+                            .servers
+                            .get(idx)
+                            .map(|s| resolve_java_for_server(&self.cfg, s))
+                            .unwrap_or_else(|| "java".to_string());
+                        let java = java_version_text(&java_path)
+                            .unwrap_or_else(|e| format!("无法获取（{e}）"));
+                        let mut text = String::new();
+                        text.push_str(&format!("服务器：{name}\n"));
+                        text.push_str(&format!(
+                            "命令行：{}\n",
+                            if cmdline.is_empty() { "（未记录）" } else { cmdline.as_str() }
+                        ));
+                        text.push_str(&format!(
+                            "退出码：{}\n",
+                            code.map(|c| c.to_string()).unwrap_or_else(|| "?".to_string())
+                        ));
+                        text.push_str(&format!("系统 Java 版本：{java}\n"));
+                        text.push_str(&format!("崩溃分析来源：{}\n", finding.source));
+                        for c in &finding.causes {
+                            text.push_str(&format!("- {}（建议：{}）\n", c.title, c.advice));
+                        }
+                        text.push_str("stderr 末尾：\n");
+                        if stderr.is_empty() {
+                            text.push_str("（无 stderr 输出；可能已并入日志）\n");
+                        } else {
+                            for l in &stderr {
+                                text.push_str(l);
+                                text.push('\n');
+                            }
+                        }
+                        ctx.copy_text(text);
+                        self.set_toast("诊断信息已复制".to_string());
                     }
                     if ui.button("关闭").clicked() {
                         close = true;
@@ -21636,4 +24596,1101 @@ fn measure_toast_card_height(
     let frame_pad_y = egui::Frame::window(&style).inner_margin.sum().y;
     // 留足余量：宁可多算几像素，也不让下一张卡片压上来
     frame_pad_y + title_h + item_gap + body_h + cancel_h + TOAST_MARGIN_EPS
+}
+
+// ==================== 诊断包 / 预检 / 系统信息（自由函数） ====================
+
+/// 无控制台执行命令并捕获 stdout+stderr 文本（GUI 子系统下必须显式屏蔽窗口）。
+fn run_capture(prog: &str, args: &[&str], cwd: Option<&Path>) -> Result<String, String> {
+    use std::process::{Command, Stdio};
+    let mut c = Command::new(prog);
+    c.args(args)
+        .creation_flags(0x0800_0000)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(d) = cwd {
+        c.current_dir(d);
+    } else {
+        c.current_dir(sane_cwd());
+    }
+    let out = c.output().map_err(|e| format!("执行 {prog} 失败: {e}"))?;
+    let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    if !err.trim().is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&err);
+    }
+    if text.trim().is_empty() {
+        // java -version 的版本行在 stderr，但某些发行版会因编码变成空 → 用退出码兜底说明
+        if !out.status.success() {
+            return Err(format!("退出码 {}", out.status.code().unwrap_or(-1)));
+        }
+    }
+    Ok(text.trim().to_string())
+}
+
+/// 读取 `java -version` 输出（第一行即版本行）。失败返回 Err（不 panic）。
+fn java_version_text(java: &str) -> Result<String, String> {
+    let exe = if java.trim().is_empty() { "java" } else { java.trim() };
+    let text = run_capture(exe, &["-version"], None)?;
+    let first = text
+        .lines()
+        .find(|l| l.to_lowercase().contains("version"))
+        .unwrap_or_else(|| text.lines().next().unwrap_or(""))
+        .trim()
+        .to_string();
+    if first.is_empty() {
+        Err("java -version 没有输出".to_string())
+    } else {
+        Ok(first)
+    }
+}
+
+/// 从 `java -version` 首行解析主版本号（"1.8.0_402" → 8；"17.0.9" → 17）。
+fn parse_java_major(text: &str) -> Option<u32> {
+    // 形如 `openjdk version "17.0.9" 2023-10-17` 或 `java version "1.8.0_402"`
+    let start = text.find('"')?;
+    let rest = text.get(start + 1..)?;
+    let end = rest.find('"')?;
+    let ver = rest.get(..end)?;
+    let mut it = ver.split(['.', '_']);
+    let first = it.next()?.parse::<u32>().ok()?;
+    if first == 1 {
+        it.next()?.parse::<u32>().ok()
+    } else {
+        Some(first)
+    }
+}
+
+/// Minecraft 版本 → 要求的 Java 主版本（按官方支持矩阵）。
+/// 1.20.5+ 需 21；1.18–1.20.4 需 17；1.17 需 16；≤1.16 需 8。解析不出时返回 None。
+fn required_java_major(mc: Option<&str>) -> Option<u32> {
+    let v = mc?.trim();
+    if v.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = v.split(['.', '-', '+']).collect();
+    let minor: u32 = parts.get(1).and_then(|s| s.parse().ok())?;
+    let patch: u32 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+    Some(match minor {
+        0..=16 => 8,
+        17 => 16,
+        18..=20 => {
+            if minor == 20 && patch >= 5 {
+                21
+            } else {
+                17
+            }
+        }
+        _ => 21,
+    })
+}
+
+/// 脱敏：键名（不区分大小写）命中敏感词时，值一律替换为 `***`，只保留键名。
+fn key_is_secret(key: &str) -> bool {
+    let k = key.to_lowercase();
+    const NEEDLES: [&str; 9] = [
+        "password",
+        "passwd",
+        "token",
+        "secret",
+        "apikey",
+        "api_key",
+        "credential",
+        "auth",
+        "user",
+    ];
+    NEEDLES.iter().any(|n| k.contains(n))
+}
+
+/// 递归脱敏 JSON：对象键命中敏感词 → 值替换成 `***`；数组/嵌套对象继续递归。
+fn sanitize_json(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (k, val) in map.iter() {
+                if key_is_secret(k) {
+                    out.insert(k.clone(), serde_json::Value::String("***".to_string()));
+                } else {
+                    out.insert(k.clone(), sanitize_json(val));
+                }
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(a) => serde_json::Value::Array(a.iter().map(sanitize_json).collect()),
+        other => other.clone(),
+    }
+}
+
+/// `server.properties` 脱敏：抹掉 `rcon.password` 与 `level-seed` 的值，其余原样保留。
+fn sanitize_server_properties(text: &str) -> String {
+    let mut out = String::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') || trimmed.starts_with('!') || !trimmed.contains('=') {
+            out.push_str(line);
+            out.push_str("\r\n");
+            continue;
+        }
+        let key = trimmed.split('=').next().unwrap_or("").trim().to_lowercase();
+        if key == "rcon.password" || key == "level-seed" {
+            out.push_str(&format!("{key}=***"));
+        } else {
+            out.push_str(line);
+        }
+        out.push_str("\r\n");
+    }
+    out
+}
+
+/// Windows 版本描述（注册表 CurrentVersion：ProductName + DisplayVersion + Build）。
+fn windows_version_text() -> String {
+    #[cfg(windows)]
+    {
+        use winapi::um::winreg::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+        fn read(key: &str, name: &str) -> Option<String> {
+            let k: Vec<u16> = key.encode_utf16().chain(std::iter::once(0)).collect();
+            let n: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut buf = [0u16; 512];
+            let mut len = (buf.len() * 2) as u32;
+            let rc = unsafe {
+                RegGetValueW(
+                    HKEY_LOCAL_MACHINE,
+                    k.as_ptr(),
+                    n.as_ptr(),
+                    RRF_RT_REG_SZ,
+                    std::ptr::null_mut(),
+                    buf.as_mut_ptr() as *mut _,
+                    &mut len,
+                )
+            };
+            if rc != 0 {
+                return None;
+            }
+            let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+            Some(String::from_utf16_lossy(&buf[..end]).trim().to_string())
+        }
+        let key = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
+        let product = read(key, "ProductName").unwrap_or_else(|| "Windows".to_string());
+        let disp = read(key, "DisplayVersion").or_else(|| read(key, "ReleaseId"));
+        let build = read(key, "CurrentBuildNumber");
+        let mut s = product;
+        if let Some(d) = disp {
+            s.push(' ');
+            s.push_str(&d);
+        }
+        if let Some(b) = build {
+            s.push_str(&format!(" (Build {b})"));
+        }
+        return s;
+    }
+    #[cfg(not(windows))]
+    {
+        "非 Windows".to_string()
+    }
+}
+
+/// CPU 型号 + 逻辑核数（系统环境变量即可，无需额外依赖）。
+fn cpu_info_text() -> String {
+    let model = std::env::var("PROCESSOR_IDENTIFIER").unwrap_or_else(|_| "未知".to_string());
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0);
+    format!("{model}（逻辑核心 {cores}）")
+}
+
+/// 打包成 zip 的一个条目（路径 + 内容）；`data` 为 None 时表示从文件读取。
+struct ZipEntry {
+    name: String,
+    data: Vec<u8>,
+}
+
+/// 写入诊断 zip；返回 (路径, 字节数)。
+fn write_zip(path: &Path, entries: &[ZipEntry]) -> Result<u64, String> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
+    }
+    let file = std::fs::File::create(path).map_err(|e| format!("创建 zip 失败: {e}"))?;
+    let mut zw = zip::ZipWriter::new(file);
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    for e in entries {
+        zw.start_file(e.name.as_str(), opts)
+            .map_err(|err| format!("写入条目 {} 失败: {err}", e.name))?;
+        zw.write_all(&e.data)
+            .map_err(|err| format!("写入条目内容 {} 失败: {err}", e.name))?;
+    }
+    zw.finish().map_err(|err| format!("收尾 zip 失败: {err}"))?;
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    Ok(size)
+}
+
+/// 读取文件为 zip 条目（读不到就返回 None，不报错）。
+fn zip_entry_from_file(path: &Path, name: &str) -> Option<ZipEntry> {
+    let data = std::fs::read(path).ok()?;
+    Some(ZipEntry {
+        name: name.to_string(),
+        data,
+    })
+}
+
+/// 目录下按 mtime 倒序取前 `n` 个匹配扩展名的文件。
+fn newest_files(dir: &Path, exts: &[&str], n: usize) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut items: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for e in rd.flatten() {
+        let p = e.path();
+        if !p.is_file() {
+            continue;
+        }
+        let name = p.file_name().map(|x| x.to_string_lossy().to_lowercase()).unwrap_or_default();
+        if !exts.iter().any(|x| name.ends_with(x)) {
+            continue;
+        }
+        let Ok(md) = e.metadata() else { continue };
+        let Ok(mt) = md.modified() else { continue };
+        items.push((mt, p));
+    }
+    items.sort_by(|a, b| b.0.cmp(&a.0));
+    items.into_iter().take(n).map(|(_, p)| p).collect()
+}
+
+/// 启动前预检（7 项）。全部为"只读检查"，不修改任何文件，也不阻断启动。
+fn run_precheck(sc: &ServerConfig, cfg: &GlobalConfig) -> Vec<PrecheckItem> {
+    let mut items: Vec<PrecheckItem> = Vec::new();
+    let pinfo = serverinfo::detect_cached(&sc.dir, std::time::Duration::from_secs(3));
+
+    // 1) Java 版本 vs MC 版本
+    {
+        let java = resolve_java_for_server(cfg, sc);
+        let mc = pinfo.mc_version.clone().or_else(|| sc.mc_version.clone());
+        let want = required_java_major(mc.as_deref());
+        match java_version_text(&java) {
+            Ok(text) => {
+                let got = parse_java_major(&text);
+                match (want, got) {
+                    (Some(w), Some(g)) if w == g => {
+                        items.push(PrecheckItem::pass("Java 版本", format!("要求 Java {w}，当前 Java {g}（{text}）")));
+                    }
+                    (Some(w), Some(g)) => {
+                        items.push(PrecheckItem::warn(
+                            "Java 版本",
+                            format!("要求 Java {w}，当前 Java {g}（{text}）"),
+                            format!("请把该服务器的 Java 换成 Java {w}（设置 → Java 环境，或服务器设置里的 Java 路径）"),
+                        ));
+                    }
+                    (Some(w), None) => {
+                        items.push(PrecheckItem::warn(
+                            "Java 版本",
+                            format!("要求 Java {w}，但无法从输出解析当前版本（{text}）"),
+                            "请确认该 Java 能正常执行 java -version".to_string(),
+                        ));
+                    }
+                    (None, Some(g)) => {
+                        items.push(PrecheckItem::pass("Java 版本", format!("未能识别 MC 版本的 Java 要求，当前 Java {g}")));
+                    }
+                    (None, None) => {
+                        items.push(PrecheckItem::warn(
+                            "Java 版本",
+                            "未能识别 MC 版本，也未能解析 Java 版本".to_string(),
+                            "手动确认服务端要求的 Java 版本（1.20.5+ 用 21，1.18–1.20.4 用 17，1.17 用 16，1.16 及以下用 8）".to_string(),
+                        ));
+                    }
+                }
+            }
+            Err(e) => {
+                items.push(PrecheckItem::fail(
+                    "Java 版本",
+                    format!("无法执行 Java（{}）：{e}", java),
+                    "请在服务器设置里指定正确的 Java 路径（或让 run.bat 里的 JAVA_PATH 指向有效 java.exe）".to_string(),
+                ));
+            }
+        }
+    }
+
+    // 2) 内存
+    {
+        let phys = physical_memory_gb();
+        let jvm = sc
+            .jvm_args
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                let d = cfg.default_jvm_args.trim().to_string();
+                if d.is_empty() { None } else { Some(d) }
+            })
+            .unwrap_or_else(|| recommended_jvm_args(phys));
+        match parse_xmx_gb(&jvm) {
+            Some(xmx) => {
+                let limit = (phys as f64 * 0.8) as u64;
+                if xmx > limit.max(1) {
+                    items.push(PrecheckItem::warn(
+                        "内存",
+                        format!("-Xmx 约 {xmx}G，物理内存 {phys}G（上限建议不超过 80%，即约 {limit}G）"),
+                        "调低 -Xmx，或关闭其它占内存的程序，否则容易触发系统换页导致卡顿/崩溃".to_string(),
+                    ));
+                } else {
+                    items.push(PrecheckItem::pass(
+                        "内存",
+                        format!("-Xmx 约 {xmx}G，物理内存 {phys}G（在 80% 以内）"),
+                    ));
+                }
+            }
+            None => {
+                items.push(PrecheckItem::warn(
+                    "内存",
+                    format!("当前 JVM 参数里没有可识别的 -Xmx（{jvm}），物理内存 {phys}G"),
+                    format!("建议使用：{}", recommended_jvm_args(phys)),
+                ));
+            }
+        }
+    }
+
+    // 3) 端口占用
+    {
+        let port = read_server_port(&sc.dir).unwrap_or(25565);
+        match std::net::TcpListener::bind(("127.0.0.1", port)) {
+            Ok(l) => {
+                drop(l);
+                items.push(PrecheckItem::pass("端口", format!("{port} 端口未被占用（127.0.0.1 可绑定）")));
+            }
+            Err(e) => {
+                items.push(PrecheckItem::warn(
+                    "端口",
+                    format!("{port} 端口已被占用（{e}）"),
+                    "可能该服务器已在运行（含外部启动的实例），也可能是别的程序占用；请先用「接管」或换端口".to_string(),
+                ));
+            }
+        }
+    }
+
+    // 4) EULA
+    {
+        let p = sc.dir.join("eula.txt");
+        let mut ok = false;
+        let mut detail = "eula.txt 不存在".to_string();
+        if let Ok(text) = std::fs::read_to_string(&p) {
+            let agreed = text.lines().any(|l| {
+                let l = l.trim().to_lowercase();
+                l.starts_with("eula=") && l.contains("true")
+            });
+            if agreed {
+                ok = true;
+                detail = "eula.txt 已同意（eula=true）".to_string();
+            } else {
+                detail = "eula.txt 存在，但 eula 不是 true".to_string();
+            }
+        }
+        if ok {
+            items.push(PrecheckItem::pass("EULA", detail));
+        } else {
+            items.push(PrecheckItem::fail(
+                "EULA",
+                detail,
+                "启动一次服务器会自动生成 eula.txt，或手动把其中的 eula=false 改成 eula=true（不改服务器会立即退出）".to_string(),
+            ));
+        }
+    }
+
+    // 5) 核心文件
+    {
+        let jar = sc.dir.join(detect_core_jar(&sc.dir));
+        let bat = sc.dir.join("run.bat");
+        let (has_jar, has_bat) = (jar.is_file(), bat.is_file());
+        if has_jar || has_bat {
+            let mut what: Vec<String> = Vec::new();
+            if has_jar {
+                what.push(format!("核心 {}", jar.file_name().map(|x| x.to_string_lossy().to_string()).unwrap_or_default()));
+            }
+            if has_bat {
+                what.push("run.bat".to_string());
+            }
+            items.push(PrecheckItem::pass("核心文件", format!("已找到：{}", what.join("、"))));
+        } else {
+            items.push(PrecheckItem::fail(
+                "核心文件",
+                format!("在 {} 下既没有找到核心 jar，也没有 run.bat", sc.dir.display()),
+                "请先下载服务端核心（Paper/Fabric/Forge 等），或把 run.bat 放回服务器目录".to_string(),
+            ));
+        }
+    }
+
+    // 6) mods 与加载器/MC 版本
+    {
+        let mods_dir = sc.dir.join("mods");
+        if !mods_dir.is_dir() {
+            items.push(PrecheckItem::pass(
+                "模组",
+                if pinfo.kind.is_modded() {
+                    "mods 目录不存在（将按无模组启动）".to_string()
+                } else {
+                    format!("该服务端识别为「{}」，不使用 mods 目录", pinfo.kind.label())
+                },
+            ));
+        } else {
+            let mut metas = serverinfo::scan_mod_metadata(&mods_dir);
+            // 只统计启用的 jar（.jar.disabled 不算入加载）
+            metas.retain(|m| m.file_name.to_lowercase().ends_with(".jar"));
+            // (a) 重复 modid
+            let mut seen: HashMap<String, Vec<String>> = HashMap::new();
+            for m in &metas {
+                if let Some(id) = &m.mod_id {
+                    seen.entry(id.to_lowercase()).or_default().push(m.file_name.clone());
+                }
+            }
+            let mut dups: Vec<(String, Vec<String>)> = seen
+                .into_iter()
+                .filter(|(_, v)| v.len() > 1)
+                .collect();
+            dups.sort_by(|a, b| a.0.cmp(&b.0));
+            if dups.is_empty() {
+                items.push(PrecheckItem::pass("重复模组", format!("未发现重复 modid（共 {} 个模组）", metas.len())));
+            } else {
+                let list: Vec<String> = dups
+                    .iter()
+                    .map(|(id, files)| format!("{id} → {}", files.join(" / ")))
+                    .collect();
+                items.push(PrecheckItem::warn(
+                    "重复模组",
+                    list.join("；"),
+                    "同一个 modid 只应保留一个版本，请删除多余的那份（可能直接导致启动崩溃）".to_string(),
+                ));
+            }
+            // (b) 缺失前置依赖：轻量读取 fabric.mod.json 的 depends 与 mods.toml 的 dependencies
+            let present: HashSet<String> = metas
+                .iter()
+                .filter_map(|m| m.mod_id.as_ref().map(|s| s.to_lowercase()))
+                .collect();
+            let mut missing: Vec<String> = Vec::new();
+            let mut checked = 0usize;
+            for m in &metas {
+                let p = mods_dir.join(&m.file_name);
+                let deps = read_declared_dependencies(&p);
+                if deps.is_empty() {
+                    continue;
+                }
+                checked += 1;
+                let lack: Vec<String> = deps
+                    .into_iter()
+                    .filter(|d| !is_builtin_dependency(d))
+                    .filter(|d| !present.contains(&d.to_lowercase()))
+                    .collect();
+                if !lack.is_empty() {
+                    missing.push(format!("{} 缺少 {}", m.file_name, lack.join("、")));
+                }
+            }
+            if missing.is_empty() {
+                items.push(PrecheckItem::pass(
+                    "模组前置",
+                    format!("已检查 {checked} 个带依赖声明的模组，未发现缺失前置"),
+                ));
+            } else {
+                items.push(PrecheckItem::warn(
+                    "模组前置",
+                    missing.join("；"),
+                    "从 Modrinth/CurseForge 补上缺失的前置模组（版本要与 MC 版本、加载器一致）".to_string(),
+                ));
+            }
+        }
+    }
+
+    // 7) 目录可写（启动时要在目录里写日志/世界）
+    {
+        let probe = sc.dir.join(".xmst_write_test.tmp");
+        match std::fs::write(&probe, b"ok") {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&probe);
+                items.push(PrecheckItem::pass("目录写入", "服务器目录可写".to_string()));
+            }
+            Err(e) => {
+                items.push(PrecheckItem::fail(
+                    "目录写入",
+                    format!("无法写入 {}：{e}", sc.dir.display()),
+                    "常见原因是目录权限或完整性级别过低（Low IL），可在设置页查看修复命令".to_string(),
+                ));
+            }
+        }
+    }
+
+    items
+}
+
+/// 从 JVM 参数字符串里解析 `-Xmx`（返回 GB 近似值；-Xmx2G / -Xmx2048M / -Xmx2048 都认）。
+fn parse_xmx_gb(jvm: &str) -> Option<u64> {
+    for tok in jvm.split_whitespace() {
+        let low = tok.to_lowercase();
+        let Some(rest) = low.strip_prefix("-xmx") else { continue };
+        let rest = rest.trim();
+        if rest.is_empty() {
+            continue;
+        }
+        // 按字符取"最后一位单位"与"其余数字部分"：不能用字节切片（单位可能是全角字符，
+        // 按字节 split_at 会落在字符中间直接 panic —— release 是 panic=abort）。
+        let last = rest.chars().last()?;
+        let unit = last.to_ascii_lowercase();
+        if unit.is_ascii_digit() {
+            // 纯数字 = 字节
+            if let Ok(b) = rest.parse::<u64>() {
+                return Some((b / (1024 * 1024 * 1024)).max(1));
+            }
+            continue;
+        }
+        let num: String = rest.chars().take(rest.chars().count().saturating_sub(1)).collect();
+        let Ok(v) = num.trim().parse::<f64>() else { continue };
+        let gb = match unit {
+            'g' => v,
+            'm' => v / 1024.0,
+            'k' => v / (1024.0 * 1024.0),
+            't' => v * 1024.0,
+            _ => continue,
+        };
+        return Some(gb.round().max(1.0) as u64);
+    }
+    None
+}
+
+/// 读取 `server.properties` 的 `server-port`（默认 25565）。
+fn read_server_port(dir: &Path) -> Option<u16> {
+    let text = std::fs::read_to_string(dir.join("server.properties")).ok()?;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("server-port") {
+            let v = rest.split('=').nth(1)?.trim();
+            return v.parse::<u16>().ok();
+        }
+    }
+    None
+}
+
+/// 轻量读取 jar 内声明的**前置依赖** modid 列表。
+/// Fabric/Quilt：`fabric.mod.json` / `quilt.mod.json` 的 `depends` 键；
+/// Forge/NeoForge：`META-INF/mods.toml` / `META-INF/neoforge.mods.toml` 的 `modId = "..."`。
+/// 读不到（非 mods.jar / 加密 / 格式不支持）时返回空列表，不算错误。
+fn read_declared_dependencies(jar: &Path) -> Vec<String> {
+    let Ok(file) = std::fs::File::open(jar) else {
+        return Vec::new();
+    };
+    let Ok(mut z) = zip::ZipArchive::new(file) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for name in ["fabric.mod.json", "quilt.mod.json"] {
+        let Ok(mut f) = z.by_name(name) else { continue };
+        let mut s = String::new();
+        if std::io::Read::read_to_string(&mut f, &mut s).is_err() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) else {
+            continue;
+        };
+        let mut collect = |obj: Option<&serde_json::Value>| {
+            if let Some(serde_json::Value::Object(m)) = obj {
+                for k in m.keys() {
+                    if !out.contains(k) {
+                        out.push(k.clone());
+                    }
+                }
+            }
+        };
+        collect(v.get("depends"));
+        // quilt 的 depends 在 quilt_loader 下
+        if let Some(ql) = v.get("quilt_loader") {
+            collect(ql.get("depends"));
+        }
+    }
+    for name in ["META-INF/mods.toml", "META-INF/neoforge.mods.toml"] {
+        let Ok(mut f) = z.by_name(name) else { continue };
+        let mut s = String::new();
+        if std::io::Read::read_to_string(&mut f, &mut s).is_err() {
+            continue;
+        }
+        for line in s.lines() {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix("modId") else { continue };
+            let rest = rest.trim_start();
+            let Some(rest) = rest.strip_prefix('=') else { continue };
+            let id = rest.trim().trim_matches('"').trim();
+            if !id.is_empty() && id != "minecraft" && !out.contains(&id.to_string()) {
+                out.push(id.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// 一键诊断包：把日志 / 崩溃报告 / 工具日志 / 脱敏配置 / 系统信息打包成一个 zip。
+///
+/// 内容清单（zip 内路径）：
+/// · `logs/latest.log`、最近 1 个 `logs/*.log.gz`、最近 2 份 `crash-reports/*.txt`
+/// · `tool/crash.log`(+`.1`)、`tool/integrity_check.log`、`tool/shutdown.log`
+/// · `config/server.json`（当前服务器配置片段，脱敏）、`config/global.json`（全局设置片段，脱敏）
+/// · `server.properties`（抹掉 rcon.password / level-seed 的值）
+/// · `system.txt`（系统 + Java + 平台 + 程序版本与完整性级别）
+/// · `README.txt`（每项是什么）
+///
+/// 返回 (zip 路径, 字节数)。
+fn build_diag_package(
+    sc: &ServerConfig,
+    cfg: &GlobalConfig,
+    data_dir: &Path,
+    rid: Option<u32>,
+) -> Result<(PathBuf, u64), String> {
+    let mut entries: Vec<ZipEntry> = Vec::new();
+
+    // 1) 服务器日志
+    let latest = sc.dir.join("logs").join("latest.log");
+    if let Some(e) = zip_entry_from_file(&latest, "logs/latest.log") {
+        entries.push(e);
+    }
+    for p in newest_files(&sc.dir.join("logs"), &[".log.gz"], 1) {
+        let name = p.file_name().map(|x| x.to_string_lossy().to_string()).unwrap_or_default();
+        if let Some(e) = zip_entry_from_file(&p, &format!("logs/{name}")) {
+            entries.push(e);
+        }
+    }
+    // 2) 崩溃报告（最近 2 份）
+    for p in newest_files(&sc.dir.join("crash-reports"), &[".txt"], 2) {
+        let name = p.file_name().map(|x| x.to_string_lossy().to_string()).unwrap_or_default();
+        if let Some(e) = zip_entry_from_file(&p, &format!("crash-reports/{name}")) {
+            entries.push(e);
+        }
+    }
+
+    // 3) 工具自己的诊断日志（data 目录）
+    for name in ["crash.log", "crash.log.1", "integrity_check.log", "shutdown.log", "resume.log"] {
+        let p = data_dir.join(name);
+        if let Some(e) = zip_entry_from_file(&p, &format!("tool/{name}")) {
+            entries.push(e);
+        }
+    }
+
+    // 4) 脱敏配置：当前服务器片段 + 全局设置片段
+    if let Ok(v) = serde_json::to_value(sc) {
+        let masked = sanitize_json(&v);
+        if let Ok(text) = serde_json::to_string_pretty(&masked) {
+            entries.push(ZipEntry {
+                name: "config/server.json".to_string(),
+                data: text.into_bytes(),
+            });
+        }
+    }
+    if let Ok(mut v) = serde_json::to_value(cfg) {
+        // 服务器列表已单独导出，这里去掉避免重复（全局设置片段只保留"设置"本身）
+        if let Some(obj) = v.as_object_mut() {
+            obj.remove("servers");
+        }
+        let masked = sanitize_json(&v);
+        if let Ok(text) = serde_json::to_string_pretty(&masked) {
+            entries.push(ZipEntry {
+                name: "config/global.json".to_string(),
+                data: text.into_bytes(),
+            });
+        }
+    }
+
+    // 5) server.properties（去掉敏感值与种子）
+    let props = sc.dir.join("server.properties");
+    if let Ok(text) = std::fs::read_to_string(&props) {
+        entries.push(ZipEntry {
+            name: "server.properties".to_string(),
+            data: sanitize_server_properties(&text).into_bytes(),
+        });
+    }
+
+    // 6) 系统信息
+    let pinfo = serverinfo::detect_cached(&sc.dir, std::time::Duration::from_secs(3));
+    let java = resolve_java_for_server(cfg, sc);
+    let java_ver = java_version_text(&java).unwrap_or_else(|e| format!("无法获取（{e}）"));
+    let level = match rid {
+        Some(r) if r == winapi::um::winnt::SECURITY_MANDATORY_LOW_RID => "Low（会导致写其它目录失败）",
+        Some(r) if r == winapi::um::winnt::SECURITY_MANDATORY_MEDIUM_RID => "Medium（正常）",
+        Some(_) => "High/System",
+        None => "未知",
+    };
+    let mut sys = String::new();
+    sys.push_str(&format!("生成时间: {}\r\n", chrono::Local::now().format("%Y-%m-%d %H:%M:%S")));
+    sys.push_str(&format!("操作系统: {}\r\n", windows_version_text()));
+    sys.push_str(&format!("CPU: {}\r\n", cpu_info_text()));
+    sys.push_str(&format!("物理内存: {} GB\r\n", physical_memory_gb()));
+    sys.push_str(&format!("Java 路径: {java}\r\n"));
+    sys.push_str(&format!("Java 版本: {java_ver}\r\n"));
+    sys.push_str(&format!("服务端平台: {}\r\n", pinfo.summary()));
+    sys.push_str(&format!(
+        "MC 版本: {}\r\n",
+        pinfo.mc_version.clone().unwrap_or_else(|| "未知".to_string())
+    ));
+    sys.push_str(&format!(
+        "加载器: {}\r\n",
+        pinfo.kind.label()
+    ));
+    sys.push_str(&format!("模组数量: {}\r\n", pinfo.mod_count));
+    sys.push_str(&format!("插件数量: {}\r\n", pinfo.plugin_count));
+    sys.push_str(&format!("服务器目录: {}\r\n", sc.dir.display()));
+    sys.push_str(&format!("程序版本: v{}\r\n", env!("CARGO_PKG_VERSION")));
+    sys.push_str(&format!("程序完整性级别: {level}\r\n"));
+    entries.push(ZipEntry {
+        name: "system.txt".to_string(),
+        data: sys.into_bytes(),
+    });
+
+    // 7) README：说明每一项是什么
+    let readme = "XMST 诊断包内容说明\r\n\
+\r\n\
+logs/latest.log        服务器最近一次运行的完整日志（最重要的排查依据）\r\n\
+logs/*.log.gz          上一份被轮转的日志压缩包（最近 1 个）\r\n\
+crash-reports/*.txt    最近 2 份崩溃报告（没有崩溃就不会出现）\r\n\
+tool/crash.log         工具自身的崩溃记录（含 .1 轮转文件）\r\n\
+tool/integrity_check.log  启动时的进程完整性级别自检记录\r\n\
+tool/shutdown.log      工具记录的关服/退出过程\r\n\
+tool/resume.log        检测到\"上次未正常退出仍在运行\"的服务器时的留痕\r\n\
+config/server.json     当前服务器的配置（已脱敏）\r\n\
+config/global.json     工具的全局设置（已脱敏，不含服务器列表）\r\n\
+server.properties      服务端配置（已抹掉 rcon.password 与 level-seed 的值）\r\n\
+system.txt             操作系统 / CPU / 内存 / Java / 平台 / 程序版本与完整性级别\r\n\
+\r\n\
+脱敏规则：键名（不区分大小写）包含 password / passwd / token / secret / apikey / api_key /\r\n\
+credential / auth / user 的字段，其值一律替换为 ***，只保留键名。\r\n";
+    entries.push(ZipEntry {
+        name: "README.txt".to_string(),
+        data: readme.as_bytes().to_vec(),
+    });
+
+    // 输出：data\diag\<服务器名>_诊断_<yyyyMMdd_HHmmss>.zip
+    let safe: String = sc
+        .name
+        .chars()
+        .map(|c| if r#"\/:*?"<>|"#.contains(c) { '_' } else { c })
+        .collect();
+    let safe = safe.trim();
+    let safe = if safe.is_empty() { "server" } else { safe };
+    let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+    let out = data_dir.join("diag").join(format!("{safe}_诊断_{stamp}.zip"));
+    let size = write_zip(&out, &entries)?;
+    Ok((out, size))
+}
+
+/// 加载器 / 原版自带、无需用户安装的前置 id。
+fn is_builtin_dependency(id: &str) -> bool {
+    let l = id.to_lowercase();
+    matches!(
+        l.as_str(),
+        "minecraft" | "java" | "fabricloader" | "fabric" | "forge" | "neoforge" | "quilt_loader"
+            | "quilt_base"
+    )
+}
+
+#[cfg(test)]
+mod finishing_batch_selfcheck {
+    use super::*;
+
+    /// -Xmx 解析：GB/M/G、纯数字、缺单位全角字符都不能 panic
+    #[test]
+    fn xmx_parse() {
+        assert_eq!(parse_xmx_gb("-Xms1G -Xmx4G"), Some(4));
+        assert_eq!(parse_xmx_gb("-Xmx2048M"), Some(2));
+        assert_eq!(parse_xmx_gb("-Xmx8g"), Some(8));
+        assert_eq!(parse_xmx_gb("-Xmx"), None);
+        assert_eq!(parse_xmx_gb("-Xmx 2048"), None);
+        assert_eq!(parse_xmx_gb(""), None);
+        // 全角单位：按字节切片会 panic，必须安全返回
+        assert_eq!(parse_xmx_gb("-Xmx2Ｇ"), None);
+    }
+
+    /// Java 版本要求矩阵 + java -version 输出解析
+    #[test]
+    fn java_major_rule() {
+        assert_eq!(required_java_major(Some("1.20.5")), Some(21));
+        assert_eq!(required_java_major(Some("1.20.4")), Some(17));
+        assert_eq!(required_java_major(Some("1.19.2")), Some(17));
+        assert_eq!(required_java_major(Some("1.18.2")), Some(17));
+        assert_eq!(required_java_major(Some("1.17.1")), Some(16));
+        assert_eq!(required_java_major(Some("1.16.5")), Some(8));
+        assert_eq!(required_java_major(Some("1.21")), Some(21));
+        assert_eq!(required_java_major(None), None);
+        assert_eq!(
+            parse_java_major("openjdk version \"17.0.9\" 2023-10-17"),
+            Some(17)
+        );
+        assert_eq!(parse_java_major("java version \"1.8.0_402\""), Some(8));
+        assert_eq!(parse_java_major("没有引号的输出"), None);
+    }
+
+    /// 脱敏规则：键名不区分大小写命中敏感词 → 值变 ***，其余原样保留
+    #[test]
+    fn sanitize_rules() {
+        let raw = "level-name=world\r\nlevel-seed=12345\r\nrcon.password=abc\r\nmax-players=20\r\n";
+        let out = sanitize_server_properties(raw);
+        assert!(out.contains("level-seed=***"));
+        assert!(out.contains("rcon.password=***"));
+        assert!(out.contains("level-name=world"));
+        assert!(out.contains("max-players=20"));
+
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"a":{"rcon_password":"x","token":"y","port":25565},"remote_user":"admin","name":"s"}"#,
+        )
+        .unwrap_or_default();
+        let m = sanitize_json(&v);
+        assert_eq!(m["a"]["rcon_password"], "***");
+        assert_eq!(m["a"]["token"], "***");
+        assert_eq!(m["remote_user"], "***");
+        assert_eq!(m["a"]["port"], 25565);
+        assert_eq!(m["name"], "s");
+    }
+
+    /// 外部实例判定：目录命中优先于核心 jar 命中；本工具托管 PID 必须被排除
+    #[test]
+    fn external_match_priority() {
+        let mut a = ServerConfig::default();
+        a.name = "A".to_string();
+        a.dir = PathBuf::from("C:\\srv\\a");
+        let mut b = ServerConfig::default();
+        b.name = "B".to_string();
+        b.dir = PathBuf::from("C:\\srv\\b");
+        let servers = vec![a, b];
+        // 纯函数部分（不依赖真实进程）：规整化后目录串应能被命令行包含
+        let key = norm_path_key(&servers[1].dir);
+        assert_eq!(key, "c:\\srv\\b");
+        assert!("java -jar c:/srv/b/server.jar".replace('/', "\\").to_lowercase().contains(&key));
+    }
+
+    /// 命令行读取（PEB）：拿一个真实进程验证固定偏移没读错位。
+    /// 读不到（权限/策略）时不算失败——调用方本就有退化路径。
+    #[test]
+    fn command_line_readable() {
+        let spawned = std::process::Command::new("cmd")
+            .args(["/c", "ping -n 5 127.0.0.1 > nul"])
+            .creation_flags(0x0800_0000)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let Ok(mut child) = spawned else { return };
+        let pid = child.id();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let cl = process::process_command_line(pid);
+        let alive = process::pid_alive(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(alive, "刚拉起的进程应被判为存活");
+        if let Some(s) = cl {
+            let low = s.to_lowercase();
+            assert!(low.contains("ping"), "读到的命令行不像本进程: {s}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod encoding_selfcheck {
+    use super::*;
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("xmst_enc_{name}"));
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::create_dir_all(&d);
+        d
+    }
+
+    #[test]
+    fn gbk_roundtrip_keeps_encoding_and_backs_up() {
+        let d = tmp_dir("gbk");
+        let p = d.join("run.bat");
+        let text = "@echo off\r\nrem 中文注释\r\njava -jar server.jar\r\n";
+        write_text_same_encoding(&p, text, TextEncoding::Gbk, true).expect("write gbk");
+        let raw = std::fs::read(&p).unwrap();
+        assert_eq!(raw, string_to_ansi_bytes(text).unwrap());
+        let (back, enc) = read_text_auto_encoding(&p).unwrap();
+        assert_eq!(enc, TextEncoding::Gbk);
+        assert_eq!(back, text);
+        // 再存一次：应生成 .bak_ 备份，内容仍是 GBK 且 CRLF
+        write_text_same_encoding(&p, &back, enc, true).expect("rewrite");
+        let baks = std::fs::read_dir(&d)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".bak_"))
+            .count();
+        assert_eq!(baks, 1, "覆盖前应留下 .bak_ 备份");
+        let raw2 = std::fs::read(&p).unwrap();
+        assert!(!raw2.starts_with(&[0xEF, 0xBB, 0xBF]), "GBK 不能带 UTF-8 BOM");
+        assert!(raw2.windows(2).any(|w| w == b"\r\n"), "应保持 CRLF");
+    }
+
+    #[test]
+    fn utf8_bom_roundtrip() {
+        let d = tmp_dir("bom");
+        let p = d.join("notes.txt");
+        std::fs::write(&p, [&[0xEFu8, 0xBB, 0xBF][..], "中文".as_bytes()].concat()).unwrap();
+        let (text, enc) = read_text_auto_encoding(&p).unwrap();
+        assert_eq!(enc, TextEncoding::Utf8Bom);
+        assert_eq!(text, "中文");
+        write_text_same_encoding(&p, &text, enc, false).unwrap();
+        let raw = std::fs::read(&p).unwrap();
+        assert!(raw.starts_with(&[0xEF, 0xBB, 0xBF]));
+        assert!(!raw.windows(2).any(|w| w == b"\r\n"), "LF 文件写回不应变成 CRLF");
+    }
+
+    #[test]
+    fn utf16_bom_detected() {
+        let d = tmp_dir("utf16");
+        let p = d.join("wide.txt");
+        let mut bytes = vec![0xFFu8, 0xFE];
+        for u in "中文abc".encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        std::fs::write(&p, &bytes).unwrap();
+        let (text, enc) = read_text_auto_encoding(&p).unwrap();
+        assert_eq!(enc, TextEncoding::Utf16Le);
+        assert_eq!(text, "中文abc");
+    }
+
+    #[test]
+    fn gbk_rejects_unmappable_and_keeps_original() {
+        let d = tmp_dir("emoji");
+        let p = d.join("data.txt");
+        std::fs::write(&p, b"original").unwrap();
+        let r = write_text_same_encoding(&p, "中文😀", TextEncoding::Gbk, true);
+        assert!(r.is_err(), "GBK 无法表示 emoji 时必须拒绝保存");
+        assert_eq!(std::fs::read(&p).unwrap(), b"original");
+        assert!(
+            std::fs::read_dir(&d)
+                .unwrap()
+                .flatten()
+                .all(|e| !e.file_name().to_string_lossy().ends_with(".xmst.tmp")),
+            "失败时不应残留临时文件"
+        );
+    }
+
+    #[test]
+    fn bat_defaults_to_gbk_others_utf8() {
+        assert!(matches!(
+            default_text_encoding(Path::new("x\\run.bat")),
+            TextEncoding::Gbk
+        ));
+        assert!(matches!(
+            default_text_encoding(Path::new("x\\server.cmd")),
+            TextEncoding::Gbk
+        ));
+        assert!(matches!(
+            default_text_encoding(Path::new("x\\server.properties")),
+            TextEncoding::Utf8
+        ));
+    }
+
+    #[test]
+    fn recommended_args_follow_physical_memory() {
+        assert_eq!(
+            recommended_jvm_args(8),
+            "-Xms1G -Xmx4G -XX:+UseG1GC -XX:MaxGCPauseMillis=200"
+        );
+        assert!(recommended_jvm_args(64).contains("-Xmx16G"));
+        assert!(recommended_jvm_args(2).contains("-Xmx2G"));
+        assert!(recommended_jvm_args(1).contains("-Xmx2G"));
+    }
+
+    #[test]
+    fn generated_run_bat_is_cmd_safe() {
+        let d = tmp_dir("genbat");
+        let p = generate_run_bat(&d, "java", "", "server.jar").expect("生成 run.bat");
+        let raw = std::fs::read(&p).unwrap();
+        assert!(!raw.starts_with(&[0xEF, 0xBB, 0xBF]));
+        assert!(raw.windows(2).any(|w| w == b"\r\n"));
+        assert!(raw.windows(2).all(|w| w != b"\n\n"), "不能出现空行被写成 LF");
+        let (text, enc) = read_text_auto_encoding(&p).unwrap();
+        assert_eq!(enc, TextEncoding::Gbk);
+        // 原文里的 pause 只能出现在注释里（说明为什么不能加），不能是可执行的 pause 行
+        assert!(
+            !text
+                .lines()
+                .any(|l| l.trim().eq_ignore_ascii_case("pause")),
+            "生成的脚本不能有 pause 行"
+        );
+        assert!(text.contains("set \"MAX_RESTARTS=1\""));
+        assert!(
+            text.lines()
+                .filter(|l| {
+                    let u = l.to_ascii_uppercase();
+                    let t = u.trim_start();
+                    !t.starts_with("REM") && !t.starts_with("::") && u.contains("MAX_RESTARTS")
+                })
+                .count()
+                == 1,
+            "MAX_RESTARTS 赋值行只能有一处"
+        );
+        assert!(text.contains("-Dfile.encoding=UTF-8"));
+        assert!(text.contains("-Djava.io.tmpdir=%~dp0tmp"));
+        assert!(text.contains("%~dp0tmp"));
+        assert!(text.contains("-XX:+UseG1GC"));
+        assert!(!text.contains("chcp"));
+        // 工具自己的 MAX_RESTARTS 探测/改写要能在生成的脚本上跑通
+        assert_eq!(read_bat_max_restarts(&d).map(|(_, v)| v), Some(1));
+        let f = write_bat_max_restarts(&d, 3).expect("改写 MAX_RESTARTS");
+        assert_eq!(f, "run.bat");
+        assert_eq!(read_bat_max_restarts(&d).map(|(_, v)| v), Some(3));
+        let (after, enc2) = read_text_auto_encoding(&p).unwrap();
+        assert_eq!(enc2, TextEncoding::Gbk, "改写后仍必须是 GBK");
+        assert!(after.contains("MAX_RESTARTS=3"));
+        assert!(
+            after.contains("rem MAX_RESTARTS 取 1"),
+            "注释行不能被改写成 set 赋值"
+        );
+        assert!(
+            after
+                .lines()
+                .filter(|l| {
+                    let u = l.to_ascii_uppercase();
+                    let t = u.trim_start();
+                    !t.starts_with("REM") && !t.starts_with("::") && u.contains("MAX_RESTARTS")
+                })
+                .count()
+                == 1
+        );
+    }
+
+    #[test]
+    fn tmp_exclude_migration() {
+        // 迁移已委托给 backup::migrate_excludes（只补默认项，不删不改顺序）
+        let mut cfg = GlobalConfig::default();
+        let mut sc = ServerConfig::default();
+        sc.backup.exclude = vec!["logs".to_string(), "TMP".to_string()];
+        cfg.servers.push(sc);
+        // "TMP" 与默认项 "tmp" 等价（忽略大小写）→ 只补其它缺失的默认项，原项顺序与写法保留
+        assert!(migrate_backup_exclude_tmp(&mut cfg));
+        assert_eq!(
+            &cfg.servers[0].backup.exclude[..2],
+            &["logs".to_string(), "TMP".to_string()][..]
+        );
+        assert!(!migrate_backup_exclude_tmp(&mut cfg));
+
+        // 非空但缺默认项 → 追加到末尾，且不改动已有项与顺序
+        let mut cfg3 = GlobalConfig::default();
+        let mut sc3 = ServerConfig::default();
+        sc3.backup.exclude = vec!["logs".to_string(), "我的目录".to_string()];
+        cfg3.servers.push(sc3);
+        assert!(migrate_backup_exclude_tmp(&mut cfg3));
+        let ex3 = &cfg3.servers[0].backup.exclude;
+        assert_eq!(&ex3[..2], &["logs".to_string(), "我的目录".to_string()][..]);
+        assert!(ex3.iter().any(|e| e.eq_ignore_ascii_case("tmp")));
+        assert!(ex3.iter().any(|e| e.eq_ignore_ascii_case("jna-*")));
+        assert!(!migrate_backup_exclude_tmp(&mut cfg3));
+
+        let mut cfg2 = GlobalConfig::default();
+        let mut sc2 = ServerConfig::default();
+        sc2.backup.exclude.clear();
+        cfg2.servers.push(sc2);
+        assert!(migrate_backup_exclude_tmp(&mut cfg2));
+        let ex = &cfg2.servers[0].backup.exclude;
+        assert!(ex.iter().any(|e| e.eq_ignore_ascii_case("tmp")));
+        assert!(ex.iter().any(|e| e == "session.lock"));
+        let n = ex.len();
+        assert!(!migrate_backup_exclude_tmp(&mut cfg2));
+        assert_eq!(cfg2.servers[0].backup.exclude.len(), n);
+    }
 }

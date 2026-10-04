@@ -51,6 +51,9 @@ impl CrashFinding {
     }
 }
 
+/// 分析结果的别名（对外统一叫法）：与 `CrashFinding` 是同一个类型。
+pub type CrashAnalysis = CrashFinding;
+
 /// 读取 mods/ 目录，建立 `mod id -> 友好名(文件名)` 映射（Fabric/Quilt/Forge/NeoForge 四种元数据）。
 fn mod_name_map(dir: &Path) -> HashMap<String, String> {
     let mut map = HashMap::new();
@@ -237,7 +240,23 @@ pub fn analyze(dir: &Path) -> Option<CrashFinding> {
     }
 
     let mut finding = CrashFinding::default();
-    for (name, text) in &sources {
+    analyze_sources_into(&mut finding, &sources, &map);
+    enrich_paths(dir, &mut finding);
+    if finding.is_empty() {
+        None
+    } else {
+        Some(finding)
+    }
+}
+
+/// 依次分析若干份来源（崩溃报告 / 日志），把结论并入 `finding`；
+/// 一旦某份来源得出结论（`crashed` 或有 causes）就停止 —— 只用最相关的一份来源。
+fn analyze_sources_into(
+    finding: &mut CrashFinding,
+    sources: &[(String, String)],
+    map: &HashMap<String, String>,
+) {
+    for (name, text) in sources {
         // ---- 先用「崩溃报告」的整体结构做一次分析：Exception 行 + 堆栈归属模组 ----
         // 这一步覆盖了大量"模组自身异常/配置损坏"类崩溃（依赖缺失只是其中一类）。
         if text.contains("---- Minecraft Crash Report ----") || text.contains("Description:") {
@@ -490,9 +509,12 @@ pub fn analyze(dir: &Path) -> Option<CrashFinding> {
             break; // 只用最相关的一份来源
         }
     }
-    // 为每条结论补充"建议查看的数据文件"（用户可直接跳过去改）。
-    // 搜索范围不止 config/：carpet 系列等模组把服务端设置放在 **world/** 下，
-    // 也有模组直接写在服务器根目录，所以按 config → world → 根目录 → defaultconfigs 依次找。
+}
+
+/// 为每条结论补充"建议查看的数据文件"（用户可直接跳过去改）。
+/// 搜索范围不止 config/：carpet 系列等模组把服务端设置放在 **world/** 下，
+/// 也有模组直接写在服务器根目录，所以按 config → world → 根目录 → defaultconfigs 依次找。
+fn enrich_paths(dir: &Path, finding: &mut CrashFinding) {
     if !finding.causes.is_empty() {
         for c in finding.causes.iter_mut() {
             if c.path.is_some() {
@@ -523,11 +545,88 @@ pub fn analyze(dir: &Path) -> Option<CrashFinding> {
             }
         }
     }
-    if finding.is_empty() {
-        None
-    } else {
-        Some(finding)
+}
+
+/// 只取 `dir/crash-reports` 下**修改时间 >= since** 的最新一份 `.txt` 报告，
+/// 返回 `(报告路径, 报告文本)`；没有更新的报告（或目录不存在）时返回 `Ok(None)`。
+///
+/// 用途：只要"本次运行"产生的崩溃报告。进程启动前就存在的旧报告会把上一次的崩溃
+/// 误当成本次结论，所以用启动时间当分界线；返回 `None` 时调用方应显示
+/// "本次运行未生成崩溃报告，可能是启动失败"。
+pub fn latest_report_since(
+    dir: &Path,
+    since: std::time::SystemTime,
+) -> Result<Option<(std::path::PathBuf, String)>, String> {
+    let reports_dir = dir.join("crash-reports");
+    if !reports_dir.is_dir() {
+        return Ok(None);
     }
+    let rd = std::fs::read_dir(&reports_dir).map_err(|e| format!("读取崩溃报告目录失败: {e}"))?;
+    let mut newest: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    for e in rd.flatten() {
+        let p = e.path();
+        if !p.is_file() {
+            continue;
+        }
+        let is_txt = p
+            .extension()
+            .and_then(|x| x.to_str())
+            .map(|x| x.eq_ignore_ascii_case("txt"))
+            .unwrap_or(false);
+        if !is_txt {
+            continue;
+        }
+        let Ok(md) = e.metadata() else { continue };
+        let Ok(mtime) = md.modified() else { continue };
+        if mtime < since {
+            continue;
+        }
+        let better = match &newest {
+            Some((t, _)) => mtime > *t,
+            None => true,
+        };
+        if better {
+            newest = Some((mtime, p));
+        }
+    }
+    let Some((_, path)) = newest else {
+        return Ok(None);
+    };
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("读取崩溃报告失败: {e}"))?;
+    Ok(Some((path, text)))
+}
+
+/// 只对**文本**做分析（不需要服务器目录）。
+/// 由于没有目录上下文，模组 id 无法映射成友好名（suspects 只能是原始 id），
+/// 也无法定位"建议查看的文件"（path 一律为空）；需要这些请用 `analyze()` / `analyze_since()`。
+/// 文本为空时返回空的 `CrashAnalysis`（`is_empty()` 为 true）。
+pub fn analyze_text(text: &str) -> crate::crashscan::CrashAnalysis {
+    let mut finding = CrashFinding::default();
+    if text.trim().is_empty() {
+        return finding;
+    }
+    analyze_sources_into(&mut finding, &[("crash-report".to_string(), text.to_string())], &HashMap::new());
+    finding
+}
+
+/// 组合入口：取 `since` 之后**最新**的崩溃报告并做完整分析（含模组名映射与建议文件定位）。
+/// 没有本次运行产生的报告时返回 `Err("本次运行未生成崩溃报告…")`，文案可直接展示给用户。
+pub fn analyze_since(
+    dir: &Path,
+    since: std::time::SystemTime,
+) -> Result<crate::crashscan::CrashAnalysis, String> {
+    let Some((path, text)) = latest_report_since(dir, since)? else {
+        return Err("本次运行未生成崩溃报告，可能是启动失败".to_string());
+    };
+    let name = path
+        .file_name()
+        .map(|x| x.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let map = mod_name_map(dir);
+    let mut finding = CrashFinding::default();
+    analyze_sources_into(&mut finding, &[(name, text)], &map);
+    enrich_paths(dir, &mut finding);
+    Ok(finding)
 }
 
 /// 在 `config/`（含一层子目录）里按模组 id 模糊查找配置文件/目录，返回相对路径。
