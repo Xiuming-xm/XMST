@@ -16,6 +16,7 @@ mod server_download;
 mod serverinfo;
 mod spark_analysis;
 mod theme;
+mod toollog;
 
 use chrono::Local;
 use config::{
@@ -2289,6 +2290,17 @@ struct App {
     log_follow: bool,
     /// 日志页：行高（1.0 紧凑 / 1.6 舒适）
     log_row_h: f32,
+    /// 「日志」页（工具运行日志）过滤结果缓存：只在日志版本或过滤条件变化时重算，
+    /// 渲染路径不遍历内存缓冲，也不读文件
+    tool_log_rev: u64,
+    /// 上次重算时用的过滤条件（级别, 类别, 关键字）
+    tool_log_filter_key: (String, String, String),
+    /// 过滤后的工具日志（渲染只读这一份）
+    tool_log_rows: Vec<toollog::ToolLogEntry>,
+    /// 过滤后出现过的类别（动态收集，供类别下拉使用）
+    tool_log_cats: Vec<String>,
+    /// 插件日志已消费到的行数（把插件加载/启停/脚本报错转记到工具日志用）
+    plugin_log_seen: usize,
     /// 隐藏请求已受理但窗口尚未隐藏（延迟一帧隐藏：见 update 早退分支，避免隐藏窗口
     /// request_redraw 无效导致 eframe ControlFlow 滞留 Poll 空转 100% CPU）
     hide_requested: bool,
@@ -3181,6 +3193,9 @@ impl App {
         if let Some(parent) = config_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        // 工具运行日志：先建立落盘文件与内存缓冲（早于配置加载，
+        // 配置损坏/迁移这类事件才能被记上；文件尾部只在这一次读取）
+        toollog::init(&exe_dir.join("data"));
         let mut cfg = load_config(&config_path);
         let nav_collapsed_init = cfg.nav_collapsed;
         // 老配置兼容：admin_port 缺失时统一为 7400，重新编号避免端口冲突
@@ -3311,6 +3326,11 @@ impl App {
             log_src: "全部".to_string(),
             log_follow: true,
             log_row_h: 1.0,
+            tool_log_rev: u64::MAX,
+            tool_log_filter_key: (String::new(), String::new(), String::new()),
+            tool_log_rows: Vec::new(),
+            tool_log_cats: Vec::new(),
+            plugin_log_seen: 0,
             hide_requested: false,
             hide_sent: false,
             tray_tick_at: None,
@@ -3478,6 +3498,15 @@ impl App {
         app.detect_startup_leftovers();
         // 自动化入口：XMST_OPEN_PAGE=<页面> → 启动即切到该页（在首帧渲染前完成）
         app.apply_open_page_env();
+        toollog::tool_log(
+            toollog::ToolLevel::Info,
+            "启动",
+            format!(
+                "XMST {} 启动（数据目录 {}）",
+                env!("CARGO_PKG_VERSION"),
+                app.data_dir().display()
+            ),
+        );
         app
     }
 
@@ -3656,6 +3685,11 @@ impl App {
             Err(e) => {
                 self.cfg_save_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
                 self.set_toast(format!("配置序列化失败，未写盘（避免清空配置）：{e}"));
+                toollog::tool_log(
+                    toollog::ToolLevel::Error,
+                    "配置",
+                    format!("配置保存失败：序列化失败，未写盘（{e}）"),
+                );
                 return;
             }
         };
@@ -3667,6 +3701,11 @@ impl App {
         if std::fs::write(&tmp, json.as_bytes()).is_err() {
             self.cfg_save_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
             self.set_toast("配置写入失败（无法创建临时文件）".to_string());
+            toollog::tool_log(
+                toollog::ToolLevel::Error,
+                "配置",
+                "配置保存失败：无法写入临时文件",
+            );
             return;
         }
         if self.config_path.exists() {
@@ -3682,6 +3721,11 @@ impl App {
             Err(e) => {
                 self.cfg_save_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
                 self.set_toast(format!("配置替换失败：{e}"));
+                toollog::tool_log(
+                    toollog::ToolLevel::Error,
+                    "配置",
+                    format!("配置保存失败：替换失败（{e}）"),
+                );
             }
         }
     }
@@ -3999,6 +4043,11 @@ impl App {
                 "「{}」启动失败：启动方式设为 run.bat，但目录里没有 run.bat",
                 sc.name
             ));
+            toollog::tool_log(
+                toollog::ToolLevel::Error,
+                "服务器",
+                format!("启动失败：{}（启动方式为 run.bat，但目录里没有 run.bat）", sc.name),
+            );
             return;
         }
         if mode == "java" || !run_bat.exists() {
@@ -4012,6 +4061,11 @@ impl App {
                         rt.last_msg = format!("启动失败: {e}");
                     }
                     self.set_toast(format!("启动失败: {e}"));
+                    toollog::tool_log(
+                        toollog::ToolLevel::Error,
+                        "服务器",
+                        format!("启动失败：{}（直连 java 解析失败：{e}）", sc.name),
+                    );
                 }
             }
             return;
@@ -4169,6 +4223,7 @@ impl App {
             Ok(mp) => {
                 // 关机/注销时窗口过程要直接向这个句柄写 stop（拿不到 App），先登记一份
                 bridge_register_proc(idx, mp.child.clone(), mp.allow_stdin);
+                let started_pid = process::pid(&mp).unwrap_or(0);
                 // 本次启动的命令行与时刻：崩溃分析只认"这次运行"产生的报告，
                 // 弹窗要能展示实际启动命令行（不是模板字符串）。
                 rt.run_cmdline = mp.cmdline.clone();
@@ -4236,6 +4291,14 @@ impl App {
                         "阶段=启动编排 结果=已接管（界面已开始等待服务端就绪；回退启动={fallback}）"
                     ),
                 );
+                toollog::tool_log(
+                    toollog::ToolLevel::Info,
+                    "服务器",
+                    format!(
+                        "启动：{}（方式：{}，PID {}）",
+                        sc.name, spec.kind, started_pid
+                    ),
+                );
             }
             Err(e) => {
                 process::launch_log_ctx(
@@ -4243,6 +4306,11 @@ impl App {
                     &format!("阶段=启动编排 结果=失败（界面提示：启动失败: {e}）"),
                 );
                 rt.last_msg = format!("启动失败: {e}");
+                toollog::tool_log(
+                    toollog::ToolLevel::Error,
+                    "服务器",
+                    format!("启动失败：{}（{e}）", sc.name),
+                );
             }
         }
     }
@@ -4629,6 +4697,13 @@ impl App {
             if let Some(pm) = self.plugins.as_mut() {
                 pm.emit("server_stopped", vec![Dynamic::from(srv_name), Dynamic::from("killed")]);
             }
+            if let Some(sc) = self.cfg.servers.get(idx) {
+                toollog::tool_log(
+                    toollog::ToolLevel::Warn,
+                    "服务器",
+                    format!("强制停止：{}（含进程树）", sc.name),
+                );
+            }
         }
     }
 
@@ -4853,6 +4928,15 @@ impl App {
             "工具启动 版本={} exe_dir={dir_text} 完整性level={level} rid={rid_text} 本进程在Job内={in_job} 本进程cwd={self_cwd}",
             env!("CARGO_PKG_VERSION")
         ));
+        toollog::tool_log(
+            if level == "Low" {
+                toollog::ToolLevel::Error
+            } else {
+                toollog::ToolLevel::Info
+            },
+            "诊断",
+            format!("完整性自检：level={level}（exe 目录 {dir_text}）"),
+        );
         // Job 限制逐项落盘（多行文本压成一行便于 grep）：带进程数/内存上限的外层 Job
         // 会拦住需要大堆的 java，而 cmd/echo 这类小进程看不出异常 —— 这是第一个怀疑对象。
         process::launch_log_line(&format!(
@@ -5639,6 +5723,18 @@ impl App {
                 "XMST - 服务器已停止",
                 &format!("{name} 已{}", if ok { "优雅停止" } else { "超时强制结束" }),
             );
+            toollog::tool_log(
+                if ok {
+                    toollog::ToolLevel::Info
+                } else {
+                    toollog::ToolLevel::Warn
+                },
+                "服务器",
+                format!(
+                    "停止：{name}（{}）",
+                    if ok { "优雅停止" } else { "等待超时" }
+                ),
+            );
             // 正常关服（等待到进程退出）→ 自动做一份 reason=stop 的快照；超时强杀不算正常关闭
             if ok {
                 let tail = self
@@ -5831,6 +5927,15 @@ impl App {
                 )
             };
         }
+        toollog::tool_log(
+            toollog::ToolLevel::Info,
+            "服务器",
+            if ext.pid != 0 {
+                format!("外部实例接管：{name}（PID {}）", ext.pid)
+            } else {
+                format!("外部实例接管：{name}（未能取得 PID）")
+            },
+        );
         if ext.pid != 0 {
             self.notify("XMST - 已接管外部实例", &format!("{name}：PID {}", ext.pid));
         } else {
@@ -5967,10 +6072,24 @@ impl App {
                     self.backup_cache = None;
                     self.backup_stats_cache = None;
                     match res {
-                        Ok(n) => self.set_toast(format!(
-                            "已锁定为独立归档（不再随源文件变化）：{dir_name}（实化 {n} 个文件）"
-                        )),
-                        Err(e) => self.set_toast(format!("锁定失败：{e}")),
+                        Ok(n) => {
+                            self.set_toast(format!(
+                                "已锁定为独立归档（不再随源文件变化）：{dir_name}（实化 {n} 个文件）"
+                            ));
+                            toollog::tool_log(
+                                toollog::ToolLevel::Info,
+                                "备份",
+                                format!("快照锁定：{dir_name}（实化 {n} 个文件）"),
+                            );
+                        }
+                        Err(e) => {
+                            self.set_toast(format!("锁定失败：{e}"));
+                            toollog::tool_log(
+                                toollog::ToolLevel::Error,
+                                "备份",
+                                format!("快照锁定失败：{dir_name}（{e}）"),
+                            );
+                        }
                     }
                 }
                 BgMsg::Synced(idx, dir_name, res) => {
@@ -5979,11 +6098,25 @@ impl App {
                         rt.sync_busy = None;
                     }
                     match res {
-                        Ok(n) => self.set_toast(format!(
-                            "已转存快照 {dir_name}（本次复制 {}）",
-                            fmt_size(n)
-                        )),
-                        Err(e) => self.set_toast(format!("转存失败：{e}")),
+                        Ok(n) => {
+                            self.set_toast(format!(
+                                "已转存快照 {dir_name}（本次复制 {}）",
+                                fmt_size(n)
+                            ));
+                            toollog::tool_log(
+                                toollog::ToolLevel::Info,
+                                "备份",
+                                format!("快照转存：{dir_name}（复制 {}）", fmt_size(n)),
+                            );
+                        }
+                        Err(e) => {
+                            self.set_toast(format!("转存失败：{e}"));
+                            toollog::tool_log(
+                                toollog::ToolLevel::Error,
+                                "备份",
+                                format!("快照转存失败：{dir_name}（{e}）"),
+                            );
+                        }
                     }
                 }
                 BgMsg::Diag(res) => {
@@ -6001,14 +6134,55 @@ impl App {
                                 parent.clone(),
                             );
                             self.diag_last_dir = Some(parent);
+                            toollog::tool_log(
+                                toollog::ToolLevel::Info,
+                                "诊断",
+                                format!(
+                                    "导出诊断包：{}（{}）",
+                                    path.file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| path.display().to_string()),
+                                    fmt_size(size)
+                                ),
+                            );
                         }
                         Err(e) => {
                             self.push_toast("XMST - 导出诊断包失败", &e);
+                            toollog::tool_log(
+                                toollog::ToolLevel::Error,
+                                "诊断",
+                                format!("导出诊断包失败：{e}"),
+                            );
                         }
                     }
                 }
                 BgMsg::Precheck(idx, items) => {
                     self.bg_busy.remove(&format!("precheck:{idx}"));
+                    let warns = items
+                        .iter()
+                        .filter(|it| it.level == CheckLevel::Warn)
+                        .count();
+                    let fails = items
+                        .iter()
+                        .filter(|it| it.level == CheckLevel::Fail)
+                        .count();
+                    let sname = self
+                        .cfg
+                        .servers
+                        .get(idx)
+                        .map(|s| s.name.clone())
+                        .unwrap_or_default();
+                    toollog::tool_log(
+                        if fails > 0 {
+                            toollog::ToolLevel::Error
+                        } else if warns > 0 {
+                            toollog::ToolLevel::Warn
+                        } else {
+                            toollog::ToolLevel::Info
+                        },
+                        "诊断",
+                        format!("启动前检查：{sname}（警告 {warns} 项、失败 {fails} 项）"),
+                    );
                     if let Some(rt) = self.runtimes.get_mut(idx) {
                         rt.precheck_busy = false;
                         rt.precheck_items = items;
@@ -6031,6 +6205,18 @@ impl App {
                             self.modupd_cache.insert(r.cache_key.clone(), r.clone());
                         }
                     }
+                    let updatable = rows.iter().filter(|r| !r.url.is_empty()).count();
+                    let sname = self
+                        .cfg
+                        .servers
+                        .get(idx)
+                        .map(|s| s.name.clone())
+                        .unwrap_or_default();
+                    toollog::tool_log(
+                        toollog::ToolLevel::Info,
+                        "更新",
+                        format!("检查更新完成：{sname}（可更新 {updatable} 个）"),
+                    );
                     let ui_on = mod_update_ui_enabled(&self.cfg);
                     if let Some(rt) = self.runtimes.get_mut(idx) {
                         rt.modupd_busy = false;
@@ -6068,6 +6254,11 @@ impl App {
                     self.launch_diag_text = Some(text);
                     self.bg_busy.remove("launchdiag");
                     self.set_toast(format!("启动诊断已完成（{name}）：结果窗口已打开"));
+                    toollog::tool_log(
+                        toollog::ToolLevel::Info,
+                        "诊断",
+                        format!("启动诊断完成：{name}"),
+                    );
                 }
             }
             self.egui_ctx.request_repaint();
@@ -6146,6 +6337,19 @@ impl App {
         }
         // 同一会话内不重复请求同一个文件
         let cached: HashMap<String, ModUpdateRow> = self.modupd_cache.clone();
+        toollog::tool_log(
+            toollog::ToolLevel::Info,
+            "更新",
+            format!(
+                "检查更新开始：{}（{} 个模组）",
+                self.cfg
+                    .servers
+                    .get(idx)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_default(),
+                metas.len()
+            ),
+        );
         if let Some(rt) = self.runtimes.get_mut(idx) {
             rt.modupd_busy = true;
             rt.modupd_rows.clear();
@@ -6869,6 +7073,11 @@ impl App {
                     if plugins_active {
                         plugin_evts.push(PluginEvt::ServerStopped(name.clone(), "crashed".to_string()));
                     }
+                    toollog::tool_log(
+                        toollog::ToolLevel::Error,
+                        "服务器",
+                        format!("崩溃退出：{name}（退出码 {code}，未经过正常停止）"),
+                    );
                     // 崩溃自动重启：窗口内计数 -> 计划重启 / 熔断
                     let cr = self
                         .cfg
@@ -6905,6 +7114,14 @@ impl App {
                                     cr.wait_secs, cr.max_restarts
                                 ),
                             ));
+                            toollog::tool_log(
+                                toollog::ToolLevel::Warn,
+                                "服务器",
+                                format!(
+                                    "崩溃重启：{name} 将在 {} 秒后自动重启（第 {n}/{} 次）",
+                                    cr.wait_secs, cr.max_restarts
+                                ),
+                            );
                         } else {
                             rt.last_msg = format!(
                                 "⚠️ 服务器进程已退出（exit code {code}）。{} 分钟内连续崩溃达到上限（{n} 次），已熔断停止自动重启；可手动启动或等待窗口重置",
@@ -6918,6 +7135,14 @@ impl App {
                                     cr.circuit_minutes
                                 ),
                             ));
+                            toollog::tool_log(
+                                toollog::ToolLevel::Error,
+                                "服务器",
+                                format!(
+                                    "崩溃熔断：{name} 已连续崩溃 {n} 次（{} 分钟内），停止自动重启",
+                                    cr.circuit_minutes
+                                ),
+                            );
                         }
                     } else {
                         rt.last_msg = format!(
@@ -7040,6 +7265,11 @@ impl App {
             "XMST - 已自动改用直连 java",
             &format!("{name}：run.bat 启动失败，已自动改用直连 java 启动"),
         );
+        toollog::tool_log(
+            toollog::ToolLevel::Warn,
+            "服务器",
+            format!("启动方式回退：{name} 的 run.bat 启动失败，已改用直连 java"),
+        );
         self.fallback_restart(idx);
     }
     // 统一投递本次收集的通知（循环结束后避免借用冲突）桌面弹窗 + 工具内通知同步
@@ -7072,6 +7302,11 @@ impl App {
             "阶段=排队停止 结果=已就绪，自动发送 stop（服务器={name}）"
         ));
         self.set_toast(format!("「{name}」已就绪，正在自动停止"));
+        toollog::tool_log(
+            toollog::ToolLevel::Info,
+            "服务器",
+            format!("自动停止：{name} 已就绪，正在发送 stop"),
+        );
         self.begin_graceful_stop(idx);
     }
         plugin_evts
@@ -7135,9 +7370,28 @@ impl App {
                         sc.backup.last_backup = Some(Local::now().to_rfc3339());
                     }
                     self.save_config();
+                    toollog::tool_log(
+                        toollog::ToolLevel::Info,
+                        "备份",
+                        format!(
+                            "回退完成：{}（恢复 {} 个文件，失败 {} 个）",
+                            self.cfg
+                                .servers
+                                .get(i)
+                                .map(|s| s.name.clone())
+                                .unwrap_or_default(),
+                            rep.restored,
+                            rep.failed.len()
+                        ),
+                    );
                 }
                 Err(e) => {
                     self.set_toast(format!("回退失败: {e}"));
+                    toollog::tool_log(
+                        toollog::ToolLevel::Error,
+                        "备份",
+                        format!("回退失败：{}（{e}）", self.cfg.servers.get(i).map(|s| s.name.clone()).unwrap_or_default()),
+                    );
                 }
             }
         }
@@ -7147,8 +7401,18 @@ impl App {
             self.backup_cache = None;
             self.backup_stats_cache = None;
             match res {
-                Ok(m) => self.set_toast(m),
-                Err(e) => self.set_toast(format!("备份维护失败: {e}")),
+                Ok(m) => {
+                    self.set_toast(m.clone());
+                    toollog::tool_log(toollog::ToolLevel::Info, "备份", format!("保留策略清理：{m}"));
+                }
+                Err(e) => {
+                    self.set_toast(format!("备份维护失败: {e}"));
+                    toollog::tool_log(
+                        toollog::ToolLevel::Warn,
+                        "备份",
+                        format!("保留策略清理失败：{e}"),
+                    );
+                }
             }
         }
 
@@ -7192,6 +7456,22 @@ impl App {
                             ));
                         }
                         self.set_toast(msg);
+                        toollog::tool_log(
+                            toollog::ToolLevel::Info,
+                            "备份",
+                            format!(
+                                "快照创建：{}（{}，原因：{}，变化 {} 个文件、新增 {}）",
+                                self.cfg
+                                    .servers
+                                    .get(i)
+                                    .map(|s| s.name.clone())
+                                    .unwrap_or_default(),
+                                name,
+                                r.reason.label(),
+                                r.copied,
+                                fmt_size(r.bytes)
+                            ),
+                        );
                         // 插件事件：backup_done（成功且有关键数据才触发）
                         if let Some(pm) = self.plugins.as_mut() {
                             let srv_name = self
@@ -7217,6 +7497,18 @@ impl App {
                         }
                     } else {
                         self.set_toast("自动快照检查完成：与上一份无变化，已跳过".to_string());
+                        toollog::tool_log(
+                            toollog::ToolLevel::Info,
+                            "备份",
+                            format!(
+                                "快照检查：{} 与上一份无变化，已跳过",
+                                self.cfg
+                                    .servers
+                                    .get(i)
+                                    .map(|s| s.name.clone())
+                                    .unwrap_or_default()
+                            ),
+                        );
                     }
                     // 每次生成快照后按保留策略自动清理（后台执行；硬链接下删除是安全的）
                     if r.changed {
@@ -7226,6 +7518,18 @@ impl App {
                 }
                 Err(e) => {
                     self.set_toast(format!("备份失败: {e}"));
+                    toollog::tool_log(
+                        toollog::ToolLevel::Error,
+                        "备份",
+                        format!(
+                            "备份失败：{}（{e}）",
+                            self.cfg
+                                .servers
+                                .get(i)
+                                .map(|s| s.name.clone())
+                                .unwrap_or_default()
+                        ),
+                    );
                 }
             }
         }
@@ -7686,6 +7990,11 @@ impl App {
             }
             if self.spawn_backup(idx, backup::BackupReason::Stop, false) {
                 self.exit_snapshot_inflight.insert(idx);
+                toollog::tool_log(
+                    toollog::ToolLevel::Info,
+                    "备份",
+                    format!("关服快照排队：{}（原因：正常关服）", sc.name),
+                );
             }
         } else if sc.backup.backup_on_crash {
             if !self.auto_snapshot_allowed(idx) {
@@ -7693,6 +8002,11 @@ impl App {
             }
             if self.spawn_backup(idx, backup::BackupReason::Auto, false) {
                 self.exit_snapshot_inflight.insert(idx);
+                toollog::tool_log(
+                    toollog::ToolLevel::Warn,
+                    "备份",
+                    format!("崩溃快照排队：{}（原因：异常退出）", sc.name),
+                );
             }
         }
     }
@@ -9558,6 +9872,11 @@ fn load_config(path: &Path) -> GlobalConfig {
                                 let _ = std::fs::create_dir_all(data_dir);
                                 let _ = std::fs::write(path, json);
                             }
+                            toollog::tool_log(
+                                toollog::ToolLevel::Info,
+                                "配置",
+                                format!("配置迁移：从旧位置 {} 读入并写入 data 目录", old.display()),
+                            );
                             return cfg;
                         }
                     }
@@ -9580,27 +9899,48 @@ fn load_config(path: &Path) -> GlobalConfig {
                     if let Ok(bs) = std::fs::read_to_string(&bak) {
                         if let Ok(c) = serde_json::from_str::<GlobalConfig>(&bs) {
                             eprintln!("配置解析失败（{e}），已从 .bak 恢复；坏文件存为 {}", bak_bad.display());
+                            toollog::tool_log(
+                                toollog::ToolLevel::Error,
+                                "配置",
+                                format!(
+                                    "配置损坏：解析失败（{e}），坏文件留档 {}，已从 .bak 恢复",
+                                    bak_bad.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+                                ),
+                            );
                             return c;
                         }
                     }
                     eprintln!("配置解析失败（{e}），坏文件存为 {}，本次用默认配置", bak_bad.display());
+                    toollog::tool_log(
+                        toollog::ToolLevel::Error,
+                        "配置",
+                        format!(
+                            "配置损坏：解析失败（{e}），坏文件留档 {}，本次使用默认配置",
+                            bak_bad.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+                        ),
+                    );
                     GlobalConfig::default()
                 }
             },
             Err(_) => GlobalConfig::default(),
         }
     };
+    // 本次启动做过的配置迁移（末尾汇总成一条工具日志）
+    let mut migrated: Vec<&str> = Vec::new();
     // 旧配置兼容：跟随系统/自动化配色已移除，历史 theme_mode="auto" 一律迁移为夜间。
     if cfg.theme_mode == "auto" {
         cfg.theme_mode = "dark".to_string();
+        migrated.push("配色 auto→dark");
     }
     // 旧配置兼容：自定义配色升级为独立第三模式（theme_mode="custom"），
     // 历史 custom_colors=true（覆盖开关）迁移为新模式，避免旧自定义配色丢失。
     if cfg.custom_colors && cfg.theme_mode != "custom" {
         cfg.theme_mode = "custom".to_string();
+        migrated.push("自定义配色→custom 模式");
     }
     // Bug5：启动时修复历史脏配置（GBK 字节被按 UTF-8 读出的乱码隧道名/备注），并回写磁盘
     if config::repair_cfg_mojibake(&mut cfg) {
+        migrated.push("修复乱码隧道名/备注");
         if let Ok(json) = serde_json::to_string_pretty(&cfg) {
             if let Some(data_dir) = path.parent() {
                 let _ = std::fs::create_dir_all(data_dir);
@@ -9613,6 +9953,7 @@ fn load_config(path: &Path) -> GlobalConfig {
     // <0.35 一律视为被误钳制的脏值，抬到新默认 0.5 并回写磁盘；用户显式调高的值保留。
     if cfg.bg_content_scrim < 0.35 {
         cfg.bg_content_scrim = 0.5;
+        migrated.push("内容衬底脏值→0.5");
         if let Ok(json) = serde_json::to_string_pretty(&cfg) {
             if let Some(data_dir) = path.parent() {
                 let _ = std::fs::create_dir_all(data_dir);
@@ -9623,6 +9964,7 @@ fn load_config(path: &Path) -> GlobalConfig {
     // 崩溃熔断参数收敛：历史上默认「5 次 / 等待 10 秒 / 窗口 10 分钟」，
     // 故障循环里会把服务器反复拉起很久；有改动时原子回写磁盘（临时文件 → 替换）。
     if migrate_crash_restart_defaults(&mut cfg) {
+        migrated.push("崩溃熔断旧默认值收敛");
         if let Ok(json) = serde_json::to_string_pretty(&cfg) {
             if let Some(data_dir) = path.parent() {
                 let _ = std::fs::create_dir_all(data_dir);
@@ -9637,6 +9979,7 @@ fn load_config(path: &Path) -> GlobalConfig {
     //（JNA/SQLite 把原生 DLL 解压进去），它不在排除表里会让快照变化数与占用虚高。
     // 空表先用默认值填满（与 backup::default_excludes 一致），再补齐 tmp；不覆盖用户自定义项、不改顺序。
     if migrate_backup_exclude_tmp(&mut cfg) {
+        migrated.push("备份排除表补齐默认项");
         if let Ok(json) = serde_json::to_string_pretty(&cfg) {
             if let Some(data_dir) = path.parent() {
                 let _ = std::fs::create_dir_all(data_dir);
@@ -9646,6 +9989,13 @@ fn load_config(path: &Path) -> GlobalConfig {
                 let _ = std::fs::rename(&tmp, path);
             }
         }
+    }
+    if !migrated.is_empty() {
+        toollog::tool_log(
+            toollog::ToolLevel::Info,
+            "配置",
+            format!("配置迁移：{}", migrated.join("、")),
+        );
     }
     cfg
 }
@@ -22366,6 +22716,11 @@ impl App {
         let cctx = self.egui_ctx.clone();
         let kind_label = kind.label().to_string();
         self.notify("开始下载服务端", &format!("{kind_label} {version}"));
+        toollog::tool_log(
+            toollog::ToolLevel::Info,
+            "下载",
+            format!("下载开始：{file_name}（{kind_label} {version}）"),
+        );
         std::thread::spawn(move || {
             let client = download::new_client();
             let res = download::download_file_parallel(&client, &url, &dest, 0, &mut |d, t, ph| {
@@ -22435,6 +22790,7 @@ impl App {
         let mut sc = ServerConfig::default();
         sc.name = folder.clone();
         sc.dir = dir;
+        let dir_text = sc.dir.display().to_string();
         sc.mc_version = Some(mc_ver.clone());
         sc.launch_cmd = if matches!(kind, server_download::ServerKind::Forge | server_download::ServerKind::NeoForge) {
             format!("{{java}} {{jvm}} -jar {jar_name} --installServer")
@@ -22451,6 +22807,11 @@ impl App {
         self.runtimes.push(ServerRuntime::default());
         self.selected_server = Some(self.cfg.servers.len() - 1);
         self.save_config();
+        toollog::tool_log(
+            toollog::ToolLevel::Info,
+            "下载",
+            format!("下载完成：{jar_name}（服务端已创建到 {dir_text}）"),
+        );
         if let Some(cs) = self.create_server.as_mut() {
             cs.finished = true;
             cs.downloading = false;
