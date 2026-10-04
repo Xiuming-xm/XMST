@@ -2276,20 +2276,14 @@ struct App {
     cfg_dirty: bool,
     /// 去抖到期时间点
     cfg_save_at: Option<std::time::Instant>,
-    /// 日志页缓存：时间戳/条数/行（避免每帧查 SQLite）
-    log_cache_at: Option<std::time::Instant>,
-    log_cache_count: i64,
-    log_cache_rows: Vec<logdb::LogRow>,
     /// 日志页：搜索关键字
     log_query: String,
     /// 日志页：级别筛选（全部/信息/警告/错误）
     log_level: String,
-    /// 日志页：来源筛选（全部 / 服务器名 / 隧道:名）
+    /// 日志页：类别筛选（全部 / 服务器 / 备份 / 隧道 …）
     log_src: String,
-    /// 日志页：是否跟随最新
+    /// 日志页：是否自动跟随最新
     log_follow: bool,
-    /// 日志页：行高（1.0 紧凑 / 1.6 舒适）
-    log_row_h: f32,
     /// 「日志」页（工具运行日志）过滤结果缓存：只在日志版本或过滤条件变化时重算，
     /// 渲染路径不遍历内存缓冲，也不读文件
     tool_log_rev: u64,
@@ -2314,6 +2308,12 @@ struct App {
     low_il_notice: Option<String>,
     /// 上面提示里给出的修复命令（供「复制修复命令」按钮使用）
     low_il_fix_cmd: String,
+    /// 服务器目录完整性自检的待展示提示：(文案, 修复命令)。与 exe 目录的提示共用同一个窗口逐条展示
+    low_il_pending: Vec<(String, String)>,
+    /// 服务器目录完整性自检：本次运行已提示过的服务器（名称+目录，小写）——每台服务器只提示一次
+    server_il_notified: HashSet<String>,
+    /// 服务器目录完整性自检是否已在启动后跑过（只跑一次，不每帧扫盘）
+    server_il_checked: bool,
     /// 启动诊断（「🧪 启动诊断」）是否正在后台执行
     launch_diag_busy: bool,
     /// 启动诊断结果文本（Some 时显示可滚动小窗口）
@@ -2523,6 +2523,9 @@ struct App {
     open_page_left: u32,
     /// 已发出关闭命令后的等待帧数（关闭被二次确认拦住时的兜底强退计数）
     open_page_wait: u32,
+    /// 无头（无人值守）回归模式：XMST_OPEN_PAGE / XMST_CRASHSCAN / XMST_OPEN_TEST 激活时为 true。
+    /// 该模式下无人可点确认弹窗，用户确认类弹窗一律按「不阻塞退出」处理（见 handle_close_request）
+    headless: bool,
     // ---------- 外部实例接管 / 诊断包 / 一次性后台任务 ----------
     /// 外部实例扫描节流时刻（每次扫描要枚举进程 + 读命令行，不能每帧做）
     external_scan_at: Option<std::time::Instant>,
@@ -3196,6 +3199,15 @@ impl App {
         // 工具运行日志：先建立落盘文件与内存缓冲（早于配置加载，
         // 配置损坏/迁移这类事件才能被记上；文件尾部只在这一次读取）
         toollog::init(&exe_dir.join("data"));
+        toollog::tool_log(
+            toollog::ToolLevel::Info,
+            "启动",
+            format!(
+                "XMST {} 启动（数据目录 {}）",
+                env!("CARGO_PKG_VERSION"),
+                exe_dir.join("data").display()
+            ),
+        );
         let mut cfg = load_config(&config_path);
         let nav_collapsed_init = cfg.nav_collapsed;
         // 老配置兼容：admin_port 缺失时统一为 7400，重新编号避免端口冲突
@@ -3316,16 +3328,12 @@ impl App {
             tray_cleanup_done: false,
             crash_report: None,
             glossary_query: String::new(),
-            log_cache_at: None,
-            log_cache_count: 0,
-            log_cache_rows: Vec::new(),
             cfg_dirty: false,
             cfg_save_at: None,
             log_query: String::new(),
             log_level: "全部".to_string(),
             log_src: "全部".to_string(),
             log_follow: true,
-            log_row_h: 1.0,
             tool_log_rev: u64::MAX,
             tool_log_filter_key: (String::new(), String::new(), String::new()),
             tool_log_rows: Vec::new(),
@@ -3336,6 +3344,9 @@ impl App {
             tray_tick_at: None,
             low_il_notice: None,
             low_il_fix_cmd: String::new(),
+            low_il_pending: Vec::new(),
+            server_il_notified: HashSet::new(),
+            server_il_checked: false,
             launch_diag_busy: false,
             launch_diag_text: None,
             tray_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -3373,6 +3384,7 @@ impl App {
             open_page: None,
             open_page_left: 0,
             open_page_wait: 0,
+            headless: headless_diag_env(),
             external_scan_at: None,
             confirm_kill_external: None,
             confirm_start_external: None,
@@ -3498,15 +3510,6 @@ impl App {
         app.detect_startup_leftovers();
         // 自动化入口：XMST_OPEN_PAGE=<页面> → 启动即切到该页（在首帧渲染前完成）
         app.apply_open_page_env();
-        toollog::tool_log(
-            toollog::ToolLevel::Info,
-            "启动",
-            format!(
-                "XMST {} 启动（数据目录 {}）",
-                env!("CARGO_PKG_VERSION"),
-                app.data_dir().display()
-            ),
-        );
         app
     }
 
@@ -3593,6 +3596,8 @@ impl App {
     /// `XMST_OPEN_PAGE` 的帧计数与退出（见 `apply_open_page_env`）。
     ///
     /// 计数期间主动请求重绘：没有输入也要持续出帧，帧数才可预期地走完。
+    /// 退出走 `ViewportCommand::Close`；无头模式下 `handle_close_request` 不再拦关闭，
+    /// 因此正常情况下一两帧内就退出，下面的兜底只防"还有别的层拦住关闭"。
     fn tick_open_page(&mut self, ctx: &egui::Context) {
         if self.open_page.is_none() {
             return;
@@ -3606,13 +3611,21 @@ impl App {
             let page = self.open_page.clone().unwrap_or_default();
             // 退出路径会跳过配置去抖，这里先落盘，避免诊断运行把改动丢掉
             self.flush_config();
+            toollog::tool_log(
+                toollog::ToolLevel::Info,
+                "诊断",
+                format!("无头回归完成：{page}"),
+            );
             eprintln!("XMST_OPEN_PAGE done: {page}（未崩溃）");
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         self.open_page_wait = self.open_page_wait.saturating_add(1);
         ctx.request_repaint();
-        // 兜底：有服务器在运行时关闭会被二次确认拦住，最多再等 300 帧直接退出
-        if self.open_page_wait > 300 {
+        // 兜底：关闭命令被任何一层拦住时最多再等 60 帧直接退出。
+        // 退出前再落一次盘（幂等：没有改动就直接返回）；`std::process::exit` 不会
+        // 结束已在运行的服务器进程（Job 未设 KILL_ON_JOB_CLOSE，也不会走退出清理）。
+        if self.open_page_wait > 60 {
+            self.flush_config();
             std::process::exit(0);
         }
     }
@@ -4028,6 +4041,9 @@ impl App {
             }
             return;
         }
+        // 服务器目录完整性自检（§9.1：Low 标签会让 java 连 logs\latest.log 都写不出来）：
+        // 只提示一次、不阻断启动，用户看完提示可以自己决定继续。
+        self.check_server_integrity_before_start(idx);
         // 启动方式（每服务器设置）：
         //   auto（默认）——优先 run.bat，run.bat 启动失败时自动改用直连 java；
         //   bat        ——只用 run.bat，失败就报错，不回退；
@@ -4967,6 +4983,92 @@ impl App {
         self.low_il_notice = Some(lines.join("\n"));
     }
 
+    /// 启动后一次性的**服务器目录**完整性自检（只跑一次，不每帧扫盘）。
+    ///
+    /// 服务器目录带 Low 标签时，目录里的 java.exe 也以 Low IL 运行，连 `logs\latest.log`
+    /// 都写不出来（表现为"连日志都没有、退出码 1、stderr 为空"，而同一份 run.bat 在
+    /// PowerShell 里能正常启动，见 AGENTS.md §9.1）。逐台检查并把结论写进工具日志，
+    /// 命中 Low 时登记一条提示（每个目录本次运行只提示一次）。
+    fn check_server_dirs_integrity(&mut self) {
+        if self.server_il_checked {
+            return;
+        }
+        self.server_il_checked = true;
+        let servers = self.cfg.servers.clone();
+        for sc in &servers {
+            for (dir, rid) in server_integrity_scan(sc) {
+                if rid == Some(winapi::um::winnt::SECURITY_MANDATORY_LOW_RID) {
+                    continue; // Low 由 queue_server_il_notice 统一写错误级日志
+                }
+                toollog::tool_log(
+                    toollog::ToolLevel::Info,
+                    "诊断",
+                    format!(
+                        "服务器目录完整性自检：{} 目录={} level={}",
+                        sc.name,
+                        dir.display(),
+                        integrity_level_text(rid)
+                    ),
+                );
+            }
+            self.queue_server_il_notice(sc);
+        }
+    }
+
+    /// 用户点「▶ 启动服务器」时按同一套检查复核一次：是 Low 就提示一次（不阻断启动）。
+    fn check_server_integrity_before_start(&mut self, idx: usize) {
+        let Some(sc) = self.cfg.servers.get(idx).cloned() else {
+            return;
+        };
+        self.queue_server_il_notice(&sc);
+    }
+
+    /// 登记一台服务器的「目录完整性级别为 Low」提示：错误级工具日志 + 入队。
+    /// 每台服务器本次运行只提示一次（同一台的低完整性目录合并进同一条提示）。
+    fn queue_server_il_notice(&mut self, sc: &ServerConfig) {
+        let lows: Vec<PathBuf> = server_integrity_scan(sc)
+            .into_iter()
+            .filter(|(_, rid)| *rid == Some(winapi::um::winnt::SECURITY_MANDATORY_LOW_RID))
+            .map(|(d, _)| d)
+            .collect();
+        if lows.is_empty() {
+            return;
+        }
+        let key = format!("{}\u{1}{}", sc.name, sc.dir.to_string_lossy()).to_lowercase();
+        if !self.server_il_notified.insert(key) {
+            return;
+        }
+        let dirs_text = lows
+            .iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<String>>()
+            .join("；");
+        let cmds: Vec<String> = lows
+            .iter()
+            .map(|d| format!("icacls \"{}\" /setintegritylevel M /T /C", d.display()))
+            .collect();
+        toollog::tool_log(
+            toollog::ToolLevel::Error,
+            "诊断",
+            format!(
+                "服务器目录完整性自检：{} level=Low（服务器可能无法写入 logs 等目录）目录={dirs_text}",
+                sc.name
+            ),
+        );
+        let cmd = cmds.join("\r\n");
+        let mut lines: Vec<String> = Vec::new();
+        lines.push("服务器目录的完整性级别为 Low，服务器可能无法写入 logs 等目录。".to_string());
+        lines.push(String::new());
+        lines.push(format!("目录：{dirs_text}"));
+        lines.push(String::new());
+        lines.push("请用管理员身份打开命令提示符，执行下面的命令：".to_string());
+        lines.push(String::new());
+        lines.push(cmd.clone());
+        lines.push(String::new());
+        lines.push("改完必须重启本程序才会生效。".to_string());
+        self.low_il_pending.push((lines.join("\n"), cmd));
+    }
+
     /// 完整性自检诊断留痕：追加一行到 `data\integrity_check.log`（超过 64KB 只保留最后 100 行）。
     fn integrity_log(&self, line: &str) {
         use std::io::Write;
@@ -5003,14 +5105,20 @@ impl App {
     }
 
     /// 低完整性（Low IL）提示窗：只弹一次，点「我知道了」或右上角关闭后本次运行不再出现。
+    /// 服务器目录的提示与 exe 目录的提示共用这一个窗口，队列里还有就接着弹下一条。
     fn ui_low_il_notice(&mut self, ctx: &egui::Context) {
+        if self.low_il_notice.is_none() && !self.low_il_pending.is_empty() {
+            let (text, cmd) = self.low_il_pending.remove(0);
+            self.low_il_notice = Some(text);
+            self.low_il_fix_cmd = cmd;
+        }
         let Some(text) = self.low_il_notice.clone() else {
             return;
         };
         let cmd = self.low_il_fix_cmd.clone();
         let mut open = true;
         let mut dismiss = false;
-        egui::Window::new("运行完整性级别偏低（Low IL）")
+        egui::Window::new("完整性级别偏低（Low IL）")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
@@ -6079,7 +6187,7 @@ impl App {
                             toollog::tool_log(
                                 toollog::ToolLevel::Info,
                                 "备份",
-                                format!("快照锁定：{dir_name}（实化 {n} 个文件）"),
+                                format!("快照锁定/解锁完成：{dir_name}（实化 {n} 个文件）"),
                             );
                         }
                         Err(e) => {
@@ -6493,6 +6601,15 @@ impl App {
         } else {
             format!("正在解锁快照 {dir_name}…")
         });
+        toollog::tool_log(
+            toollog::ToolLevel::Info,
+            "备份",
+            if pin {
+                format!("快照锁定开始：{dir_name}")
+            } else {
+                format!("快照解锁开始：{dir_name}")
+            },
+        );
         let tx = self.bg_tx.clone();
         let name_for_msg = dir_name.clone();
         std::thread::spawn(move || {
@@ -6717,6 +6834,14 @@ impl App {
     fn handle_close_request(&mut self, ctx: &egui::Context) -> bool {
         // 关闭前把去抖中的配置立刻落盘（避免丢改动）
         self.flush_config();
+        // 无头回归（XMST_OPEN_PAGE 等）：没有人能点确认弹窗，确认类弹窗直接按
+        // 「不阻塞退出」处理 —— 关闭确认不询问、也不按"最小化到托盘"拦住关闭。
+        // 这里刻意提前返回，绕过下面 ctx_close_pending 分支里的
+        // kill_all_children_on_exit()：无头回归只渲染页面，不该顺带结束
+        // 正在运行的服务器（本工具拉起的或已接管的都不会受影响）。
+        if self.headless {
+            return true;
+        }
         // 已确认退出且全部服务器已停止：放行
         if self.ctx_close_pending {
             // 退出程序即终止崩溃重启循环：此时可能还有服务器是"崩溃后待重启"状态
@@ -6724,6 +6849,11 @@ impl App {
             self.clear_all_pending_crash_restarts();
             // 优雅退出：显式结束本工具拉起的所有子进程（Job 已不再 kill-on-close）
             self.kill_all_children_on_exit();
+            toollog::tool_log(
+                toollog::ToolLevel::Info,
+                "启动",
+                format!("XMST {} 退出", env!("CARGO_PKG_VERSION")),
+            );
             return true;
         }
         // 已确认退出但仍有服务器在停止中：继续等待
@@ -6793,6 +6923,11 @@ impl App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                 return false;
             }
+            toollog::tool_log(
+                toollog::ToolLevel::Info,
+                "启动",
+                format!("XMST {} 退出", env!("CARGO_PKG_VERSION")),
+            );
             return true;
         }
         // 有服务器运行：按配置处理
@@ -7210,7 +7345,64 @@ impl App {
     }
     for (idx, rt) in self.tunnel_runtimes.iter_mut().enumerate() {
         if let Some(p) = &rt.proc {
+            let old_len_t = rt.log_buf.len();
             let added_t = process::drain_logs(p, &mut rt.log_buf, 2000);
+            // 隧道自身的连接结果只在这里出现（frpc/rathole 的 stdout）：
+            // 抓到关键词就记一条工具日志，方便在「日志」页看穿透通没通
+            if added_t > 0 {
+                let tname = self
+                    .cfg
+                    .tunnels
+                    .get(idx)
+                    .map(|t| t.name.clone())
+                    .unwrap_or_default();
+                let mut joined = false;
+                let mut broken = false;
+                let mut dropped = false;
+                for line in safe_from(&rt.log_buf, old_len_t).lines() {
+                    if line.contains("login to server success")
+                        || line.contains("start proxy success")
+                        || line.contains("Connected to server")
+                        || line.contains("connected to remote")
+                    {
+                        joined = true;
+                    }
+                    if line.contains("login to server failed")
+                        || line.contains("connect error")
+                        || line.contains("connection refused")
+                        || line.contains("连接失败")
+                    {
+                        broken = true;
+                    }
+                    if line.contains("connection closed")
+                        || line.contains("disconnected")
+                        || line.contains("连接断开")
+                    {
+                        dropped = true;
+                    }
+                }
+                if joined {
+                    toollog::tool_log(
+                        toollog::ToolLevel::Info,
+                        "隧道",
+                        format!("连接成功：{tname}"),
+                    );
+                }
+                if broken {
+                    toollog::tool_log(
+                        toollog::ToolLevel::Error,
+                        "隧道",
+                        format!("连接失败：{tname}"),
+                    );
+                }
+                if dropped {
+                    toollog::tool_log(
+                        toollog::ToolLevel::Warn,
+                        "隧道",
+                        format!("连接断开：{tname}"),
+                    );
+                }
+            }
             // 阶段C：隧道日志落库 SQLite（来源标记为「隧道:名称」）
             if added_t > 0 {
                 if let Some(db) = self.logdb.as_mut() {
@@ -7241,6 +7433,11 @@ impl App {
                     .unwrap_or_else(|| "?".to_string());
                 let name = self.cfg.tunnels.get(idx).map(|t| t.name.clone()).unwrap_or_default();
                 notify_queue.push(("XMST - 内网穿透异常退出".to_string(), format!("{name} 进程已退出（code {code}）")));
+                toollog::tool_log(
+                    toollog::ToolLevel::Error,
+                    "隧道",
+                    format!("隧道异常退出：{name}（退出码 {code}）"),
+                );
                 rt.proc = None;
             }
         }
@@ -7816,6 +8013,18 @@ impl App {
         self.restore_inflight.insert(idx);
         self.backup_cache = None;
         self.backup_stats_cache = None;
+        toollog::tool_log(
+            toollog::ToolLevel::Warn,
+            "备份",
+            format!(
+                "回退开始：{}（恢复到 {}）",
+                server_name,
+                target
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            ),
+        );
         let tx = self.restore_tx.clone();
         std::thread::spawn(move || {
             backup::set_thread_low_priority();
@@ -7981,6 +8190,8 @@ impl App {
         // 三重信号取或：正常停止流程 / 日志出现关服标志 / 退出码为 0；但存在新崩溃报告即视为异常
         let normal = !new_crash_report
             && (graceful || backup::looks_normal_shutdown(log_tail, exit_code, false));
+        // 服务器名先取出：后面要调用 &mut self（spawn_backup），不能再借用 sc
+        let sname = sc.name.clone();
         if normal {
             if !sc.backup.backup_on_stop {
                 return;
@@ -7993,7 +8204,7 @@ impl App {
                 toollog::tool_log(
                     toollog::ToolLevel::Info,
                     "备份",
-                    format!("关服快照排队：{}（原因：正常关服）", sc.name),
+                    format!("关服快照排队：{sname}（原因：正常关服）"),
                 );
             }
         } else if sc.backup.backup_on_crash {
@@ -8005,7 +8216,7 @@ impl App {
                 toollog::tool_log(
                     toollog::ToolLevel::Warn,
                     "备份",
-                    format!("崩溃快照排队：{}（原因：异常退出）", sc.name),
+                    format!("崩溃快照排队：{sname}（原因：异常退出）"),
                 );
             }
         }
@@ -8192,6 +8403,11 @@ impl App {
             if t.cfg.trim().is_empty() {
                 rt.log_buf.push_str("错误: 未填写完整的 frpc.toml 内容，请在该隧道的「配置」里粘贴完整 TOML。\n");
                 self.notify("XMST - 隧道启动失败", &format!("{} 未填写完整的 frpc.toml 配置", t.name));
+                toollog::tool_log(
+                    toollog::ToolLevel::Error,
+                    "隧道",
+                    format!("frp 启动失败：{}（未填写完整 frpc.toml）", t.name),
+                );
                 return;
             }
             // frpc.exe：优先使用隧道填写的 exe；留空则用共�?data/frp/frpc.exe
@@ -8199,6 +8415,11 @@ impl App {
                 if !frp_dir.join("frpc.exe").exists() {
                     rt.log_buf.push_str("错误: 未找到 frpc.exe，请先在 Frp 页下载或导入。\n");
                     self.notify("XMST - 隧道启动失败", &format!("{} 未找到 frpc.exe，请先在仪表盘下载或导入", t.name));
+                    toollog::tool_log(
+                        toollog::ToolLevel::Error,
+                        "隧道",
+                        format!("frp 启动失败：{}（未找到 frpc.exe）", t.name),
+                    );
                     return;
                 }
                 frp_dir.join("frpc.exe")
@@ -8229,6 +8450,11 @@ impl App {
             if let Err(e) = std::fs::write(&cfg_path, write_cfg.as_bytes()) {
                 rt.log_buf.push_str(&format!("写入 frpc.toml 失败: {e}\n"));
                 self.notify("XMST - 隧道启动失败", &format!("{} 写入 frpc.toml 失败: {e}", t.name));
+                toollog::tool_log(
+                    toollog::ToolLevel::Error,
+                    "隧道",
+                    format!("frp 启动失败：{}（写入 frpc.toml 失败：{e}）", t.name),
+                );
                 return;
             }
             let r = process::spawn_hidden(
@@ -8244,10 +8470,20 @@ impl App {
                     rt.stopping = false;
                     let name = self.cfg.tunnels[idx].name.clone();
                     self.notify("XMST - Frp 穿透已启动", &format!("{name} 已启动（独立 frpc 进程）"));
+                    toollog::tool_log(
+                        toollog::ToolLevel::Info,
+                        "隧道",
+                        format!("frp 启动：{name}"),
+                    );
                 }
                 Err(e) => {
                     rt.log_buf.push_str(&format!("启动失败: {e}\n"));
                     self.notify("XMST - 隧道启动失败", &format!("{} 启动失败: {e}", t.name));
+                    toollog::tool_log(
+                        toollog::ToolLevel::Error,
+                        "隧道",
+                        format!("frp 启动失败：{}（{e}）", t.name),
+                    );
                 }
             }
         } else if t.kind == "rathole" {
@@ -8257,6 +8493,11 @@ impl App {
                 rt.log_buf
                     .push_str("错误: 未找到 rathole.exe，正在自动下载官方客户端…\n");
                 self.notify("XMST - 隧道启动失败", &format!("{} 未找到 rathole.exe，正在自动下载…", t.name));
+                toollog::tool_log(
+                    toollog::ToolLevel::Warn,
+                    "隧道",
+                    format!("rathole 启动中止：{}（缺少 rathole.exe，已开始自动下载）", t.name),
+                );
                 self.download_rathole();
                 return;
             }
@@ -8283,15 +8524,30 @@ impl App {
                     rt.stopping = false;
                     let name = self.cfg.tunnels[idx].name.clone();
                     self.notify("XMST - Rathole 穿透已启动", &format!("{name} 已启动（rathole 客户端进程）"));
+                    toollog::tool_log(
+                        toollog::ToolLevel::Info,
+                        "隧道",
+                        format!("rathole 启动：{name}"),
+                    );
                 }
                 Err(e) => {
                     rt.log_buf.push_str(&format!("启动失败: {e}\n"));
                     self.notify("XMST - 隧道启动失败", &format!("{} 启动失败: {e}", t.name));
+                    toollog::tool_log(
+                        toollog::ToolLevel::Error,
+                        "隧道",
+                        format!("rathole 启动失败：{}（{e}）", t.name),
+                    );
                 }
             }
         } else {
             rt.log_buf
                 .push_str("错误: 该隧道类型已不再支持（NPS 功能已移除），请删除后重建为 Frp 或 Rathole 隧道。\n");
+            toollog::tool_log(
+                toollog::ToolLevel::Error,
+                "隧道",
+                format!("启动失败：{}（隧道类型已不再支持）", t.name),
+            );
         }
     }
 
@@ -8314,6 +8570,11 @@ impl App {
                     })
                     .unwrap_or_default();
                 self.notify("XMST - 穿透已停止", &format!("{name} 已停止"));
+                toollog::tool_log(
+                    toollog::ToolLevel::Info,
+                    "隧道",
+                    format!("隧道停止：{name}"),
+                );
             }
         }
     }
@@ -8526,6 +8787,18 @@ impl App {
                 Ok(()) => {
                     self.remote_pending.remove(&srv);
                     self.set_toast("远端备份转存完成".to_string());
+                    toollog::tool_log(
+                        toollog::ToolLevel::Info,
+                        "备份",
+                        format!(
+                            "远端转存完成：{}",
+                            self.cfg
+                                .servers
+                                .get(srv)
+                                .map(|s| s.name.clone())
+                                .unwrap_or_default()
+                        ),
+                    );
                 }
                 Err(e) => {
                     // 失败：登记重试（最多 remote_retry 次），后续 tick_backup 到期重试
@@ -8549,9 +8822,19 @@ impl App {
                         self.remote_pending
                             .insert(srv, (path, remaining - 1));
                         self.set_toast(format!("远端备份转存失败（将自动重试 {left} 次）: {e}", left = remaining - 1));
+                        toollog::tool_log(
+                            toollog::ToolLevel::Warn,
+                            "备份",
+                            format!("远端转存失败（将重试 {} 次）：{e}", remaining - 1),
+                        );
                     } else {
                         self.remote_pending.remove(&srv);
                         self.set_toast(format!("远端备份转存失败（已放弃）: {e}"));
+                        toollog::tool_log(
+                            toollog::ToolLevel::Error,
+                            "备份",
+                            format!("远端转存失败（已放弃）：{e}"),
+                        );
                     }
                 }
             }
@@ -8819,9 +9102,19 @@ impl App {
                 Ok(mp) => {
                     self.frp_proc = Some(mp);
                     self.frp_log.push_str("frpc 已启动（单进程，frpc.toml 集中管理所有隧道）。\n");
+                    toollog::tool_log(
+                        toollog::ToolLevel::Info,
+                        "隧道",
+                        "frpc 集中进程启动（frpc.toml 管理所有 frp 隧道）",
+                    );
                 }
                 Err(e) => {
                     self.frp_log.push_str(&format!("frpc 启动失败: {e}\n"));
+                    toollog::tool_log(
+                        toollog::ToolLevel::Error,
+                        "隧道",
+                        format!("frpc 集中进程启动失败：{e}"),
+                    );
                 }
             }
         }
@@ -11574,6 +11867,152 @@ fn current_integrity_rid() -> Option<u32> {
     }
 }
 
+/// 完整性级别 RID → 文本（与 `check_integrity_level` 的取值保持一致）
+fn integrity_level_text(rid: Option<u32>) -> &'static str {
+    match rid {
+        Some(r) if r == winapi::um::winnt::SECURITY_MANDATORY_LOW_RID => "Low",
+        Some(r) if r == winapi::um::winnt::SECURITY_MANDATORY_MEDIUM_RID => "Medium",
+        Some(_) => "High/System",
+        None => "未知",
+    }
+}
+
+/// 读取**指定路径**（文件或目录）自身的完整性级别 RID。
+///
+/// 与 `current_integrity_rid`（当前进程令牌）的区别：这个读的是对象 SACL 里的强制完整性标签。
+/// 进程的完整性级别取自**可执行文件自身的标签**：服务器目录带 Low 标签时，目录里的 java.exe
+/// 也以 Low IL 运行，连 `logs\latest.log` 都写不出来（见 AGENTS.md §9.1）。
+/// 返回 None = 读不到（无标签 / 无权限 / API 失败），调用方按「未知」处理。
+fn path_integrity_rid(path: &Path) -> Option<u32> {
+    use std::os::windows::ffi::OsStrExt;
+    use winapi::shared::minwindef::DWORD;
+    use winapi::um::securitybaseapi::{
+        GetFileSecurityW, GetSecurityDescriptorSacl, GetSidSubAuthority, GetSidSubAuthorityCount,
+    };
+    use winapi::um::winnt::{
+        ACL, LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SYSTEM_MANDATORY_LABEL_ACE,
+        SYSTEM_MANDATORY_LABEL_ACE_TYPE,
+    };
+    let name: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // 第一次调用只问「需要多大缓冲区」（预期失败并回填长度）
+    let mut need: DWORD = 0;
+    unsafe {
+        GetFileSecurityW(
+            name.as_ptr(),
+            LABEL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            0,
+            &mut need,
+        );
+    }
+    if need == 0 {
+        return None;
+    }
+    // 缓冲区用 u64 数组：安全描述符与 ACE 里的 SID 都需要指针对齐
+    let mut buf = vec![0u64; (need as usize / 8) + 2];
+    let buf_bytes = buf.len() * 8;
+    let mut got: DWORD = 0;
+    let ok = unsafe {
+        GetFileSecurityW(
+            name.as_ptr(),
+            LABEL_SECURITY_INFORMATION,
+            buf.as_mut_ptr() as PSECURITY_DESCRIPTOR,
+            buf_bytes as DWORD,
+            &mut got,
+        )
+    };
+    if ok == 0 || got == 0 {
+        return None;
+    }
+    // 强制完整性标签存放在 SACL 里
+    let mut present: i32 = 0;
+    let mut defaulted: i32 = 0;
+    let mut sacl: *mut ACL = std::ptr::null_mut();
+    let ok = unsafe {
+        GetSecurityDescriptorSacl(
+            buf.as_ptr() as PSECURITY_DESCRIPTOR,
+            &mut present,
+            &mut sacl,
+            &mut defaulted,
+        )
+    };
+    if ok == 0 || present == 0 || sacl.is_null() {
+        return None;
+    }
+    unsafe {
+        // ACL 布局：AclRevision(1) Sbz1(1) AclSize(2) AceCount(2) Sbz2(2) + ACE 数组；
+        // 每个 ACE 头 4 字节（AceType/AceFlags/AceSize），全部偏移都按 AclSize 夹住，越界即放弃
+        let base = sacl as *const u8;
+        let acl_size = *(base.add(2) as *const u16) as usize;
+        let ace_count = *(base.add(4) as *const u16) as usize;
+        let mut off = 8usize;
+        for _ in 0..ace_count {
+            if off + 4 > acl_size {
+                break;
+            }
+            let ace_type = *base.add(off);
+            let ace_size = *(base.add(off + 2) as *const u16) as usize;
+            if ace_size < 8 || off + ace_size > acl_size {
+                break;
+            }
+            if ace_type == SYSTEM_MANDATORY_LABEL_ACE_TYPE {
+                // 标签 ACE：SidStart 就在 ACE_HEADER(4) + Mask(4) 之后，SID 至少 12 字节
+                if ace_size < 20 {
+                    return None;
+                }
+                let ace = base.add(off) as *const SYSTEM_MANDATORY_LABEL_ACE;
+                let sid = std::ptr::addr_of!((*ace).SidStart) as PSID;
+                let count = *GetSidSubAuthorityCount(sid);
+                if count == 0 {
+                    return None;
+                }
+                return Some(*GetSidSubAuthority(sid, (count - 1) as DWORD));
+            }
+            off += ace_size;
+        }
+    }
+    None
+}
+
+/// 无头（无人值守）诊断入口是否激活：这些入口自己会退出，退出路上没有可点按钮的人。
+fn headless_diag_env() -> bool {
+    ["XMST_OPEN_PAGE", "XMST_CRASHSCAN", "XMST_OPEN_TEST"]
+        .iter()
+        .any(|k| std::env::var_os(k).is_some())
+}
+
+/// 一台服务器要参与完整性自检的目录：服务器目录本身 + 自带的 Java 运行时目录。
+///
+/// 运行时目录只按「**直接**子目录里有 `bin\java.exe`」判定（`Java21` / `jre` / `jdk-21` 这类都能命中），
+/// 不递归遍历整棵树：子对象默认继承父目录的标签，查目录自身就够了。
+fn server_integrity_dirs(sc: &ServerConfig) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = vec![sc.dir.clone()];
+    if let Ok(entries) = std::fs::read_dir(&sc.dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() && p.join("bin").join("java.exe").is_file() {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// 逐目录读完整性级别：(目录, RID)。RID = None 表示读不到（按未知处理）。
+fn server_integrity_scan(sc: &ServerConfig) -> Vec<(PathBuf, Option<u32>)> {
+    server_integrity_dirs(sc)
+        .into_iter()
+        .map(|d| {
+            let rid = path_integrity_rid(&d);
+            (d, rid)
+        })
+        .collect()
+}
+
 /// 运行 powershell 命令并返回退出码（None=启动失败/超时）。
 fn powershell_status(ps: &str, timeout_secs: u64) -> Option<i32> {
     use std::os::windows::process::CommandExt;
@@ -12672,6 +13111,8 @@ impl eframe::App for App {
             install_main_wndproc(hwnd);
         }
         self.handle_tray_recreate(ctx);
+        // 启动后一次性的服务器目录完整性自检（见 check_server_dirs_integrity：只跑一次，不每帧）
+        self.check_server_dirs_integrity();
         // P0 阶段0 A1：托盘态不渲染——隐藏时立即返回，不构图、不重建纹理/字体/背景材质。
         // 但隐藏期间仍要按 1s 跑一批自动行为 tick（进程退出检测 / 正常关服快照 / 崩溃与自动重启 /
         // 下载与备份收尾），见下方 tray_hidden_tick —— 那是「关窗去托盘后再停服」能被检测到、
@@ -15400,7 +15841,7 @@ impl App {
             let pre_busy = self.runtimes.get(idx).map(|r| r.precheck_busy).unwrap_or(false);
             if ui
                 .add_enabled(!pre_busy, egui::Button::new("🩺 启动前检查"))
-                .on_hover_text("检查 Java 版本、内存、端口占用、EULA、核心文件、重复模组与缺失前置（不阻断启动）")
+                .on_hover_text("检查 Java 版本、内存、端口占用、EULA、核心文件、目录完整性、重复模组与缺失前置（不阻断启动）")
                 .clicked()
             {
                 self.spawn_precheck(idx);
@@ -21647,15 +22088,40 @@ impl App {
             let _ = pm.reload_all();
             self.plugins = Some(pm);
         }
-        let (toasts, bg) = {
+        let mut plugin_log_seen = self.plugin_log_seen;
+        let (toasts, bg, fresh_plugin_logs) = {
             let Some(pm) = self.plugins.as_mut() else {
                 return;
             };
             pm.tick();
             let toasts = std::mem::take(&mut pm.toasts);
             let bg = pm.bg_request.take();
-            (toasts, bg)
+            // 插件日志新增行：加载/启停/脚本报错转记到工具日志（只在真正新增时才拷贝）
+            let total = pm.log_lines.len();
+            let fresh: Vec<String> = if total > plugin_log_seen {
+                pm.log_lines[plugin_log_seen..].to_vec()
+            } else {
+                Vec::new()
+            };
+            plugin_log_seen = total;
+            (toasts, bg, fresh)
         };
+        self.plugin_log_seen = plugin_log_seen;
+        for line in fresh_plugin_logs {
+            if line.contains("执行出错") || line.contains("加载失败") {
+                toollog::tool_log(
+                    toollog::ToolLevel::Error,
+                    "插件",
+                    format!("脚本报错：{line}"),
+                );
+            } else if line.contains("插件已加载")
+                || line.contains("已启用")
+                || line.contains("已禁用")
+                || line.contains("已卸载")
+            {
+                toollog::tool_log(toollog::ToolLevel::Info, "插件", line);
+            }
+        }
         for (title, body) in toasts {
             self.notify(&title, &body);
         }
@@ -22641,6 +23107,15 @@ impl App {
                 if let Some(e) = &cs.progress.error {
                     cs.last_error = Some(format!("下载失败: {e}"));
                     cs.downloading = false;
+                    toollog::tool_log(
+                        toollog::ToolLevel::Error,
+                        "下载",
+                        if e.contains("校验") {
+                            format!("下载校验失败：服务端 {}（{e}）", cs.selected_version)
+                        } else {
+                            format!("下载失败：服务端 {}（{e}）", cs.selected_version)
+                        },
+                    );
                 } else {
                     self.finish_create_server();
                 }
@@ -22787,6 +23262,9 @@ impl App {
         }
         // eula 自动同意
         let _ = std::fs::write(dir.join("eula.txt"), "eula=true\n");
+        let jar_bytes = std::fs::metadata(dir.join(&jar_name))
+            .map(|m| m.len())
+            .unwrap_or(0);
         let mut sc = ServerConfig::default();
         sc.name = folder.clone();
         sc.dir = dir;
@@ -22810,7 +23288,7 @@ impl App {
         toollog::tool_log(
             toollog::ToolLevel::Info,
             "下载",
-            format!("下载完成：{jar_name}（服务端已创建到 {dir_text}）"),
+            format!("下载完成：{jar_name}（{}，服务端已创建到 {dir_text}）", fmt_size(jar_bytes)),
         );
         if let Some(cs) = self.create_server.as_mut() {
             cs.finished = true;
@@ -23016,6 +23494,26 @@ impl App {
                     toasts.push(msg.clone());
                     dl.dl_log.push(msg);
                     wake = true;
+                    match &dl.custom_progress.error {
+                        Some(e) => toollog::tool_log(
+                            toollog::ToolLevel::Error,
+                            "下载",
+                            if e.contains("校验") {
+                                format!("下载校验失败：{}（{e}）", dl.custom_file_name)
+                            } else {
+                                format!("下载失败：{}（{e}）", dl.custom_file_name)
+                            },
+                        ),
+                        None => toollog::tool_log(
+                            toollog::ToolLevel::Info,
+                            "下载",
+                            format!(
+                                "下载完成：{}（{}）",
+                                dl.custom_file_name,
+                                fmt_size(dl.custom_progress.downloaded)
+                            ),
+                        ),
+                    }
                 } else {
                     dl.custom_shared = Some(shared);
                 }
@@ -23034,6 +23532,26 @@ impl App {
                     toasts.push(msg.clone());
                     dl.dl_log.push(msg.clone());
                     wake = true;
+                    match &dl.mod_dl_progress.error {
+                        Some(e) => toollog::tool_log(
+                            toollog::ToolLevel::Error,
+                            "下载",
+                            if e.contains("校验") {
+                                format!("下载校验失败：{}（{e}）", dl.mod_download_name)
+                            } else {
+                                format!("下载失败：{}（{e}）", dl.mod_download_name)
+                            },
+                        ),
+                        None => toollog::tool_log(
+                            toollog::ToolLevel::Info,
+                            "下载",
+                            format!(
+                                "下载完成：{}（{}）",
+                                dl.mod_download_name,
+                                fmt_size(dl.mod_dl_progress.downloaded)
+                            ),
+                        ),
+                    }
                 } else {
                     dl.mod_dl_shared = Some(shared);
                 }
@@ -23295,6 +23813,12 @@ impl App {
                 "开始自定义下载: {file_name}（线程数 {threads}）"
             ));
         }
+        // 工具运行日志：URL 里的文件名可能很长，只记保存名
+        toollog::tool_log(
+            toollog::ToolLevel::Info,
+            "下载",
+            format!("下载开始：{file_name}（线程数 {}）", threads),
+        );
         let client = download::new_client();
         let dest = std::path::PathBuf::from(&dest_dir).join(&file_name);
         std::thread::spawn(move || {
@@ -23339,6 +23863,11 @@ impl App {
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_default();
             dl.dl_log.push(format!("开始安装模组: {name}"));
+            toollog::tool_log(
+                toollog::ToolLevel::Info,
+                "下载",
+                format!("下载开始：模组 {name}"),
+            );
         }
         let client = download::new_client();
         std::thread::spawn(move || {
@@ -24332,42 +24861,43 @@ impl App {
         }
     }
 
-    /// 工具自身日志页（📜 日志）：日志库浏览 + 过滤 + 相关设置。
+    /// 「日志」页 = **工具自身运行日志**（服务器控制台日志在 服务器 → 日志；穿透日志在隧道页）。
     ///
-    /// 这是 **XMST 工具自己的运行日志**（服务器输出也汇总进同一个库，以来源标记区分），
-    /// 因此不按服务器拆页签，筛选靠「来源」下拉完成。原「设置 → 日志」整段已并入本页。
-    /// 日志库查询（500ms 节流缓存）：此前在日志页渲染路径里每帧执行
-    /// SELECT COUNT(*) + 取 800 行。
-    ///
-    /// ★ 崩溃修复：本函数原先在"缓存过期"分支里写成了 `self.log_rows_cached()`（自我递归），
-    /// 而时间戳是在递归返回后才写入的，于是每一层递归都判定缓存过期 → 无限递归 →
-    /// 主线程栈溢出被系统直接终止（`0xC00000FD`）。栈溢出不走 panic 钩子，所以 crash.log
-    /// 里没有任何记录。这里按抽取缓存前的原语义查询：总条数 + 最近 800 行。
-    fn log_rows_cached(&mut self) -> (i64, Vec<logdb::LogRow>) {
-        let stale = self
-            .log_cache_at
-            .map(|t| t.elapsed() > std::time::Duration::from_millis(500))
-            .unwrap_or(true);
-        if stale {
-            let (c, r) = match self.logdb.as_ref() {
-                Some(db) => (db.count(), db.recent(800, None)),
-                None => (0, Vec::new()),
-            };
-            // 先落时间戳再填数据：任何提前返回都不会让"缓存过期"重复成立
-            self.log_cache_at = Some(std::time::Instant::now());
-            self.log_cache_count = c;
-            self.log_cache_rows = r;
-        }
-        (self.log_cache_count, self.log_cache_rows.clone())
-    }
+    /// 数据来自 `toollog`：内存环形缓冲（≤ 2000 条）+ 落盘 `data\tool.log`（启动时只读一次文件尾部）。
+    /// 过滤结果按「日志版本号 + 过滤条件」缓存：条件不变时渲染只读缓存，缓冲有新增才重算一次；
+    /// 列表经 `show_rows` 虚拟化，只布局可见行。渲染路径不读文件、不开线程、不遍历全量缓冲。
     fn ui_logs_page(&mut self, ctx: &egui::Context) {
         let mut query = self.log_query.clone();
         let mut level = self.log_level.clone();
-        let mut src_filter = self.log_src.clone();
+        let mut cat = self.log_src.clone();
         let mut follow = self.log_follow;
-        let mut row_h = self.log_row_h;
-        let mut do_clear = false;
-        let mut do_export = false;
+        let mut max_show = self.cfg.max_log_lines;
+        let mut do_clear_view = false;
+        let mut do_open_file = false;
+        let mut copied: Option<String> = None;
+        let col_info = self.theme_cur.weak;
+        let col_widget_bg = self.theme_cur.widget_bg;
+        let col_stroke = self.theme_cur.stroke;
+        // ---- 过滤缓存：只在日志版本或过滤条件变化时重算 ----
+        let rev = toollog::rev();
+        let q_lower = query.trim().to_lowercase();
+        let key = (level.clone(), cat.clone(), q_lower.clone());
+        if rev != self.tool_log_rev || key != self.tool_log_filter_key {
+            let all = toollog::snapshot();
+            let mut cats: Vec<String> = all.iter().map(|e| e.category.clone()).collect();
+            cats.sort();
+            cats.dedup();
+            self.tool_log_rows = all
+                .into_iter()
+                .filter(|e| toollog::matches(&key.0, &key.1, &q_lower, e))
+                .collect();
+            self.tool_log_cats = cats;
+            self.tool_log_rev = rev;
+            self.tool_log_filter_key = key;
+        }
+        // 渲染期间把结果移出（归还放在面板闭包之后），避免闭包内借用 self 字段
+        let rows = std::mem::take(&mut self.tool_log_rows);
+        let cats = std::mem::take(&mut self.tool_log_cats);
         egui::CentralPanel::default()
             .frame(content_frame(
                 egui::Frame::none().fill(ctx.style().visuals.panel_fill),
@@ -24390,38 +24920,30 @@ impl App {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.heading("日志");
-                    ui.label(
-                        RichText::new("XMST 工具自身的运行日志（含服务器输出汇总，按来源标记）")
-                            .weak()
-                            .small(),
-                    );
+                    ui.label(RichText::new("XMST 工具自身的运行日志").weak().small());
                 });
+                ui.label(
+                    RichText::new("服务器控制台日志在 服务器 → 日志；穿透日志在 隧道页")
+                        .weak()
+                        .small(),
+                );
                 ui.separator();
                 // ---- 统计卡 ----
-                let (count, rows) = if self.logdb.is_some() {
-                    self.log_rows_cached()
-                } else {
-                    (0, Vec::new())
-                };
-                let sources: Vec<String> = {
-                    let mut v: Vec<String> = rows.iter().map(|r| r.src.clone()).collect();
-                    v.sort();
-                    v.dedup();
-                    v
-                };
                 ui.horizontal_wrapped(|ui| {
                     for (t, v) in [
-                        ("日志总条数", format!("{count}")),
-                        ("库上限（轮转）", "50000".to_string()),
+                        ("显示条数", rows.len().to_string()),
+                        ("缓冲上限", toollog::RING_CAP.to_string()),
                         (
                             "最近写入",
-                            // recent() 返回的是时间正序（旧→新），最新一条在末尾
-                            rows.last().map(|r| r.ts.clone()).unwrap_or_else(|| "暂无".into()),
+                            // 缓冲按时间正序追加，最新一条在末尾
+                            rows.last()
+                                .map(|e| e.ts.clone())
+                                .unwrap_or_else(|| "暂无".into()),
                         ),
                     ] {
                         egui::Frame::none()
-                            .fill(self.theme_cur.widget_bg)
-                            .stroke(egui::Stroke::new(1.0, self.theme_cur.stroke))
+                            .fill(col_widget_bg)
+                            .stroke(egui::Stroke::new(1.0, col_stroke))
                             .rounding(8.0)
                             .inner_margin(egui::Margin::symmetric(12.0, 6.0))
                             .show(ui, |ui| {
@@ -24438,11 +24960,11 @@ impl App {
                     ui.label("🔍");
                     ui.add(
                         egui::TextEdit::singleline(&mut query)
-                            .hint_text("搜索关键字（消息或来源）")
-                            .desired_width(240.0),
+                            .hint_text("搜索关键字（消息或类别）")
+                            .desired_width(220.0),
                     );
                     ui.label("级别");
-                    egui::ComboBox::from_id_salt("log_level")
+                    egui::ComboBox::from_id_salt("tool_log_level")
                         .selected_text(level.clone())
                         .width(80.0)
                         .show_ui(ui, |ui| {
@@ -24450,166 +24972,149 @@ impl App {
                                 ui.selectable_value(&mut level, l.to_string(), l);
                             }
                         });
-                    ui.label("来源");
-                    egui::ComboBox::from_id_salt("log_src")
-                        .selected_text(src_filter.clone())
-                        .width(160.0)
+                    ui.label("类别");
+                    egui::ComboBox::from_id_salt("tool_log_cat")
+                        .selected_text(cat.clone())
+                        .width(120.0)
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut src_filter, "全部".to_string(), "全部");
-                            for s in &sources {
-                                ui.selectable_value(&mut src_filter, s.clone(), s);
+                            ui.selectable_value(&mut cat, "全部".to_string(), "全部");
+                            for c in &cats {
+                                ui.selectable_value(&mut cat, c.clone(), c);
                             }
                         });
-                    ui.checkbox(&mut follow, "跟随最新");
-                    ui.label("行高");
-                    egui::ComboBox::from_id_salt("log_rowh")
-                        .selected_text(if row_h < 1.5 { "紧凑" } else { "舒适" })
-                        .width(70.0)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut row_h, 1.0, "紧凑");
-                            ui.selectable_value(&mut row_h, 1.6, "舒适");
-                        });
-                    if ui.button("🗑 清空日志库").clicked() {
-                        do_clear = true;
+                    ui.checkbox(&mut follow, "自动跟随最新");
+                    if ui
+                        .button("🗑 清空视图")
+                        .on_hover_text("只清空本页的内存缓冲，不删除 data\\tool.log 文件")
+                        .clicked()
+                    {
+                        do_clear_view = true;
                     }
-                    if ui.button("💾 导出…").clicked() {
-                        do_export = true;
+                    if ui
+                        .button("📂 打开日志文件")
+                        .on_hover_text("打开 data\\tool.log 所在目录并选中该文件")
+                        .clicked()
+                    {
+                        do_open_file = true;
                     }
                 });
                 ui.separator();
-                // ---- 主日志区（等宽、级别着色、点击复制）----
-                let q = query.trim().to_lowercase();
-                let lv = level.clone();
-                let mut shown = 0usize;
-                // 日志区高度要扣掉下方「相关设置」那一行：日志区用 auto_shrink([false, false]) 会吃掉
-                // 全部剩余高度，若不给上限，低窗口高度时下面这行设置会被窗口下边缘裁掉（滚也滚不到）。
-                let logs_max_h = (ui.available_height() - 48.0).max(80.0);
-                egui::ScrollArea::vertical()
-                    .id_salt("logs_scroll")
-                    .auto_shrink([false, false])
-                    .max_height(logs_max_h)
-                    .stick_to_bottom(follow)
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        if rows.is_empty() {
-                            ui.add_space(10.0);
-                            ui.label(
-                                RichText::new(
-                                    "暂无日志。启动服务器 / 隧道后，输出会自动汇总到这里。",
-                                )
-                                .weak(),
-                            );
-                        }
-                        for r in rows.iter() {
-                            if src_filter != "全部" && r.src != src_filter {
-                                continue;
-                            }
-                            let lvl_ok = match lv.as_str() {
-                                "警告" => r.line.contains("WARN") || r.line.contains("警告"),
-                                "错误" => {
-                                    r.line.contains("ERROR")
-                                        || r.line.contains("FATAL")
-                                        || r.line.contains("Exception")
-                                        || r.line.contains("失败")
-                                        || r.line.contains("异常")
-                                }
-                                _ => true,
-                            };
-                            if !lvl_ok {
-                                continue;
-                            }
-                            if !q.is_empty()
-                                && !r.line.to_lowercase().contains(&q)
-                                && !r.src.to_lowercase().contains(&q)
-                            {
-                                continue;
-                            }
-                            if shown >= 500 {
-                                break;
-                            }
-                            shown += 1;
-                            let lvl_col = if r.line.contains("ERROR")
-                                || r.line.contains("FATAL")
-                                || r.line.contains("Exception")
-                            {
-                                Color32::from_rgb(235, 110, 110)
-                            } else if r.line.contains("WARN") {
-                                Color32::from_rgb(235, 190, 90)
-                            } else {
-                                self.theme_cur.text
-                            };
-                            let row_resp = ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 6.0;
-                                ui.label(
-                                    RichText::new(&r.ts)
-                                        .monospace()
-                                        .small()
-                                        .color(self.theme_cur.weak),
-                                );
-                                ui.label(
-                                    RichText::new(format!("[{}]", r.src))
-                                        .monospace()
-                                        .small()
-                                        .color(self.fg(Color32::from_rgb(120, 180, 255))),
-                                );
-                                ui.label(
-                                    RichText::new(&r.line)
-                                        .monospace()
-                                        .color(lvl_col),
-                                );
-                            });
-                            let rr = row_resp.response.interact(egui::Sense::click());
-                            if rr.clicked() {
-                                ui.ctx().copy_text(r.line.clone());
-                                self.set_toast("已复制该行日志".to_string());
-                            }
-                        }
-                        if shown == 0 && !rows.is_empty() {
-                            ui.add_space(8.0);
-                            ui.label(RichText::new("当前过滤条件下没有日志").weak());
-                        } else if shown >= 500 {
-                            ui.add_space(6.0);
-                            ui.label(
-                                RichText::new("仅显示最近 500 行（不影响库中已存数据）")
-                                    .weak()
-                                    .small(),
-                            );
-                        }
-                    });
-                ui.separator();
-                // ---- 相关设置（原「设置 → 日志」）----
-                ui.horizontal(|ui| {
-                    ui.label("最大显示行数");
-                    if ui
-                        .add(egui::DragValue::new(&mut self.cfg.max_log_lines).range(100..=20000))
-                        .changed()
-                    {
-                        self.save_config();
-                    }
+                // ---- 列表（等宽、级别着色、长消息截断 + hover 看全文、点击复制）----
+                // 底部留白同其它页（CONTENT_EDGE_PAD），并按下方设置行的高度扣减，避免最后一行被裁
+                let logs_max_h = (ui.available_height() - 40.0 - CONTENT_EDGE_PAD).max(80.0);
+                let show_cap = max_show.clamp(100, toollog::RING_CAP).min(rows.len());
+                if rows.is_empty() {
+                    ui.add_space(10.0);
                     ui.label(
-                        RichText::new("行（仅影响显示条数；日志库按 50000 行轮转）")
+                        RichText::new("暂无工具日志。启动服务器 / 开始备份 / 连接隧道后，这里会出现对应记录。")
+                            .weak(),
+                    );
+                } else {
+                    let row_h = ui.text_style_height(&egui::TextStyle::Monospace) + 2.0;
+                    egui::ScrollArea::vertical()
+                        .id_salt("tool_logs_scroll")
+                        .auto_shrink([false, false])
+                        .max_height(logs_max_h)
+                        .stick_to_bottom(follow)
+                        .show_rows(ui, row_h, show_cap, |ui, range| {
+                            ui.set_width(ui.available_width());
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            for i in range {
+                                let Some(r) = rows.get(i) else { continue };
+                                let lvl_col = match r.level {
+                                    toollog::ToolLevel::Error => Color32::from_rgb(235, 110, 110),
+                                    toollog::ToolLevel::Warn => Color32::from_rgb(235, 190, 90),
+                                    toollog::ToolLevel::Info => col_info,
+                                };
+                                // 长消息按字节安全截断（safe_to 会向前对齐到字符边界），全文放 hover
+                                let truncated = r.msg.len() > 240;
+                                let msg = if truncated {
+                                    format!("{}…", safe_to(&r.msg, 240))
+                                } else {
+                                    r.msg.clone()
+                                };
+                                let resp = ui
+                                    .horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                        ui.label(
+                                            RichText::new(&r.ts)
+                                                .monospace()
+                                                .small()
+                                                .color(col_info),
+                                        );
+                                        ui.label(
+                                            RichText::new(format!("[{}]", r.category))
+                                                .monospace()
+                                                .small()
+                                                .color(Color32::from_rgb(120, 180, 255)),
+                                        );
+                                        ui.label(RichText::new(msg).monospace().color(lvl_col));
+                                    })
+                                    .response;
+                                let resp = if truncated {
+                                    resp.on_hover_text(r.msg.as_str())
+                                } else {
+                                    resp
+                                };
+                                let resp = resp.interact(egui::Sense::click());
+                                if resp.clicked() {
+                                    ui.ctx().copy_text(r.msg.clone());
+                                    copied = Some("已复制该条日志".to_string());
+                                }
+                            }
+                        });
+                    if show_cap < rows.len() {
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "仅显示最近 {show_cap} 条（共 {} 条；可在下方调整「最多显示条数」）",
+                                rows.len()
+                            ))
+                            .weak()
+                            .small(),
+                        );
+                    }
+                }
+                ui.add_space(CONTENT_EDGE_PAD);
+                // ---- 相关设置 ----
+                ui.horizontal(|ui| {
+                    ui.label("最多显示条数");
+                    ui.add(egui::DragValue::new(&mut max_show).range(100..=2000));
+                    ui.label(
+                        RichText::new("条（内存缓冲最多保留 2000 条）")
                             .weak()
                             .small(),
                     );
                 });
             });
+        self.tool_log_rows = rows;
+        self.tool_log_cats = cats;
         self.log_query = query;
         self.log_level = level;
-        self.log_src = src_filter;
+        self.log_src = cat;
         self.log_follow = follow;
-        self.log_row_h = row_h;
-        if do_clear {
-            if let Some(db) = self.logdb.as_mut() {
-                db.clear();
-            }
-            self.set_toast("已清空日志库".to_string());
+        if max_show != self.cfg.max_log_lines {
+            self.cfg.max_log_lines = max_show;
+            self.save_config();
         }
-        if do_export {
-            self.export_logs();
+        if do_clear_view {
+            toollog::clear();
+            self.set_toast("已清空本页视图（内存缓冲），日志文件未删除".to_string());
+        }
+        if do_open_file {
+            let p = toollog::file_path();
+            self.open_file_location(&p);
+        }
+        if let Some(m) = copied {
+            self.set_toast(m);
         }
     }
 
     /// 导出日志库为文本文件（写到 data\logs\export_<时间>.log）。
+    ///
+    /// 服务器控制台日志的导出入口：日志库（`logdb`）仍按原样写入，界面入口留待后续信息架构调整，
+    /// 这里保留实现避免能力丢失。
+    #[allow(dead_code)]
     fn export_logs(&mut self) {
         let Some(db) = self.logdb.as_ref() else {
             self.set_toast("日志库不可用".to_string());
@@ -28181,7 +28686,7 @@ fn log_shows_client_class_mixin_failure(server_dir: &Path) -> bool {
     })
 }
 
-/// 启动前预检（8 项）。全部为"只读检查"，不修改任何文件，也不阻断启动。
+/// 启动前预检（只读检查，不修改任何文件，也不阻断启动）。
 fn run_precheck(sc: &ServerConfig, cfg: &GlobalConfig) -> Vec<PrecheckItem> {
     let mut items: Vec<PrecheckItem> = Vec::new();
     let pinfo = serverinfo::detect_cached(&sc.dir, std::time::Duration::from_secs(3));
@@ -28497,6 +29002,49 @@ fn run_precheck(sc: &ServerConfig, cfg: &GlobalConfig) -> Vec<PrecheckItem> {
                     "常见原因是目录权限或完整性级别过低（Low IL），可在设置页查看修复命令".to_string(),
                 ));
             }
+        }
+    }
+
+    // 8) 目录完整性级别（服务器目录 + 自带的 Java 运行时目录）
+    //    目录带 Low 标签时目录里的 java.exe 也以 Low IL 运行，连 logs\latest.log 都写不出来，
+    //    表现为"启动服务器连日志都没有、退出码 1"，而同一份 run.bat 在 PowerShell 里正常（§9.1）。
+    {
+        let targets = server_integrity_scan(sc);
+        let lows: Vec<PathBuf> = targets
+            .iter()
+            .filter(|(_, rid)| *rid == Some(winapi::um::winnt::SECURITY_MANDATORY_LOW_RID))
+            .map(|(d, _)| d.clone())
+            .collect();
+        let unknown: Vec<PathBuf> = targets
+            .iter()
+            .filter(|(_, rid)| rid.is_none())
+            .map(|(d, _)| d.clone())
+            .collect();
+        let dirs_text = targets
+            .iter()
+            .map(|(d, rid)| format!("{}={}", d.display(), integrity_level_text(*rid)))
+            .collect::<Vec<String>>()
+            .join("；");
+        if !lows.is_empty() {
+            let cmds: Vec<String> = lows
+                .iter()
+                .map(|d| format!("icacls \"{}\" /setintegritylevel M /T /C", d.display()))
+                .collect();
+            items.push(PrecheckItem::fail(
+                "目录完整性级别",
+                format!("Low（服务器可能无法写入 logs 等目录）：{dirs_text}"),
+                format!("用管理员身份执行：{}（改完必须重启本程序）", cmds.join(" ｜ ")),
+            ));
+        } else if !unknown.is_empty() {
+            items.push(PrecheckItem::info(
+                "目录完整性级别",
+                format!("未能读取（按未知处理）：{dirs_text}"),
+            ));
+        } else {
+            items.push(PrecheckItem::pass(
+                "目录完整性级别",
+                format!("均不低于 Medium（服务器目录与自带 Java 运行时都可正常写入）：{dirs_text}"),
+            ));
         }
     }
 

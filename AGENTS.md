@@ -1,7 +1,7 @@
 # XMST 项目指南（索引 · 经验 · 排查手册）
 
 > 面向接手本项目的 AI / 开发者。**只保留"去哪找什么"和"踩过的坑"**，不再记录逐轮改动流水账（历史见 git log）。
-> 最近一次大修：2026-10-03（低完整性目录事件 + 审计修复，见 §4、§5）。
+> 最近一次大修：2026-10-04（低完整性目录第二次 + 0.1.1-alpha 收尾批，见 §4、§6、§9）。
 
 ---
 
@@ -16,7 +16,7 @@ Rust 桌面端 Minecraft 服务器管理工具：**egui/eframe 0.29 + glow(OpenG
 | 依赖源 | `.cargo/config.toml` 用中科大 sparse 镜像 |
 | 发布配置 | release：`lto=fat`、`codegen-units=1`、`strip`、**`panic=abort`** |
 | 子系统 | `windows_subsystem = "windows"`（无控制台 → **子进程标准句柄无效**，见 §4.3） |
-| 单文件主体 | `src/main.rs`（约 2 万行，全部 UI）——历史原因，改动时优先查找而非重排 |
+| 单文件主体 | `src/main.rs`（约 2.9 万行，全部 UI）——历史原因，改动时优先查找而非重排；**行号随改动漂移，定位以函数名为准** |
 
 ---
 
@@ -47,12 +47,12 @@ Rust 桌面端 Minecraft 服务器管理工具：**egui/eframe 0.29 + glow(OpenG
 ### 其它
 | 路径 | 说明 |
 |---|---|
-| `dist/XMST-0.1.0-alpha.exe` | **交付产物**（唯一该给用户的 exe） |
+| `dist/XMST-0.1.1-alpha.exe` | **交付产物**（唯一该给用户的 exe；0.1.0-alpha 为上一版，仍留在 `dist\` 与 `versions\`） |
 | `dist/backup/<时间戳>/` | 上一版 exe 回退副本（保留最近 2 份） |
 | `dist/data/` | 运行时数据（config、日志库、`open_diag.log`） |
 | `dist/data/plugins/` | **插件目录**（zip 放这里才会被扫描） |
 | `data/`（旧位置） | 历史数据目录，别再用（容易"插件/配置消失"的误会） |
-| `docs/` | 专题分析文档（材质根因、缺陷盘点等） |
+| `docs/` | 专题分析文档（材质根因、缺陷盘点、`发版流程.md`、**`UI-审计表.md`（界面信息架构逐项盘点 + 迁移批次）** 等） |
 | `vendor/eframe-0.29.1/` | 打过补丁的 eframe（`[patch.crates-io]`，含全局文字描边等改动） |
 | `resources/`、`assets/` | 图标等资源 |
 
@@ -70,12 +70,12 @@ cargo build --release                              # 约 3 分钟
 # 2) 部署（先备份旧版，保留最近 2 份）
 Get-Process XMST* -EA SilentlyContinue | Stop-Process -Force
 $bk="F:\XMST\dist\backup\$(Get-Date -Format yyyyMMdd_HHmmss)"; mkdir $bk | Out-Null
-Copy-Item F:\XMST\dist\XMST-0.1.0-alpha.exe "$bk\" -Force
-Copy-Item F:\XMST\target\release\xmst.exe F:\XMST\dist\XMST-0.1.0-alpha.exe -Force
+Copy-Item F:\XMST\dist\XMST-0.1.1-alpha.exe "$bk\" -Force
+Copy-Item F:\XMST\target\release\xmst.exe F:\XMST\dist\XMST-0.1.1-alpha.exe -Force
 
 # 3) 交付前必查
-(Get-FileHash F:\XMST\dist\XMST-0.1.0-alpha.exe -Algorithm SHA256).Hash   # 与 target 一致
-icacls F:\XMST\dist\XMST-0.1.0-alpha.exe | Select-String 'Mandatory Label' # ★ 必须 Medium
+(Get-FileHash F:\XMST\dist\XMST-0.1.1-alpha.exe -Algorithm SHA256).Hash   # 与 target 一致
+icacls F:\XMST\dist\XMST-0.1.1-alpha.exe | Select-String 'Mandatory Label' # ★ 必须 Medium
 ```
 
 - **构建后可删 `target/debug`**（约 1 GB，check 会重建）。
@@ -126,7 +126,7 @@ icacls "F:\XMST" /setintegritylevel M /T /C /Q
 3. **别信"spawn 成功"**：`CreateProcess`/`spawn` 返回 Ok ≠ 目标完成工作。要**验证结果**（本项目用 `FindWindowEx("CabinetWClass")` 数窗口才发现"报成功没窗口"）。
 4. **"半可用"是最强误导**：能读不能写、能写自己目录不能写别处 ⇒ 优先怀疑完整性标签/沙箱，而不是代码。
 5. **改动前先问"老版本为什么能用"**：能定位到"从哪次改动/哪个路径变更开始坏的"，往往一击命中（本例就是产物搬进 Low 标签目录所致）。
-6. **交付/启动自检**：部署脚本检查完整性标签；程序应在启动时检测 Low IL 并提示（**待办 §6**）。
+6. **交付/启动自检**：部署脚本检查完整性标签；**程序启动时的 Low IL 检测与提示已实现**（2026-10-04，见 §6.1 第 16 条），但只覆盖程序所在目录 —— **服务器目录**的同类自检仍待办（§6.2 第 3 条）。
 
 ### 4.3 Windows 进程交互的其它坑（已踩）
 - **GUI 子系统进程无控制台** → 子进程继承无效标准句柄，可能出现 `0xc0000142`；spawn `explorer/cmd/powershell` 时显式 `.current_dir(安全目录)` + 空标准句柄更稳。
@@ -138,7 +138,8 @@ icacls "F:\XMST" /setintegritylevel M /T /C /Q
 egui 的 `ui_*` 每帧执行。曾出现（已修/部分修）：
 - 概览页每帧递归遍历 `world/` —— 实测 **5352 文件 / 7.9 GB / 单次 282 ms**（现在 30 s 记忆化）；
 - 日志页每帧 `COUNT(*)` + 取 800 行（现在 500 ms 节流缓存）；
-- 仍待处理：`serverinfo::detect`、`dir_stats`（每文件夹 walkdir）、白名单 JSON 每帧读盘、**逐个打开所有 mods/*.jar**（§6）。
+- 已接缓存的：`serverinfo::detect_cached`（3 s TTL）、`mod_jar_index`（进 mods 页扫一次后复用）。
+- 仍待处理：`dir_stats`（每文件夹 walkdir）、`ui_whitelist_blacklist` 三个折叠标题里的白名单 JSON 每帧读盘（§6.2 第 14 条）。
 - **手法**：把结果缓存到 `ServerRuntime`/静态 TTL 缓存，渲染只读缓存；数据变更时主动失效。
 
 ### 4.5 数据安全：配置与备份
@@ -163,6 +164,8 @@ egui 的 `ui_*` 每帧执行。曾出现（已修/部分修）：
 | `XMST_OPEN_TEST=<目录/文件>` | 设环境变量后启动 exe | 输出 `dist/data/open_diag.log`：**进程完整性、目标目录写入/改名/复制实测、6 种打开方式的返回码** |
 | `XMST_CRASHSCAN=<服务器目录>` | 同上 | 只跑崩溃分析并打印结论后退出 |
 | `XMST_SHOT=<x.bmp>`（+`XMST_SHOT_EXIT`） | 同上 | 截图到文件后退出（自动化取 UI 快照） |
+| `XMST_OPEN_PAGE=<页面> [帧数]` | 设环境变量后启动 exe（页面名：`dashboard`/`servers`/`tunnel`/`logs`/`settings`/`download`/`plugins`，另有服务器页签别名如 `special`/`players`） | **无头复现 / 回归**：切到指定页面渲染 N 帧后自动退出；门控未开启或配置里没有服务器时，stderr 会打印「页签会回落到概览」等提示 |
+| `tools\run_with_capture.ps1` | 启动 exe 并把 **stderr** 重定向到文件 | 抓"闪退且无日志"的最后输出（栈溢出/`panic` 前的 stderr，见 §9.2） |
 | 应用内 `F12` | 运行中按键 | 截图 |
 | `diag/data/bg_debug.log` | 运行时自动写 | 材质：`captures=`、`tex=WxH`、`cap_ms=`、`opacity=`、`accent_ok=`、`ppp=` |
 | `data/` 下 `open_diag.log` / 配置 `.bak` / `.broken_*.json` | — | 打开失败诊断 / 配置回退与坏文件留档 |
@@ -171,21 +174,57 @@ egui 的 `ui_*` 每帧执行。曾出现（已修/部分修）：
 
 ## 6. 已知问题 / 待办（按建议优先级）
 
-1. **备份**（2026-10-04 已改造，见 §4.5）：剩余项 —— 远端转存（`BETA_REMOTE_BACKUP`）目前只对旧版 zip 生效，快照是目录、未做远端同步；硬链接快照在"源文件原地改写"时会使旧快照内容同步变化（见 §4.5 的代价说明），若要做防篡改归档需改为复制或加写时校验。
-2. **模组"检查更新"**：现已在 `设置 → 测试功能 → 模组检查更新`（`beta.server.mod_update`，**默认禁用**）。重做方案：读 jar 内 `fabric.mod.json`/`mods.toml` 取 **modid** → 查 Modrinth 项目/版本（按 MC 版本+加载器过滤）→ 与本地版本比对；交互改为**只检查并在弹窗里报告可更新版本**（用户选择，不自动替换）。
-3. **启动自检 Low IL**：检测到低完整性时直接提示修复命令（避免再次误判）。
-4. **插件缓存 key**：`plugins.rs::cache_key` 把所有非 ASCII 字符替换成 `_` → 两个中文名插件共用目录且互相 `remove_dir_all`，需追加名称哈希。
-5. **剩余每帧重活**：`serverinfo::detect`、`dir_stats`、`load_list`(白名单 JSON)、`scan_mod_jar_index`（逐个开 jar）。
-6. 主题：明暗判定目前取自正文色亮度（`theme.rs`），自定义配色下可能反相，应改为显式 `is_light` 字段。
-7. `kill_tree` 无条件返回 true（谎报成功）；`tail_logs` 可能切断多字节字符（中文日志出现 �）。
-8. 下载健壮性：下载 client 的总超时不应管大文件；应下到 `.part` 校验字节/哈希后 `rename`；远端文件名需消毒（防 zip-slip）。
+### 6.1 已完成（2026-10-04 收尾批；移出待办，仅作对照，勿回退）
+
+1. **备份系统改造**（2026-10-04）：硬链接快照引擎与锁定/转存、关服自动快照、旧版 zip 链式回退（细节见 §4.5）。
+2. **托盘隐藏态 tick**（2026-10-04）：`spawn_tray_heartbeat` + `tray_hidden_tick`（1s 节流），隐藏期间自动行为照常推进。
+3. **崩溃重启可取消 + 熔断**（2026-10-04）：倒计时窗 + `🛑 取消自动重启`，默认 3 次 / 5 分钟快速熔断。
+4. **外部实例识别与接管**（2026-10-04）：扫描 + 三个弹窗（未正常退出 / 似乎已在运行 / 结束外部进程二次确认），接管后纳入停止与崩溃判定。
+5. **异常退出不杀服**（2026-10-04，R3）：工具退出不牵连已在运行的服务器（除显式确认）。
+6. **一键诊断包**（2026-10-04）：后台打包 + `📂 打开诊断包目录`。
+7. **启动前检查**（2026-10-04）：「🩺 启动前检查」窗口，通过/警告/失败/参考计数，不阻断启动。
+8. **编辑器编码保护**（2026-10-04）：保存已存在的文本文件按原编码写回 + 先备份（GBK / UTF-8 / BOM，见 §9.5）。
+9. **run.bat 模板生成**（2026-10-04）：GBK/CP936 + CRLF + 无 BOM，`MAX_RESTARTS=1`、临时目录指向 `tmp`。
+10. **通知不重叠**（2026-10-04）：按实际高度堆叠 + 上限 4 条 + 同类合并。
+11. **窄窗口滚动条**（2026-10-04）：内容区右内边距 14pt，滚动条不再被窗口边缘缩放热区抢走。
+12. **mods 启用/禁用过滤**（2026-10-04）：`显示: 全部 / 已启用 / 已禁用` + 计数，选择持久化。
+13. **仅客户端判定改为只信元数据**（2026-10-04）：`environment` / `displayTest` 为唯一依据，启发式降级为参考线索。
+14. **测试功能列表改注册表驱动**（2026-10-04）：由 `features::REGISTRY` 全量生成，补回模组检查更新 / 内网穿透 / 远端备份入口。
+15. **检查更新三级匹配**（2026-10-04）：SHA1 指纹优先 → modid 当 slug → 搜索；只报告不替换（原"读 jar 取 modid"的重做方案已由指纹匹配覆盖）。
+16. **Low IL 启动自检**（2026-10-04）：启动时判完整性级别，Low 时弹一次提示 + `复制修复命令`（见 §4.1）。
+17. **启动方式 auto 回退**（2026-10-04）：bat 失败自动改直连 java（见 §9.6）。
+18. **排队优雅停止**（2026-10-04）：启动中点停止改为排队等就绪后优雅停止（`StartPhase` + 排队 / 强制 / 5 分钟超时三条逃生通道，关服快照保持）。
+19. `kill_tree` 返回真实结果；日志与 `tail_logs` 的按字节截断统一走 `safe_from`/`safe_to`（中文不再出现半个字）。
+20. **主题显式 `is_light`**（2026-10-04）：不再靠正文色亮度反推明暗。
+21. **插件缓存目录隔离**（2026-10-04）：`plugins::cache_key` = 可读名 + FNV-1a 64 位后缀，中文名插件不再互相 `remove_dir_all`。
+22. **下载文件名消毒**（2026-10-04）：`sanitize_remote_filename()`，`.part` 路径同源（防 zip-slip）。
+23. **锁中毒**（2026-10-03）：22 处改 `lock().unwrap_or_else(|e| e.into_inner())`（见 §4.6）。
+24. **日志页工具日志化**：**进行中**（另一工作流）。目标见 §9.7；当前页面说明仍写着"含服务器输出汇总"，尚未收口。
+
+### 6.2 仍待办（按建议优先级）
+
+1. **界面信息架构重组**：逐项盘点、合并结论与迁移批次见 `docs\UI-审计表.md`（一级导航 7 → 4、服务器页签收敛、统一工具条、设置分组折叠）。其中含两处死代码：`ui_perf`（`ServerTab::Perf` 有渲染分支但页签表里没有它，任何路径都进不去）、`ui_players_props`（已被 `ui_players_props_disabled` 取代，无调用者）。
+2. **发布 0.1.1**：产物已在 `dist\XMST-0.1.1-alpha.exe` 与 `versions\0.1.1-alpha\`，等确认后走 `tools/release.ps1`。
+3. **服务器目录完整性自检**：启动自检目前只查**程序所在目录**（exe dir）；§9.1 的 `D:\Desktop` 事故说明**服务器目录**带 Low 标签同样会让 java 写不出 `logs\latest.log`，应把每台服务器的目录也纳入同一套检查与提示。
+4. **`XMST_OPEN_PAGE` 退出加固**：收尾走 `ViewportCommand::Close`，被"有服务器运行"的二次确认拦住后靠 300 帧兜底 `std::process::exit(0)`；该兜底跳过配置去抖与日志落盘（现在只在进入退出前 `flush_config()` 一次）。
+5. **远端备份覆盖面**：`BETA_REMOTE_BACKUP` 目前只对旧版 zip 生效；快照是目录，未做远端同步。
+6. **硬链接快照的固有代价**：源文件"原地改写"会让旧快照同步变化（见 §4.5）；要做防篡改归档需改为复制或加写时校验。
+7. **`features` 可见性机制无消费者**：`is_visible()` / `FeatureMeta.default_visible` / `FeatureState.visible` 全仓库无调用（UI 只用 `is_enabled`），要么接上"仅隐藏 UI"，要么删掉。
+8. **锁访问规约**：`into_inner()` 已覆盖 22 处；仍剩 **4 处 `.lock().ok()`**（`plugins` 的 `pm.configs.lock().ok()`），与"一律 `unwrap_or_else`"的约定不符。
+9. **`DownloadState` 解包过密**：`self.dl` 上 `.as_mut().unwrap()` 49 处 + `.as_ref().unwrap()` 57 处（合计 106；此前记的"96 处"只是其中一部分）。`panic=abort` 下任一处失手即闪退，应改为一次 `let Some(dl) = ...` 或集中取引用。
+10. **`windows_version_text` 缓冲契约**：函数在 `main.rs` 内返回 `String` 供系统信息拼接，缓冲区与长度契约未写明；改动时按"一次调用一次分配、不做跨帧复用"处理。
+11. **`GetDiskFreeSpaceExW` 指针用法**：在 `backup.rs`（约 L1312），`lpFreeBytesAvailableToCaller` 等输出参数的传参形态需复核，避免 64 位值被当 32 位读。
+12. **主线程栈大小兜底**：`main` 未显式设置 `stack_size`；§9.2 的栈溢出直接让进程消失，应给主线程留足栈，或在递归点加深度上限。
+13. **rhai 插件递归未实测**：`max_operations` 已钳 20 万 + 单帧预算，但脚本内深度递归的实际表现未测。
+14. **剩余每帧读盘**：`ui_whitelist_blacklist` 把 `load_json_list(...).len()` 写进三个 `CollapsingHeader` 标题（白名单 / 封禁玩家 / 封禁 IP），每帧读盘；玩家管理侧的同一批数据已走 5s 快照缓存，可照搬。
+15. **下载健壮性剩余项**：下载 client 的总超时不应管大文件；落盘应统一走 `.part` → 校验字节/哈希 → `rename`（文件名消毒已完成，见 §6.1 第 22 条）。
 
 ---
 
 ## 7. 交付前检查清单
 
 - [ ] `cargo check` 无 error，`cargo build --release` 成功
-- [ ] `dist/XMST-0.1.0-alpha.exe` 与 `target/release/xmst.exe` **SHA256 一致**
+- [ ] `dist/XMST-0.1.1-alpha.exe` 与 `target/release/xmst.exe`、`versions/0.1.1-alpha/` 下同名文件 **三处 SHA256 一致**（见 §9.3）
 - [ ] 旧版已备份到 `dist/backup/<时间戳>/`（保留 2 份）
 - [ ] **exe 与目录完整性标签 = Medium**（`icacls … | Select-String 'Mandatory Label'`）
 - [ ] 无 Zone.Identifier（MOTW）；若对外分发建议用普通 zip（并提示用 7-Zip 解压）
