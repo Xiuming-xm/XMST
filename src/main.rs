@@ -30,11 +30,18 @@ use std::os::windows::process::CommandExt;
 
 // ---------- Java 解析辅助 ----------
 
-/// �?run.bat 提取 Java 路径：支�?`set JAVA=...` / `set JAVA_PATH=...` /
-/// `set JAVA_HOME=...` 以及行内出现 `"C:\...\java.exe"` / `javaw.exe` 的形式�?
+/// 从 run.bat 提取 Java 路径：支持 `set JAVA=...` / `set JAVA_PATH=...` /
+/// `set JAVA_HOME=...` 以及行内出现 `"C:\...\java.exe"` / `javaw.exe` 的形式。
 fn extract_java_from_bat(bat: &Path) -> Option<String> {
     // 按原编码读取：GBK 脚本里有中文注释时 read_to_string 会失败，Java 路径就提取不到
     let content = read_text_auto_encoding(bat).ok()?.0;
+    let dir = bat.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    parse_java_from_bat_text(&content, &dir)
+}
+
+/// `extract_java_from_bat` 的纯字符串实现（不读盘，便于单测）。
+/// `dir` 只用于展开「脚本所在目录」占位符 `%~dp0`。
+fn parse_java_from_bat_text(content: &str, dir: &Path) -> Option<String> {
     for line in content.lines() {
         let line = line.trim();
         let lower = line.to_lowercase();
@@ -45,26 +52,55 @@ fn extract_java_from_bat(bat: &Path) -> Option<String> {
                 // 否则键变成 `"java_path` 匹配不上，整行又被上面的 starts_with("set ") 吃掉，
                 // 分支判断根本轮不到下面的 `java.exe` 兜底 → Java 路径解析不出来。
                 let key = rest[..eq].trim().trim_matches('"').trim().to_lowercase();
-                let val = rest[eq + 1..].trim().trim_matches('"').to_string();
+                let val = rest[eq + 1..].trim().trim_matches('"').trim();
                 if !val.is_empty()
                     && (key == "java" || key == "java_path" || key == "java_home")
                 {
-                    return Some(val);
+                    return Some(expand_bat_dir_placeholder(val, dir));
                 }
             }
         } else if lower.contains("java.exe") || lower.contains("javaw.exe") {
-            // 提取行内第一个引号包裹的 java 可执行文�?
+            // 提取行内第一个引号包裹的 java 可执行文件
             if let Some(start) = line.find('"') {
                 if let Some(end) = line[start + 1..].find('"') {
                     let p = &line[start + 1..start + 1 + end];
                     if p.to_lowercase().contains("java") {
-                        return Some(p.to_string());
+                        return Some(expand_bat_dir_placeholder(p, dir));
                     }
                 }
             }
         }
     }
     None
+}
+
+/// 把 bat 里的 `%~dp0`（脚本所在目录，结尾带反斜杠）换成实际目录。
+/// 生成器写出的 run.bat 与手写脚本都常见这种写法（`set JAVA_PATH=%~dp0Java21\bin\java.exe`），
+/// 不展开的话拿到的是一个磁盘上不存在的路径，直连 java 就会解析失败。
+fn expand_bat_dir_placeholder(val: &str, dir: &Path) -> String {
+    if !val.to_ascii_lowercase().contains("%~dp0") {
+        return val.to_string();
+    }
+    let mut base = dir.display().to_string();
+    if !base.ends_with('\\') && !base.ends_with('/') {
+        base.push('\\');
+    }
+    let bytes = val.as_bytes();
+    let mut out = String::with_capacity(val.len() + base.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // `%~dp0` 全 ASCII：按字节做大小写不敏感比较，命中就整体替换（脚本里也可能写成 `%~DP0`）
+        if i + 5 <= bytes.len() && bytes[i..i + 5].eq_ignore_ascii_case(b"%~dp0") {
+            out.push_str(&base);
+            i += 5;
+            continue;
+        }
+        // 其余按字符边界逐个搬运，避免把多字节字符切碎
+        let Some(ch) = val[i..].chars().next() else { break };
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 /// �?MC 版本自动匹配全局 Java 列表：先完整版本前缀，再主版本（�?"21"）�?
@@ -563,14 +599,8 @@ fn write_text_same_encoding(
     }
 }
 
-/// 生成 run.bat 的内容。要点（都是踩过的坑）：
-///   · 不写 pause：工具托管时 pause 会让进程永不退出，工具无法判定「正常关服」，
-///     会漏掉关服自动快照；需要手动双击调试时自行在末尾加一行 pause；
-///   · MAX_RESTARTS=1：重启交给工具，避免脚本自身的重启循环与工具的崩溃自动重启叠加成「停不下来」；
-///   · TEMP/TMP 与 -Djava.io.tmpdir 都指向 %~dp0tmp：JNA / sqlite-jdbc 要把原生 DLL 解压到
-///     java.io.tmpdir，全局临时目录有残留时会加载失败；
-///   · -Dfile.encoding=UTF-8：中文日志/插件输出更稳；
-///   · 不写 chcp：批处理文件本身按 GBK 保存，改代码页会与文件编码打架。
+/// 生成 run.bat 的内容：配置区 → 检查 → 启动 → 退出码分支，风格与手写脚本一致。
+/// 脚本里的注释只说明「这是什么」，不写生成原因；不写 pause、不写 chcp。
 /// 内容里的换行统一用 \n，落盘时由 write_text_same_encoding 转成 CRLF。
 fn build_run_bat(java: &str, jvm_args: &str, core_jar: &str) -> String {
     let jvm = if jvm_args.trim().is_empty() {
@@ -602,20 +632,75 @@ fn build_run_bat(java: &str, jvm_args: &str, core_jar: &str) -> String {
     } else {
         core_jar.trim()
     };
+    // JAVA_PATH 写成路径时用 if exist 检查；只写 java（PATH 上的）时用 where 检查
+    let java_is_path = java.contains('\\') || java.contains('/') || java.contains(':');
     let mut s = String::new();
     s.push_str("@echo off\n");
-    s.push_str("rem ===== XMST 生成的启动脚本（本文件按 GBK/ANSI 保存，勿用 UTF-8 另存，否则 cmd 读中文会乱码）=====\n");
-    s.push_str("rem 不写 pause：XMST 托管时 pause 会让进程卡住不退出，工具无法判断「正常关服」而漏掉关服快照。\n");
-    s.push_str("rem 需要手动双击调试时，自行在最后加一行 pause。\n");
-    s.push_str("rem MAX_RESTARTS 取 1：重启交给 XMST，避免脚本自身重启与工具崩溃重启叠加。\n");
+    s.push_str("setlocal EnableDelayedExpansion\n\n");
+    s.push_str("rem 由 XMST 启动/停止，无需手动按任意键\n");
+    s.push_str("rem 手动双击调试时，可自己在末尾加一行 pause\n\n");
+    s.push_str("rem ===== 配置区 =====\n");
+    s.push_str("rem Java 路径（改成你自己的 java.exe 也可以）\n");
+    s.push_str(&format!("set \"JAVA_PATH={java}\"\n"));
+    s.push_str("rem JVM 参数：-Xmx 是最大内存\n");
+    s.push_str(&format!("set \"JVM_ARGS={jvm}{extra}\"\n"));
+    s.push_str("rem 服务器核心文件名\n");
+    s.push_str(&format!("set \"SERVER_JAR={core}\"\n"));
+    s.push_str("rem 最大自动重启次数\n");
     s.push_str("set \"MAX_RESTARTS=1\"\n");
-    s.push_str("rem 独立临时目录：JNA / sqlite-jdbc 要把原生 DLL 解压到 java.io.tmpdir，指向 %~dp0tmp 避免加载失败。\n");
+    s.push_str("rem 重启前等待的秒数\n");
+    s.push_str("set \"RESTART_DELAY=5\"\n");
+    s.push_str("rem 日志目录\n");
+    s.push_str("set \"LOG_DIR=logs\"\n\n");
+    s.push_str("rem 临时目录：TEMP/TMP 与 JVM 的 tmpdir 都指向它\n");
     s.push_str("set \"TEMP=%~dp0tmp\"\n");
     s.push_str("set \"TMP=%~dp0tmp\"\n");
     s.push_str("if not exist \"%~dp0tmp\" mkdir \"%~dp0tmp\"\n");
-    s.push_str(&format!(
-        "\"{java}\" {jvm}{extra} -jar {core} nogui\n"
-    ));
+    s.push_str("if not exist \"%LOG_DIR%\" mkdir \"%LOG_DIR%\"\n\n");
+    s.push_str("rem 检查 Java\n");
+    if java_is_path {
+        s.push_str("if not exist \"%JAVA_PATH%\" (\n");
+    } else {
+        s.push_str("where %JAVA_PATH% >nul 2>nul\n");
+        s.push_str("if errorlevel 1 (\n");
+    }
+    s.push_str("    echo [错误] 找不到 Java: %JAVA_PATH%\n");
+    s.push_str("    exit /b 1\n");
+    s.push_str(")\n");
+    s.push_str("rem 检查服务端核心\n");
+    s.push_str("if not exist \"%SERVER_JAR%\" (\n");
+    s.push_str("    echo [错误] 找不到服务端核心: %SERVER_JAR%\n");
+    s.push_str("    exit /b 1\n");
+    s.push_str(")\n\n");
+    s.push_str("echo ==========================================\n");
+    s.push_str("echo   服务端启动脚本\n");
+    s.push_str("echo   Java: %JAVA_PATH%\n");
+    s.push_str("echo   JVM 参数: %JVM_ARGS%\n");
+    s.push_str("echo   核心文件: %SERVER_JAR%\n");
+    s.push_str("echo   最大重启次数: %MAX_RESTARTS%\n");
+    s.push_str("echo   日志目录: %LOG_DIR%\n");
+    s.push_str("echo ==========================================\n");
+    s.push_str("echo.\n\n");
+    s.push_str("set \"CRASH_COUNT=0\"\n\n");
+    s.push_str(":restart\n");
+    s.push_str("if !CRASH_COUNT! GEQ %MAX_RESTARTS% (\n");
+    s.push_str("    echo [错误] 已启动 %MAX_RESTARTS% 次仍未正常运行，停止重启\n");
+    s.push_str("    exit /b 1\n");
+    s.push_str(")\n");
+    s.push_str("if !CRASH_COUNT! GTR 0 (\n");
+    s.push_str("    echo [提示] %RESTART_DELAY% 秒后重试\n");
+    s.push_str("    timeout /t %RESTART_DELAY% /nobreak >nul\n");
+    s.push_str(")\n");
+    s.push_str("set /a CRASH_COUNT+=1\n");
+    s.push_str("echo [%time%] 正在启动服务端...\n");
+    s.push_str(&format!("call \"{java}\" %JVM_ARGS% -jar {core} nogui %*\n"));
+    s.push_str("set \"EXIT_CODE=%ERRORLEVEL%\"\n");
+    s.push_str("echo [%time%] 服务端已停止，退出码: %EXIT_CODE%\n\n");
+    s.push_str("rem 0=正常关服，130=Ctrl+C 中断，都不重启\n");
+    s.push_str("if %EXIT_CODE% EQU 0 exit /b 0\n");
+    s.push_str("if %EXIT_CODE% EQU 130 exit /b 0\n");
+    s.push_str("echo [提示] 非正常退出，准备重启...\n");
+    s.push_str("goto restart\n");
     s
 }
 
@@ -628,7 +713,9 @@ fn generate_run_bat(
     jvm_args: &str,
     core_jar: &str,
 ) -> Result<PathBuf, String> {
-    let content = build_run_bat(java, jvm_args, core_jar);
+    // JAVA_PATH 用实际解析出的 java：能落到服务器目录里就写成 .\Java21\bin\java.exe 这种相对写法
+    let java = java_path_for_run_bat(java, dir);
+    let content = build_run_bat(&java, jvm_args, core_jar);
     std::fs::create_dir_all(dir).map_err(|e| format!("创建服务器目录失败: {e}"))?;
     let path = dir.join("run.bat");
     write_text_same_encoding(&path, &content, TextEncoding::Gbk, true)?;
@@ -1765,6 +1852,10 @@ struct ServerRuntime {
     run_started: Option<std::time::SystemTime>,
     /// 本次启动的完整命令行（崩溃弹窗/诊断信息用）
     run_cmdline: String,
+    /// run.bat 启动失败自动回退的观察窗口（None = 不在观察中；每次启动最多回退一次）
+    fallback_watch: Option<FallbackWatch>,
+    /// 本次运行是否由「bat 失败自动回退」启动（状态卡片显示「回退启动」）
+    fallback_started: bool,
     /// 上一次进程退出码（崩溃弹窗展示）
     last_exit_code: Option<i32>,
     /// 上一次运行 stderr 的末尾 30 行（崩溃弹窗展示；stderr 为空时是空列表，不算错误）
@@ -1856,6 +1947,8 @@ struct ToastMsg {
     cancel_server: Option<usize>,
     /// 通知附带「打开所在目录」按钮的目标目录（如诊断包导出后指向其所在目录）。
     open_dir: Option<PathBuf>,
+    /// 通知附带「查看启动日志」按钮的目标文件（如后台自动回退后指向 data\launch.log）。
+    open_file: Option<PathBuf>,
 }
 
 impl Default for ServerRuntime {
@@ -1952,6 +2045,8 @@ impl Default for ServerRuntime {
             last_stopped_at: None,
             run_started: None,
             run_cmdline: String::new(),
+            fallback_watch: None,
+            fallback_started: false,
             last_exit_code: None,
             last_stderr: Vec::new(),
             precheck_open: false,
@@ -2703,6 +2798,7 @@ enum BgMsg {
 }
 
 /// 一次启动的完整命令描述（生产启动与「🧪 启动诊断」共用，保证诊断跑的就是生产路径那条命令）。
+#[derive(Clone)]
 struct LaunchSpec {
     /// 实际执行的程序（cmd / java）
     prog: String,
@@ -2716,8 +2812,63 @@ struct LaunchSpec {
     priv_tmp: Option<PathBuf>,
     /// 私有临时目录准备失败的警告文案
     tmp_warn: Option<String>,
-    /// 启动方式说明（run.bat / launch_cmd 模板），写进 launch.log
+    /// 启动方式说明（run.bat / launch_cmd 模板 / 直连 java），写进 launch.log
     kind: String,
+}
+
+/// 「run.bat 启动失败自动回退直连 java」的观察窗口（只在 launch_mode=auto 且本次走 run.bat 时存在）。
+///
+/// 判定依据（三条同时成立才算 bat 启动失败）：子进程已自行退出且退出码非 0、
+/// `logs\latest.log` 的 size/mtime 与启动前基线相比都没变化、直连 java 的命令已解析成功
+/// （解析失败时根本不会建这个窗口，失败就按普通启动失败处理）。
+struct FallbackWatch {
+    /// 观察起点（写 launch.log 用）
+    start: std::time::Instant,
+    /// 观察截止时刻（启动后 3 秒）
+    deadline: std::time::Instant,
+    /// 基线：启动前 `logs\latest.log` 的 (size, mtime)；None = 启动前文件不存在
+    log_sig: Option<(u64, Option<std::time::SystemTime>)>,
+    /// 被观察的日志文件（`<服务器目录>\logs\latest.log`）
+    log_path: PathBuf,
+    /// 回退时使用的直连 java 命令（启动前就已解析好，回退时不再重新解析）
+    spec: LaunchSpec,
+}
+
+/// bat 启动失败的观察窗口时长：cmd /c run.bat 正常起 java 时会在几百毫秒内让
+/// `logs\latest.log` 出现新内容；给到 3 秒足以区分"脚本自己退了"与"java 正在起"。
+const FALLBACK_WATCH_SECS: u64 = 3;
+
+/// 启动方式取值归一化：只认 `auto` / `bat` / `java`，其余（空值、旧配置缺字段）一律按 `auto`。
+fn normalize_launch_mode(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "bat" => "bat",
+        "java" => "java",
+        _ => "auto",
+    }
+}
+
+/// 读 `logs\latest.log` 的 (size, mtime) 作为变化判定基线；文件不存在返回 None。
+fn log_signature(path: &Path) -> Option<(u64, Option<std::time::SystemTime>)> {
+    let md = std::fs::metadata(path).ok()?;
+    Some((md.len(), md.modified().ok()))
+}
+
+/// 回退判定（纯函数，便于单测）：`code` = 子进程退出码（外层 None = 仍在运行，
+/// 内层 None = 被异常终止拿不到退出码），`log_changed` = 日志 size/mtime 是否变化。
+/// 只有「已退出且退出码非 0」**且**「日志毫无变化」才判定 bat 启动失败。
+fn bat_start_failed(code: Option<Option<i32>>, log_changed: bool) -> bool {
+    if log_changed {
+        return false;
+    }
+    match code {
+        // 仍在运行
+        None => false,
+        // 正常退出（0）虽然可疑（cmd 没把 java 拉起来却又成功返回），但按需求只认非 0
+        Some(Some(0)) => false,
+        Some(Some(_)) => true,
+        // 被异常终止（拿不到退出码）：同样视为启动失败
+        Some(None) => true,
+    }
 }
 
 // ---------- 启动诊断辅助（组合④：绕过 cmd/bat 直接用 java）----------
@@ -2845,6 +2996,49 @@ fn normalize_java_exe(raw: &str, dir: &Path) -> Option<String> {
     } else {
         None
     }
+}
+
+/// 生成 run.bat 里 JAVA_PATH 用的写法：
+/// 先归一成可执行文件路径，能定位到服务器目录内的 java.exe 就写成 `.\Java21\bin\java.exe`
+/// （整个服务器目录搬走也不用改脚本），解析不到真实文件时退回原值（`java` 走 PATH）。
+fn java_path_for_run_bat(raw: &str, dir: &Path) -> String {
+    let raw = raw.trim();
+    let Some(exe) = normalize_java_exe(raw, dir) else {
+        return "java".to_string();
+    };
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let to_abs = |p: &Path| -> PathBuf {
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            cwd.join(p)
+        }
+    };
+    let exe_abs = to_abs(Path::new(&exe));
+    if !exe_abs.exists() {
+        return raw.to_string();
+    }
+    relative_under_dir(&to_abs(dir), &exe_abs).unwrap_or_else(|| exe_abs.display().to_string())
+}
+
+/// `<目录>\<文件>` 是否在 `<目录>` 之内：是则返回 `.\相对\路径`，否则 None。
+/// 逐段按大小写不敏感比较，不做字节切片，避免多字节路径被切坏。
+fn relative_under_dir(dir: &Path, p: &Path) -> Option<String> {
+    let dc: Vec<String> = dir
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .collect();
+    let pc: Vec<String> = p
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .collect();
+    if dc.is_empty() || pc.len() <= dc.len() {
+        return None;
+    }
+    if !dc.iter().zip(pc.iter()).all(|(a, b)| a.eq_ignore_ascii_case(b)) {
+        return None;
+    }
+    Some(format!(".\\{}", pc[dc.len()..].join("\\")))
 }
 
 /// 诊断输出末尾若干行 → 缩进文本（空则写出 `<empty>`；单行过长按字符截断，避免撑破窗口）。
@@ -3640,9 +3834,138 @@ impl App {
             }
             return;
         }
-        let Some(spec) = self.build_launch_spec(idx) else {
+        // 启动方式（每服务器设置）：
+        //   auto（默认）——优先 run.bat，run.bat 启动失败时自动改用直连 java；
+        //   bat        ——只用 run.bat，失败就报错，不回退；
+        //   java       ——始终直连 java（跳过 run.bat）。
+        let mode = normalize_launch_mode(&sc.launch_mode);
+        let run_bat = dir.join("run.bat");
+        if mode == "bat" && !run_bat.exists() {
+            // 用户显式选了「只用 run.bat」，目录里却没有：明确报错，不偷偷换成别的启动方式
+            if let Some(rt) = self.runtimes.get_mut(idx) {
+                rt.last_msg = "启动失败：启动方式设为 run.bat，但目录里没有 run.bat".to_string();
+            }
+            self.set_toast(format!(
+                "「{}」启动失败：启动方式设为 run.bat，但目录里没有 run.bat",
+                sc.name
+            ));
+            return;
+        }
+        if mode == "java" || !run_bat.exists() {
+            // 直连 java：目录里有 run.bat 时按它解析出的 java / JVM 参数 / 核心 jar 组装，
+            // 没有 run.bat 时沿用自定义启动命令模板那条链
+            match self.build_direct_java_spec(idx) {
+                Ok(spec) => self.launch_spec(idx, spec, None, false),
+                Err(e) => {
+                    process::launch_log_line(&format!("阶段=启动失败 原因=直连 java 解析失败：{e}"));
+                    if let Some(rt) = self.runtimes.get_mut(idx) {
+                        rt.last_msg = format!("启动失败: {e}");
+                    }
+                    self.set_toast(format!("启动失败: {e}"));
+                }
+            }
+            return;
+        }
+        // 走 run.bat（此处已确认 run.bat 存在）
+        let Some(bat_spec) = self.build_launch_spec(idx) else {
             return;
         };
+        // auto：先把「回退用」的直连 java 命令解析好，并记下 logs\latest.log 的基线。
+        // 解析不出来就不开观察窗口（回退无从谈起），run.bat 失败时按普通启动失败报错。
+        let mut watch: Option<FallbackWatch> = None;
+        if mode == "auto" {
+            match self.build_direct_java_spec(idx) {
+                Ok(java_spec) => {
+                    let log_path = dir.join("logs").join("latest.log");
+                    let now = std::time::Instant::now();
+                    process::launch_log_line(&format!(
+                        "阶段=回退准备 结果=已启用 观察={}s 判定=run.bat 自行以非 0 退出且 logs\\latest.log 的 size/mtime 无变化 改用=直连 java",
+                        FALLBACK_WATCH_SECS
+                    ));
+                    watch = Some(FallbackWatch {
+                        start: now,
+                        deadline: now + std::time::Duration::from_secs(FALLBACK_WATCH_SECS),
+                        log_sig: log_signature(&log_path),
+                        log_path,
+                        spec: java_spec,
+                    });
+                }
+                Err(e) => {
+                    process::launch_log_line(&format!(
+                        "阶段=回退准备 结果=未启用（直连 java 命令解析失败：{e}） 说明=run.bat 失败时按普通启动失败处理"
+                    ));
+                }
+            }
+        }
+        self.launch_spec(idx, bat_spec, watch, false);
+    }
+
+    /// 组装「直连 java」启动命令（不经 cmd / run.bat）：
+    /// - 目录里有 run.bat：按 run.bat 解析出的 java / JVM 参数 / 核心 jar 组装，与
+    ///   「🧪 启动诊断」组合④完全同一条命令（复用 `build_java_diag_spec`，不重复实现解析逻辑）；
+    /// - 没有 run.bat：`build_launch_spec` 给出的就是自定义启动命令模板那条链，直接用。
+    /// 解析不出可用的 java / 核心 jar 时返回 `Err(原因)`，调用方按启动失败处理。
+    fn build_direct_java_spec(&self, idx: usize) -> Result<LaunchSpec, String> {
+        let base = self
+            .build_launch_spec(idx)
+            .ok_or_else(|| "服务器下标越界".to_string())?;
+        if !base.dir.join("run.bat").exists() {
+            // 没有 run.bat：build_launch_spec 返回的就是自定义启动命令模板那条链，直接用它
+            return Ok(base);
+        }
+        let (prog, args, _detail) = self.build_java_diag_spec(idx)?;
+        Ok(LaunchSpec {
+            prog,
+            args,
+            dir: base.dir,
+            envs: base.envs,
+            priv_tmp: base.priv_tmp,
+            tmp_warn: base.tmp_warn,
+            kind: "直连 java".to_string(),
+        })
+    }
+
+    /// 执行 run.bat 启动失败后的自动回退：用启动时就解析好的直连 java 命令重新拉起
+    /// （每次启动最多回退一次；回退后的进程走完整编排，关服快照与崩溃检测照常生效）。
+    fn fallback_restart(&mut self, idx: usize) {
+        let Some(mut spec) = self
+            .runtimes
+            .get_mut(idx)
+            .and_then(|rt| rt.fallback_watch.take())
+            .map(|w| w.spec)
+        else {
+            return;
+        };
+        if idx >= self.cfg.servers.len() {
+            return;
+        }
+        spec.kind = "直连 java（run.bat 失败回退）".to_string();
+        self.launch_spec(idx, spec, None, true);
+    }
+
+    /// 按给定命令启动一台服务器并接管（`start_server` 与 run.bat 失败自动回退共用同一条路径，
+    /// 保证回退启动同样走完整编排：Job / 日志尾随 / 私有 TEMP / 关服快照 / 崩溃检测）。
+    /// `watch`：Some 时开启「run.bat 启动失败自动回退」观察窗口；`fallback`：本次是否属于回退启动。
+    fn launch_spec(
+        &mut self,
+        idx: usize,
+        spec: LaunchSpec,
+        watch: Option<FallbackWatch>,
+        fallback: bool,
+    ) {
+        // 回退启动前已把失败的 cmd 子进程清空，这里只做兜底判断（重入则直接返回）
+        if self
+            .runtimes
+            .get(idx)
+            .map(|rt| rt.proc.is_some())
+            .unwrap_or(true)
+        {
+            return;
+        }
+        let Some(sc) = self.cfg.servers.get(idx).cloned() else {
+            return;
+        };
+        let dir = spec.dir.clone();
         let priv_tmp = spec.priv_tmp.clone();
         let tmp_warn = spec.tmp_warn.clone();
         // 私有临时目录可写性探测：Low IL / ACL 异常时子进程用不了这个 TEMP 会启动失败，
@@ -3672,8 +3995,9 @@ impl App {
         process::launch_log_ctx(
             &ctx,
             &format!(
-                "阶段=准备 分支={} 注入环境={} 私有TEMP={} 私有TEMP探测={} 私有TEMP警告={}",
+                "阶段=准备 分支={} 是否回退启动={} 注入环境={} 私有TEMP={} 私有TEMP探测={} 私有TEMP警告={}",
                 spec.kind,
+                fallback,
                 process::env_pairs_text(&spec.envs),
                 priv_tmp
                     .as_ref()
@@ -3698,6 +4022,10 @@ impl App {
                 rt.last_exit_code = None;
                 rt.last_stderr.clear();
                 rt.proc = Some(mp);
+                // run.bat 启动失败的观察窗口（None = 本次不观察）与「回退启动」标记：
+                // 回退后的进程同样由这里接管，关服快照 / 崩溃检测 / 日志尾随照常生效
+                rt.fallback_watch = watch;
+                rt.fallback_started = fallback;
                 // 本工具已接管这条进程：清掉外部实例标记，避免状态显示成"外部启动"
                 rt.external = None;
                 rt.adopted_pid = None;
@@ -3717,16 +4045,23 @@ impl App {
                 if let Some(t) = &mut rt.log_tail {
                     t.seek_end();
                 }
-                rt.last_msg = match (&priv_tmp, &tmp_warn) {
-                    (Some(p), _) => format!(
-                        "正在启动…（TEMP/TMP/java.io.tmpdir = {}；等待服务端就绪，日志出现 Done 后提示完成）",
-                        p.display()
-                    ),
-                    (None, Some(w)) => {
-                        format!("正在启动…（{w}，已改用系统临时目录；等待服务端就绪）")
-                    }
-                    (None, None) => {
-                        "正在启动…（等待服务端就绪，日志出现 Done 后提示完成）".to_string()
+                rt.last_msg = {
+                    let base = match (&priv_tmp, &tmp_warn) {
+                        (Some(p), _) => format!(
+                            "正在启动…（TEMP/TMP/java.io.tmpdir = {}；等待服务端就绪，日志出现 Done 后提示完成）",
+                            p.display()
+                        ),
+                        (None, Some(w)) => {
+                            format!("正在启动…（{w}，已改用系统临时目录；等待服务端就绪）")
+                        }
+                        (None, None) => {
+                            "正在启动…（等待服务端就绪，日志出现 Done 后提示完成）".to_string()
+                        }
+                    };
+                    if fallback {
+                        format!("回退启动（run.bat 启动失败，已自动改用直连 java）：{base}")
+                    } else {
+                        base
                     }
                 };
                 // 自动重启计时起点：每次成功启动都记录，interval 模式从此刻起�?
@@ -3737,7 +4072,12 @@ impl App {
                     sc.start_count = sc.start_count.saturating_add(1);
                     self.save_config();
                 }
-                process::launch_log_ctx(&ctx, "阶段=启动编排 结果=已接管（界面已开始等待服务端就绪）");
+                process::launch_log_ctx(
+                    &ctx,
+                    &format!(
+                        "阶段=启动编排 结果=已接管（界面已开始等待服务端就绪；回退启动={fallback}）"
+                    ),
+                );
             }
             Err(e) => {
                 process::launch_log_ctx(
@@ -3904,7 +4244,9 @@ impl App {
                 ),
                 Some(true) if !cmd_layer_ok => report.push_str(
                     "结论：组合④（直接启动 java）成功，而经 cmd/run.bat 的组合失败 ⇒ \
-                     问题在 cmd/bat 这一层（脚本分支、退出码、环境变量），不是 java 创建受限。\n",
+                     问题在 cmd/bat 这一层（脚本分支、退出码、环境变量），不是 java 创建受限。\n\
+                     建议：已提供自动回退——把该服务器的启动方式设为 auto（默认）即可正常启动；\
+                     也可将 run.bat 移出目录。\n",
                 ),
                 Some(true) => report.push_str(
                     "结论：四种组合都能启动成功 —— 问题更可能在启动编排（启动时机、环境变量、\
@@ -4213,7 +4555,7 @@ impl App {
         let cmd = format!("icacls \"{dir_text}\" /setintegritylevel M /T /C");
         self.low_il_fix_cmd = cmd.clone();
         let mut lines: Vec<String> = Vec::new();
-        lines.push("当前程序运行在「低完整性级别（Low IL）」，会出现这些现象：".to_string());
+        lines.push("程序所在目录的完整性级别过低，会出现这些现象：".to_string());
         lines.push(
             "· 无法写入程序目录以外的位置，改模组/重命名/复制会报「拒绝访问 (os error 5)」；"
                 .to_string(),
@@ -4223,11 +4565,11 @@ impl App {
                 .to_string(),
         );
         lines.push(String::new());
-        lines.push("原因是程序所在目录带了 Low 完整性标签。请用管理员身份打开命令提示符，执行：".to_string());
+        lines.push("请用管理员身份打开命令提示符，执行下面的命令把目录改回正常级别：".to_string());
         lines.push(String::new());
         lines.push(cmd);
         lines.push(String::new());
-        lines.push("改完必须重启本程序才会生效（正在运行的进程会一直沿用旧令牌）。".to_string());
+        lines.push("改完必须重启本程序才会生效。".to_string());
         self.low_il_notice = Some(lines.join("\n"));
     }
 
@@ -4576,7 +4918,7 @@ impl App {
             .show(ctx, |ui| {
                 ui.label(RichText::new(format!("{name} 启动前检查结果")).strong());
                 ui.label(
-                    RichText::new("检查不会阻断启动；按建议修完再点「启动服务器」成功率更高。")
+                    RichText::new("检查不会阻断启动。")
                         .small()
                         .weak(),
                 );
@@ -4686,7 +5028,7 @@ impl App {
                 ui.label(RichText::new("stderr 最后 30 行：").strong());
                 if stderr.is_empty() {
                     ui.label(
-                        RichText::new("（本次运行没有捕获到 stderr 输出；也可能 stderr 已并入日志，见「日志」页）")
+                        RichText::new("（本次运行没有捕获到 stderr 输出）")
                             .small()
                             .weak(),
                     );
@@ -4753,6 +5095,13 @@ impl App {
 
     /// 模组"检查更新"结果窗口（BETA_MOD_UPDATE）：只报告，不自动替换/下载。
     fn ui_mod_update_window(&mut self, ctx: &egui::Context) {
+        // 开关关闭时窗口立即消失（并清掉打开标记，重新开启后不会"复活"上一次的结果）
+        if !mod_update_ui_enabled(&self.cfg) {
+            for rt in self.runtimes.iter_mut() {
+                rt.modupd_open = false;
+            }
+            return;
+        }
         let Some(idx) = self.runtimes.iter().position(|rt| rt.modupd_open) else {
             return;
         };
@@ -4779,7 +5128,7 @@ impl App {
             .show(ctx, |ui| {
                 ui.label(RichText::new(format!("{name}：模组更新检查结果")).strong());
                 ui.label(
-                    RichText::new("只检查、只报告，不会自动替换或下载；行尾标注匹配方式：指纹＝SHA1 指纹（最可靠）· slug＝按 modid 查项目 · 搜索＝Modrinth 搜索第一条（可靠度较低）")
+                    RichText::new("只检查、只报告，不会自动替换或下载；行尾为匹配方式：指纹 / slug / 搜索")
                         .small()
                         .weak(),
                 );
@@ -5361,10 +5710,17 @@ impl App {
                             self.modupd_cache.insert(r.cache_key.clone(), r.clone());
                         }
                     }
+                    let ui_on = mod_update_ui_enabled(&self.cfg);
                     if let Some(rt) = self.runtimes.get_mut(idx) {
                         rt.modupd_busy = false;
-                        rt.modupd_rows = rows;
-                        rt.modupd_open = true;
+                        // 开关在检查过程中被关闭：结果直接丢弃，不弹窗
+                        if ui_on {
+                            rt.modupd_rows = rows;
+                            rt.modupd_open = true;
+                        } else {
+                            rt.modupd_rows.clear();
+                            rt.modupd_open = false;
+                        }
                         rt.modupd_progress.clear();
                     }
                 }
@@ -5443,6 +5799,11 @@ impl App {
     /// → Modrinth 搜索取第一条候选；串行 + 每个之间 200ms，避免打爆 API。
     /// 只检查、只报告，不自动替换/下载。
     fn spawn_mod_update_check(&mut self, idx: usize) {
+        // 开关关闭时不起后台任务（UI 已隐藏，这里再兜一层，防止其它调用路径漏判）
+        if !mod_update_ui_enabled(&self.cfg) {
+            self.set_toast("「模组检查更新」未启用：设置 → 测试功能 里开启".to_string());
+            return;
+        }
         if idx >= self.cfg.servers.len() || idx >= self.runtimes.len() {
             return;
         }
@@ -5931,6 +6292,9 @@ impl App {
     let mut plugin_evts: Vec<PluginEvt> = Vec::new();
     // 本帧检测到的服务器退出事件：(序号, 退出码, 日志尾部, 是否有新崩溃报告)
     let mut exit_events: Vec<(usize, Option<i32>, String, bool)> = Vec::new();
+    // 本帧判定为「run.bat 启动失败」、需要自动回退直连 java 的服务器序号
+    // （循环内不能回调 self，统一在循环结束后重启，避免与 runtimes 的可变借用冲突）
+    let mut fallback_queue: Vec<usize> = Vec::new();
     let plugins_active = self
         .plugins
         .as_ref()
@@ -5995,6 +6359,64 @@ impl App {
         //   · 已接管的外部实例（rt.adopted_pid）——只能按 PID 探活，退出码拿不到。
         // 两者的后续判定完全一致，所以先收集成 exit_evt 再统一处理。
         let mut exit_evt: Option<(Option<i32>, Vec<String>, String)> = None;
+        // ── run.bat 启动失败自动回退：启动后 3 秒内观察（只在 launch_mode=auto 且本次走 run.bat 时）──
+        // 判定（三条同时成立）：子进程已自行退出且退出码非 0、`logs\latest.log` 的 size/mtime
+        // 与启动前基线相比都没变化（说明 java 从未起来）、直连 java 的命令已在启动前解析成功
+        //（第三条不成立时压根没有观察窗口）。判定成立立刻清掉这次失败的启动，本帧末尾改用
+        // 直连 java 重新拉起 —— 不走"崩溃"路径，否则会先弹一次「启动失败」再回退。
+        // 每帧开销：窗口期内一次 `metadata`（微秒级），不阻塞 UI。
+        if rt.stopping {
+            // 用户已在停止这次启动：不再回退
+            rt.fallback_watch = None;
+        } else if rt.fallback_watch.is_some() {
+            let expired = rt
+                .fallback_watch
+                .as_ref()
+                .map(|w| std::time::Instant::now() >= w.deadline)
+                .unwrap_or(true);
+            if expired {
+                if let Some(w) = rt.fallback_watch.take() {
+                    process::launch_log_line(&format!(
+                        "阶段=回退观察 结果=不回退（{}ms 观察窗口结束时未满足失败条件） 启动方式=run.bat",
+                        w.start.elapsed().as_millis()
+                    ));
+                }
+            } else {
+                let code_now: Option<Option<i32>> =
+                    rt.proc.as_ref().map(|p| process::exit_code(p));
+                let log_changed = rt
+                    .fallback_watch
+                    .as_ref()
+                    .map(|w| log_signature(&w.log_path) != w.log_sig)
+                    .unwrap_or(true);
+                if bat_start_failed(code_now, log_changed) {
+                    let code_text = match code_now {
+                        Some(Some(c)) => c.to_string(),
+                        Some(None) => "异常终止（无退出码）".to_string(),
+                        None => "?".to_string(),
+                    };
+                    let waited_ms = rt
+                        .fallback_watch
+                        .as_ref()
+                        .map(|w| w.start.elapsed().as_millis())
+                        .unwrap_or(0);
+                    process::launch_log_line(&format!(
+                        "阶段=回退 原因=bat 启动失败(退出码={code_text},日志无变化) 改用=直连 java 观察={waited_ms}ms"
+                    ));
+                    // 记录本次运行的退出码，便于「查看启动日志」时对照
+                    rt.last_exit_code = code_now.flatten();
+                    // 只是丢弃这条已退出的 cmd 子进程（不 kill 进程树：日志毫无变化已说明
+                    // java 没起来，万一有残留也由下面的直连 java 自己报端口占用）。
+                    // 观察窗口留在 rt 上，由本帧末尾的 fallback_restart 取走里面的直连 java 命令
+                    rt.proc = None;
+                    rt.startup_notified = false;
+                    rt.last_msg = format!(
+                        "run.bat 启动失败（退出码 {code_text}，日志无变化），正在改用直连 java 启动…"
+                    );
+                    fallback_queue.push(idx);
+                }
+            }
+        }
         if let Some(p) = &rt.proc {
             if !rt.stopping && !process::is_running(p) {
                 exit_evt = Some((
@@ -6253,6 +6675,28 @@ impl App {
                 rt.proc = None;
             }
         }
+    }
+    // run.bat 启动失败 → 本帧立刻自动回退：通知 + 用直连 java 重新启动（每次启动最多回退一次）。
+    // 回退后的进程与普通启动完全同一条编排路径，关服快照 / 崩溃检测 / 日志尾随照常生效。
+    for idx in fallback_queue {
+        let name = self
+            .cfg
+            .servers
+            .get(idx)
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+        process::launch_log_line(&format!(
+            "阶段=回退 结果=正在用直连 java 重新启动（服务器={name}）"
+        ));
+        self.push_toast_with_launch_log(
+            "XMST - 已自动改用直连 java",
+            &format!("{name}：run.bat 启动失败，已自动改用直连 java 启动"),
+        );
+        self.sys_toast(
+            "XMST - 已自动改用直连 java",
+            &format!("{name}：run.bat 启动失败，已自动改用直连 java 启动"),
+        );
+        self.fallback_restart(idx);
     }
     // 统一投递本次收集的通知（循环结束后避免借用冲突）桌面弹窗 + 工具内通知同步
     for (title, body) in notify_queue {
@@ -6944,6 +7388,11 @@ impl App {
                 return;
             }
         } else if kind == "rathole" {
+            // 测试功能「穿透内核 rathole」关闭时不创建（UI 已隐藏，这里再兜一层）
+            if !features::is_enabled(&self.cfg.features, features::BETA_RATHOLE) {
+                self.set_toast("「穿透内核 rathole」未启用：设置 → 测试功能 里开启".to_string());
+                return;
+            }
             if self.add_rh_server_addr.trim().is_empty() {
                 self.set_toast("请填写 rathole 服务器地址（server_addr）".to_string());
                 return;
@@ -7317,6 +7766,10 @@ impl App {
     // ---------- 阶段5：BackupScheduler 远程存储（本地/UNC/WebDAV）----------
     /// 备份完成后转存远端：target 为空不动作；后台线程执行复制/PUT，结果回传 remote_rx。
     fn try_remote_upload(&mut self, i: usize, zip_path: PathBuf) {
+        // 测试功能「备份远端转存」关闭时不发起（调用点已过滤，这里再兜一层）
+        if !features::is_enabled(&self.cfg.features, features::BETA_REMOTE_BACKUP) {
+            return;
+        }
         let Some(sc) = self.cfg.servers.get(i) else {
             return;
         };
@@ -8189,6 +8642,16 @@ impl App {
 
     /// 消费 mods 更新回传（每帧）
     fn tick_mod_update(&mut self) {
+        // 开关关闭：不再消费旧任务的回传，并清掉进行中/待更新状态（避免"UI 已隐藏但结果仍写入"）
+        if !mod_update_ui_enabled(&self.cfg) {
+            for rt in self.runtimes.iter_mut() {
+                rt.mod_update_shared = None;
+                rt.mod_update_busy = false;
+                rt.mod_update_pending = None;
+                rt.mod_update_msg.clear();
+            }
+            return;
+        }
         for idx in 0..self.runtimes.len() {
             let mut done: Option<Result<String, String>> = None;
             {
@@ -9145,7 +9608,13 @@ impl App {
         if let Some(old) = self
             .toasts
             .iter_mut()
-            .find(|t| t.cancel_server.is_none() && t.open_dir.is_none() && t.title == title && t.body == body)
+            .find(|t| {
+                t.cancel_server.is_none()
+                    && t.open_dir.is_none()
+                    && t.open_file.is_none()
+                    && t.title == title
+                    && t.body == body
+            })
         {
             old.born = std::time::Instant::now();
             return;
@@ -9158,6 +9627,7 @@ impl App {
             born: std::time::Instant::now(),
             cancel_server: None,
             open_dir: None,
+            open_file: None,
         });
         self.trim_toasts();
     }
@@ -9172,6 +9642,24 @@ impl App {
             born: std::time::Instant::now(),
             cancel_server: None,
             open_dir: Some(dir),
+            open_file: None,
+        });
+        self.trim_toasts();
+    }
+
+    /// 带「查看启动日志」按钮的通知：用于 bat 启动失败自动回退这类"要看启动记录才能定位"的场景。
+    fn push_toast_with_launch_log(&mut self, title: &str, body: &str) {
+        // 按钮要能打开文件，先把日志文件建出来（best-effort，失败也照常弹通知）
+        process::ensure_launch_log();
+        self.next_toast_id += 1;
+        self.toasts.push(ToastMsg {
+            id: self.next_toast_id,
+            title: title.to_string(),
+            body: body.to_string(),
+            born: std::time::Instant::now(),
+            cancel_server: None,
+            open_dir: None,
+            open_file: Some(process::launch_log_path()),
         });
         self.trim_toasts();
     }
@@ -9191,6 +9679,7 @@ impl App {
             born: std::time::Instant::now(),
             cancel_server: Some(idx),
             open_dir: None,
+            open_file: None,
         });
         self.trim_toasts();
     }
@@ -9342,7 +9831,7 @@ $timer.Start(); \
         let anim = if self.cfg.ui_animations { 0.25_f32 } else { 0.001_f32 }; // 进出动画时长（秒）；关闭动效时近似瞬时
         let total = hold + 2.0 * anim;
         // 逐条计算位置与透明度，渲染后移除过期项
-        // (id, 标题, 正文, 取消按钮目标服务器, 倒计时秒数, 位置, 透明度, 实测卡片高度, 打开目录按钮目标)
+        // (id, 标题, 正文, 取消按钮目标服务器, 倒计时秒数, 位置, 透明度, 实测卡片高度, 打开目录按钮目标, 查看启动日志目标)
         let mut render: Vec<(
             u64,
             String,
@@ -9352,6 +9841,7 @@ $timer.Start(); \
             egui::Pos2,
             f32,
             f32,
+            Option<PathBuf>,
             Option<PathBuf>,
         )> = Vec::new();
         let mut alive: Vec<ToastMsg> = Vec::new();
@@ -9380,6 +9870,7 @@ $timer.Start(); \
                 born: t.born,
                 cancel_server: t.cancel_server,
                 open_dir: t.open_dir.clone(),
+                open_file: t.open_file.clone(),
             });
             let alpha = if el < anim {
                 el / anim
@@ -9396,8 +9887,8 @@ $timer.Start(); \
                 continue;
             }
             // 按本条卡片的真实高度计算它的位置（y_bottom 逐条累加，任何高度组合都不会重叠）
-            // 「取消自动重启」与「打开所在目录」都只占一行按钮，高度预留同理
-            let has_btn_row = pending || t.open_dir.is_some();
+            // 「取消自动重启」「打开所在目录」「查看启动日志」都只占一行按钮，高度预留同理
+            let has_btn_row = pending || t.open_dir.is_some() || t.open_file.is_some();
             let h = measure_toast_card_height(ctx, &t.title, &t.body, has_btn_row, text_w);
             let y = y_bottom - h;
             if y < screen.top() {
@@ -9430,14 +9921,16 @@ $timer.Start(); \
                 alpha,
                 h,
                 t.open_dir.clone(),
+                t.open_file.clone(),
             ));
             y_bottom = y - gap;
         }
         self.toasts = alive;
-        // 点击取消 / 打开目录只记录，渲染循环结束后统一处理（避免与 self.toasts 的借用冲突）
+        // 点击取消 / 打开目录 / 查看启动日志只记录，渲染循环结束后统一处理（避免与 self.toasts 的借用冲突）
         let mut cancel_clicked: Option<usize> = None;
         let mut open_dir_clicked: Option<PathBuf> = None;
-        for (id, title, body, cancel_server, countdown, pos, alpha, card_h, open_dir) in render {
+        let mut open_file_clicked: Option<PathBuf> = None;
+        for (id, title, body, cancel_server, countdown, pos, alpha, card_h, open_dir, open_file) in render {
             let mut clicked_here = false;
             // 左侧强调条按卡片实际高度铺满（上下各留 8px），不再用固定高度推算
             let bar_h = (card_h - 16.0).max(24.0);
@@ -9508,6 +10001,17 @@ $timer.Start(); \
                                             clicked_here = true;
                                         }
                                     });
+                                } else if let Some(f) = &open_file {
+                                    // 「查看启动日志」：自动回退这类问题要看 data\launch.log 才能定位
+                                    ui.add_space(4.0);
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .add(egui::Button::new(RichText::new("查看启动日志").size(12.0)))
+                                            .clicked()
+                                        {
+                                            open_file_clicked = Some(f.clone());
+                                        }
+                                    });
                                 } else if let Some(dir) = &open_dir {
                                     // 「打开所在目录」：诊断包导出后直接给出入口，省得用户去找文件
                                     ui.add_space(4.0);
@@ -9546,6 +10050,10 @@ $timer.Start(); \
         // 「打开所在目录」：在资源管理器里打开该目录（路径已是绝对路径）
         if let Some(dir) = open_dir_clicked {
             self.open_folder(&dir);
+        }
+        // 「查看启动日志」：打开 data\launch.log 所在目录并选中该文件
+        if let Some(f) = open_file_clicked {
+            self.open_file_location(&f);
         }
     }
 }
@@ -12256,7 +12764,7 @@ impl eframe::App for App {
                 .show(ctx, |ui| {
                     if let Some((_, _, name)) = &self.confirm_delete_backup {
                         ui.label(format!("确定删除备份 [{name}] 吗？"));
-                        ui.label(RichText::new("该操作不可撤销。硬链接快照删除某一份只减少链接数，其它快照的数据仍然完整。").color(Color32::YELLOW));
+                        ui.label(RichText::new("该操作不可撤销。").color(Color32::YELLOW));
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             if ui.button("确认删除").clicked() {
@@ -12922,7 +13430,10 @@ impl App {
             self.rename_server = Some((i, name));
         }
         if let Some(i) = to_backup_now {
-            if self.cfg.servers.get(i).is_some() {
+            // 「立即备份」入口本身受 BETA_BACKUP 门控，这里再核一次开关，避免任何路径绕过
+            if features::is_enabled(&self.cfg.features, features::BETA_BACKUP)
+                && self.cfg.servers.get(i).is_some()
+            {
                 let nm = self.cfg.servers[i].name.clone();
                 self.spawn_backup(i, backup::BackupReason::Manual, true);
                 self.set_toast(format!("已对「{nm}」发起立即备份"));
@@ -13008,6 +13519,8 @@ impl App {
         ui.spacing_mut().item_spacing.y = 2.0;
         ui.spacing_mut().item_spacing.x = 4.0; // 页签间距收紧，选项整体靠左
         // 玩家管理页签仅在 BETA_PLAYERS 启用时出现（渐进式开关：关闭时不占用 UI 与调度）
+        let players_on = features::is_enabled(&self.cfg.features, features::BETA_PLAYERS);
+        let special_on = features::is_enabled(&self.cfg.features, features::BETA_SPECIAL);
         let mut tabs: Vec<(&str, ServerTab)> = vec![
             ("概览", ServerTab::Overview),
             ("服务器设置", ServerTab::Scripts),
@@ -13015,12 +13528,19 @@ impl App {
             ("自动功能", ServerTab::Backup),
             ("服务器状态", ServerTab::Status),
         ];
-        if features::is_enabled(&self.cfg.features, features::BETA_PLAYERS) {
+        if players_on {
             tabs.insert(4, ("玩家管理", ServerTab::Players));
         }
         // 特殊功能页在总开关 BETA_SPECIAL 启用时出现（2026-10-02 起属测试功能，默认禁用；可在设置-测试中的功能开关）
-        if features::is_enabled(&self.cfg.features, features::BETA_SPECIAL) {
+        if special_on {
             tabs.push(("特殊功能", ServerTab::Special));
+        }
+        // 开关关闭时当前页签立即失效：先回落到概览，避免"页签消失了页面还开着"
+        if !players_on && self.server_tab == ServerTab::Players {
+            self.server_tab = ServerTab::Overview;
+        }
+        if !special_on && self.server_tab == ServerTab::Special {
+            self.server_tab = ServerTab::Overview;
         }
         let n_tabs = tabs.len() as f32;
         let target_idx = tabs
@@ -13296,6 +13816,10 @@ impl App {
 
     /// 特殊功能页：Spark 性能分析（问题2 重构：总折叠 + 子折叠，左侧分析控制 + 右侧输出/预览）
     fn ui_special(&mut self, ui: &mut egui::Ui, idx: usize) {
+        // 总开关关闭时不渲染整页（页签已由 ui_server_detail 收回，这里再兜一层）
+        if !features::is_enabled(&self.cfg.features, features::BETA_SPECIAL) {
+            return;
+        }
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -13787,6 +14311,12 @@ impl App {
         } else {
             RunKind::Stopped
         };
+        // 本次运行是否由「run.bat 失败自动回退直连 java」启动（状态卡片要能看出来）
+        let fallback_started = self
+            .runtimes
+            .get(idx)
+            .map(|r| r.fallback_started)
+            .unwrap_or(false);
         let busy = running || stopping || adopted;
         let last_msg = self.runtimes.get(idx).map(|r| r.last_msg.clone()).unwrap_or_default();
         // 预检结果摘要（失败数 / 警告数），用于按钮旁的提示
@@ -13849,7 +14379,14 @@ impl App {
                 ("正在停止…".to_string(), Color32::from_rgb(240, 200, 120))
             } else {
                 match run_kind {
-                    RunKind::Managed => ("运行中".to_string(), Color32::from_rgb(80, 200, 120)),
+                    RunKind::Managed => (
+                        if fallback_started {
+                            "运行中（回退启动：直连 java）".to_string()
+                        } else {
+                            "运行中".to_string()
+                        },
+                        Color32::from_rgb(80, 200, 120),
+                    ),
                     RunKind::Adopted => (
                         "运行中（外部启动·已接管）".to_string(),
                         Color32::from_rgb(230, 190, 110),
@@ -13907,6 +14444,16 @@ impl App {
                 }
                 if !last_msg.is_empty() {
                     ui.label(RichText::new(last_msg.clone()).small().weak());
+                }
+                if fallback_started {
+                    ui.label(
+                        RichText::new(
+                            "本次为「回退启动」：run.bat 启动失败（自行退出且日志无变化），已自动改用直连 java；\
+                             可在「启动脚本」把启动方式设为 java 以跳过 run.bat",
+                        )
+                        .small()
+                        .color(Color32::from_rgb(240, 200, 120)),
+                    );
                 }
                 if !sc.dir.exists() {
                     ui.label(RichText::new("⚠ 目录不存在").small().color(Color32::RED));
@@ -13987,7 +14534,7 @@ impl App {
                 if let RunKind::External = run_kind {
                     if ui
                         .add(egui::Button::new(RichText::new("🤝 接管").strong()))
-                        .on_hover_text("把该进程纳入运行时状态：之后停止/强停/崩溃检测/关服快照都对其生效（无法发送控制台命令）")
+                        .on_hover_text("纳入工具管理：停止/崩溃检测/关服快照生效（无法发送控制台命令）")
                         .clicked()
                     {
                         self.adopt_external(idx);
@@ -14070,7 +14617,7 @@ impl App {
             // 打开启动日志：打开 data\launch.log 所在目录并选中该文件
             if ui
                 .button("📄 打开启动日志")
-                .on_hover_text("打开 data\\launch.log 所在目录并选中它（每次启动的命令、环境、Job 限制、PID、退出码、结束原因与最后 15 行输出）")
+                .on_hover_text("打开 data\\launch.log 所在目录并选中它")
                 .clicked()
             {
                 process::ensure_launch_log();
@@ -14418,7 +14965,7 @@ impl App {
                 });
                 ui.label(
                     RichText::new(format!(
-                        "编码: {} · 换行: {}（批处理文件按 GBK/ANSI 保存以免控制台中文乱码）",
+                        "编码: {} · 换行: {}",
                         run_meta.enc.label(),
                         if run_meta.crlf { "CRLF" } else { "LF" }
                     ))
@@ -14442,7 +14989,52 @@ impl App {
 
         // 分区三：启动脚本（run.bat / user_jvm_args / 自定义启动命令）
         ui.label(RichText::new("启动脚本").strong());
-        ui.label("run.bat 存在时启动优先执行；未使用 run.bat 时按下方自定义启动命令或工具默认设置启动");
+        ui.label("run.bat 存在且启动方式为 auto/bat 时优先执行脚本；启动方式为 java 时始终直连 java（按脚本解析出的 Java/JVM 参数/核心 jar）");
+        ui.separator();
+
+        // 启动方式（每服务器）：auto（默认）/ bat / java。解决"无控制台 GUI 进程经 cmd→bat→java
+        // 起不来"的环境问题：auto 会在 run.bat 自行以非 0 退出且日志无变化时自动改用直连 java。
+        ui.label(RichText::new("启动方式").strong());
+        {
+            let mut mode_now = normalize_launch_mode(&self.cfg.servers[idx].launch_mode).to_string();
+            let mode_before = mode_now.clone();
+            egui::ComboBox::from_id_salt("launch_mode")
+                .selected_text(match mode_now.as_str() {
+                    "bat" => "bat：只使用 run.bat",
+                    "java" => "java：始终直连 java",
+                    _ => "auto：优先 run.bat，失败自动改用直连 java",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut mode_now,
+                        "auto".to_string(),
+                        "auto：优先 run.bat，失败自动改用直连 java",
+                    );
+                    ui.selectable_value(&mut mode_now, "bat".to_string(), "bat：只使用 run.bat");
+                    ui.selectable_value(
+                        &mut mode_now,
+                        "java".to_string(),
+                        "java：始终直连 java（跳过 run.bat）",
+                    );
+                });
+            ui.label(
+                RichText::new("auto：优先 run.bat，失败自动改用直连 java（推荐）")
+                    .weak()
+                    .small(),
+            );
+            if mode_now != mode_before {
+                self.cfg.servers[idx].launch_mode = mode_now.clone();
+                self.save_config();
+                self.set_toast(format!(
+                    "启动方式已设为 {}（下次启动生效）",
+                    match mode_now.as_str() {
+                        "bat" => "bat：只使用 run.bat",
+                        "java" => "java：始终直连 java",
+                        _ => "auto：优先 run.bat，失败自动改用直连 java",
+                    }
+                ));
+            }
+        }
         ui.separator();
 
         // 生成启动脚本：按当前 Java / JVM 参数 / 核心 jar 生成一份 run.bat
@@ -14451,7 +15043,7 @@ impl App {
             if ui
                 .button("🛠 生成 run.bat")
                 .on_hover_text(
-                    "按当前 Java 路径、JVM 参数与核心 jar 生成 GBK 编码的 run.bat（覆盖前自动备份）；\n不含 pause、MAX_RESTARTS=1、TEMP/TMP 与 java.io.tmpdir 指向 %~dp0tmp",
+                    "按当前 Java、JVM 参数与核心 jar 生成 run.bat（覆盖前自动备份）",
                 )
                 .clicked()
             {
@@ -14470,13 +15062,13 @@ impl App {
                             self.runtimes[idx].run_bat_edit = Some(text);
                             self.runtimes[idx].run_bat_meta = Some(meta);
                         }
-                        self.set_toast(format!("已生成 {}", p.display()));
+                        self.set_toast(format!("已生成 run.bat：{}", p.display()));
                     }
                     Err(e) => self.set_toast(format!("生成失败: {e}")),
                 }
             }
             ui.label(
-                RichText::new("GBK 编码 · 无 pause · MAX_RESTARTS=1 · 临时目录指向 tmp")
+                RichText::new("GBK 编码 · 重启交给工具（MAX_RESTARTS=1）· 临时目录指向 tmp")
                     .weak()
                     .small(),
             );
@@ -14572,9 +15164,9 @@ impl App {
         };
         let mut upt = self.cfg.servers[idx].use_private_tmp;
         if ui
-            .checkbox(&mut upt, "独立临时目录（修复 JNA/SQLite 原生库加载失败）")
+            .checkbox(&mut upt, "独立临时目录")
             .on_hover_text(format!(
-                "把服务器的 TEMP/TMP 与 java.io.tmpdir 指向 {}；某些模组（Spark/JNA/OSHW、使用 SQLite 的插件）在全局临时目录有残留时会加载失败。",
+                "把服务器的 TEMP/TMP 与 java.io.tmpdir 指向 {}（部分模组在系统临时目录里会加载失败）",
                 dir.join(&tmp_name_hint).display()
             ))
             .changed()
@@ -14615,7 +15207,7 @@ impl App {
 
         // 开机自启（配合全局"开机自动启�?XMST"使用�?-autostart 模式下生效）
         ui.label(RichText::new("开机自启").strong());
-        ui.label("需先在设置页勾选「开机自动启动 XMST」；勾选后本机开机登录时等待 CPU 空闲再自动启动本服务器（错峰）");
+        ui.label("需先在设置页勾选「开机自动启动 XMST」；勾选后开机登录时错峰自动启动本服务器");
         let mut ae = self.cfg.servers[idx].autostart_enabled;
         if ui.checkbox(&mut ae, "开机自动启动本服务器").changed() {
             self.cfg.servers[idx].autostart_enabled = ae;
@@ -14630,7 +15222,7 @@ impl App {
 
         // Java 设置：服务器�?MC 版本 + 指定全局列表�?
         ui.label(RichText::new("Java 设置").strong());
-        ui.label("未使用 run.bat 时优先执行 run.bat；无 run.bat 时按下方解析链自动选择 Java");
+        ui.label("启动方式为 auto/bat 且有 run.bat 时以脚本内的 Java 为准；否则按下方解析链自动选择 Java");
         ui.horizontal(|ui| {
             ui.label("MC 版本");
             let mut ver = self.cfg.servers[idx].mc_version.clone().unwrap_or_default();
@@ -14690,7 +15282,13 @@ impl App {
         let resolved = resolve_java_for_server(&cfg, &sc);
         ui.label(RichText::new(format!("当前解析: {resolved}")).weak());
         if run_bat.exists() {
-            ui.label(RichText::new("（run.bat 存在，启动时优先执行 run.bat，Java 以脚本内为准").weak());
+            let mode = normalize_launch_mode(&sc.launch_mode);
+            let text = match mode {
+                "java" => "（启动方式=java：忽略 run.bat，按上面的解析结果直连 java）",
+                "bat" => "（启动方式=bat：只执行 run.bat，Java 以脚本内为准；失败不回退）",
+                _ => "（启动方式=auto：优先 run.bat；脚本启动失败时自动改用直连 java，Java 以解析结果为准）",
+            };
+            ui.label(RichText::new(text).weak());
         }
         // 末尾补一段不小于内容区内边距的留白：为什么必须保证最底部内容可达——
         // 窗口高度较低时内容区底部内边距（CONTENT_EDGE_PAD）会吃掉最后一行，
@@ -15199,6 +15797,10 @@ impl App {
 
     /// 玩家管理页（B1 四 Tab：在线 / 白名单 / 封禁 / OP；操作双路径；B5 序号防竞态）
     fn ui_players(&mut self, ui: &mut egui::Ui, idx: usize) {
+        // 开关关闭时不渲染（页签已由 ui_server_detail 收回，这里再兜一层）
+        if !features::is_enabled(&self.cfg.features, features::BETA_PLAYERS) {
+            return;
+        }
         let dir = self.cfg.servers[idx].dir.clone();
         ui.add_space(6.0);
         ui.label(RichText::new("玩家管理").size(15.0).strong());
@@ -15561,6 +16163,8 @@ impl App {
                 }
             }
             if self.runtimes[idx].file_tab == "mods" {
+                // 测试功能「网络下载」关闭时不渲染「下载模组」入口（避免"按钮在、点了才说没启用"）
+                if features::is_enabled(&self.cfg.features, features::BETA_DOWNLOAD) {
                 // 功能优化：进入模组页即识别该服务端平台 ——
                 // 原版/纯插件端不支持模组，直接把「下载模组」按钮置灰并说明原因；
                 // 模组端则把识别到的加载器/版本记下来，点下载时自动套用。
@@ -15601,20 +16205,21 @@ impl App {
                         self.set_toast("下载功能未启用".to_string());
                     }
                 }
+                }
                 if ui
                     .button("🔍 排查客户端模组")
-                    .on_hover_text("重新扫描 mods 下所有 .jar：只按元数据（fabric/quilt 的 environment、forge/neoforge 的 displayTest）判断「仅客户端」；mixin 配置与文件名只作为「疑似」候选列出，仅供参考")
+                    .on_hover_text("重新扫描 mods 下所有 .jar；「仅客户端」只按元数据判定，mixin 与文件名仅作参考")
                     .clicked()
                 {
                     self.runtimes[idx].file_client_mods_window = true;
                     self.runtimes[idx].file_client_mods_scanned = false;
                 }
-                // 模组检查更新（测试功能，默认关闭）：SHA1 指纹优先 + modid/搜索兜底，只报告不替换
-                if features::is_enabled(&self.cfg.features, features::BETA_MOD_UPDATE) {
+                // 模组检查更新（测试功能，默认关闭）：关闭时工具栏不渲染该按钮，每帧按当前配置判断
+                if mod_update_ui_enabled(&self.cfg) {
                     let busy = self.runtimes[idx].modupd_busy;
                     if ui
                         .add_enabled(!busy, egui::Button::new(if busy { "检查更新中…" } else { "🔄 检查更新" }))
-                        .on_hover_text("按 jar 的 SHA1 指纹查 Modrinth（最可靠），未命中再按 modid、最后按名称搜索；串行请求 + 限速，只报告不替换")
+                        .on_hover_text("按 SHA1 指纹、modid、名称依次查 Modrinth；只报告，不替换文件")
                         .clicked()
                     {
                         self.spawn_mod_update_check(idx);
@@ -16065,28 +16670,35 @@ impl App {
                                                         }
                                                     }
                                                 }
-                                                // PCL 式更新：Modrinth 指纹检测 -> 下载替换
-                                                let is_update_target =
-                                                    &self.runtimes[idx].mod_update_target == name;
-                                                if is_update_target
-                                                    && self.runtimes[idx].mod_update_pending.is_some()
-                                                {
-                                                    if ui.button("⬇ 更新").clicked() {
-                                                        self.mod_update_apply(idx);
+                                                // mods 内 .jar 的更新入口（测试功能「模组检查更新」，默认关闭）：
+                                                // 开关关闭时该行的「🔄 更新」「⬇ 更新」与结果文字都不渲染
+                                                if mod_update_ui_enabled(&self.cfg) {
+                                                    let is_update_target =
+                                                        &self.runtimes[idx].mod_update_target == name;
+                                                    if is_update_target
+                                                        && self.runtimes[idx].mod_update_pending.is_some()
+                                                    {
+                                                        if ui.button("⬇ 更新").clicked() {
+                                                            self.mod_update_apply(idx);
+                                                        }
+                                                    } else if ui
+                                                        .button("🔄 更新")
+                                                        .on_hover_text("通过 Modrinth 指纹检查并更新到最新版本")
+                                                        .clicked()
+                                                    {
+                                                        self.mod_update_check(idx, name, is_jar_disabled);
                                                     }
-                                                } else if ui
-                                                    .button("🔄 更新")
-                                                    .on_hover_text("通过 Modrinth 指纹检查并更新到最新版本")
-                                                    .clicked()
-                                                {
-                                                    self.mod_update_check(idx, name, is_jar_disabled);
-                                                }
-                                                if is_update_target && !self.runtimes[idx].mod_update_msg.is_empty() {
-                                                    ui.label(
-                                                        RichText::new(self.runtimes[idx].mod_update_msg.clone())
+                                                    if is_update_target
+                                                        && !self.runtimes[idx].mod_update_msg.is_empty()
+                                                    {
+                                                        ui.label(
+                                                            RichText::new(
+                                                                self.runtimes[idx].mod_update_msg.clone(),
+                                                            )
                                                             .weak()
                                                             .small(),
-                                                    );
+                                                        );
+                                                    }
                                                 }
                                             } else if editable {
                                                 if ui.button("编辑").clicked() {
@@ -16237,7 +16849,7 @@ impl App {
                             enc_now.label(),
                             if crlf_now { "CRLF" } else { "LF" },
                             if is_bat {
-                                " · 批处理文件按 GBK 保存以免控制台乱码"
+                                " · 批处理按 GBK 保存"
                             } else {
                                 ""
                             }
@@ -16357,9 +16969,8 @@ impl App {
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ui.ctx(), |ui| {
                     if !scanned {
-                        ui.label("将忽略缓存重新扫描当前 mods 目录下的所有 .jar 模组。");
-                        ui.label("「仅客户端」只按模组元数据判定（fabric/quilt 的 environment、forge/neoforge 的 displayTest）。");
-                        ui.label("mixin 配置里的 client 段、客户端类名引用、文件名关键词只作为启发式候选列出，仅供参考。");
+                        ui.label("将重新扫描当前 mods 目录下的所有 .jar 模组。");
+                        ui.label("「仅客户端」按模组元数据判定；mixin 与文件名线索只作参考。");
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             if ui.button("取消").clicked() {
@@ -16374,7 +16985,7 @@ impl App {
                         });
                     } else {
                         ui.label(
-                            RichText::new("以下为启发式推测，仅作参考，不代表只能用于客户端；Carpet/Lithium 等双端模组出现属正常。")
+                            RichText::new("以下为启发式推测，仅作参考，不代表只能用于客户端。")
                                 .color(self.fg(Color32::from_rgb(200, 170, 100))),
                         );
                         ui.add_space(4.0);
@@ -16428,7 +17039,7 @@ impl App {
                         }
                         ui.add_space(4.0);
                         ui.label(
-                            RichText::new("注：mixin 配置含 client 段在 mods 里是常态，双端/服务端模组也会命中，因此这些候选不计入任何警告。")
+                            RichText::new("注：这些线索在双端/服务端模组上也会命中，不计入任何警告。")
                                 .small()
                                 .weak(),
                         );
@@ -16579,7 +17190,7 @@ impl App {
                 ui.checkbox(&mut b.backup_on_stop, "正常关服后自动快照（推荐）");
                 ui.checkbox(&mut b.backup_on_crash, "崩溃后也自动快照");
                 ui.label(
-                    RichText::new("⚠ 不建议开启：崩溃瞬间的世界文件可能是写坏的，混入后会污染后续所有增量")
+                    RichText::new("不建议开启：崩溃瞬间的世界文件可能已损坏，会污染后续快照")
                         .color(self.fg(Color32::from_rgb(240, 176, 96)))
                         .small(),
                 );
@@ -16633,7 +17244,7 @@ impl App {
                     ui.label("份");
                 });
                 ui.label(
-                    RichText::new("硬链接快照下删除某份只减少链接数，其它快照的数据仍然完整，清理是安全的")
+                    RichText::new("删除某份只减少链接数，其它快照数据仍然完整")
                         .weak()
                         .small(),
                 );
@@ -16655,9 +17266,11 @@ impl App {
                 });
     
                 // 阶段5：远端备份目标（本地目录 / UNC / WebDAV URL）
+                // 测试功能「备份远端转存」关闭时，整块远端配置不渲染（行为层同样读该开关）
+                if features::is_enabled(&self.cfg.features, features::BETA_REMOTE_BACKUP) {
                 ui.add_space(4.0);
                 ui.label(RichText::new("远端备份目标（可选）").strong());
-                ui.label("留空 = 仅本地备份；填本地目录 / UNC 网络共享（如 D:\\backup 或 \\\\nas\\share）自动复制，或 WebDAV URL（http(s)://...）自动上传。注意：仅对旧版 zip 备份生效，快照是目录、不做远端复制");
+                ui.label("留空 = 仅本地备份；填本地目录 / UNC 网络共享（如 D:\\backup 或 \\\\nas\\share）自动复制，或 WebDAV URL（http(s)://...）自动上传；目前仅对旧版 zip 备份生效");
                 ui.horizontal(|ui| {
                     ui.label("目标:");
                     ui.add(
@@ -16689,6 +17302,7 @@ impl App {
                         RichText::new(format!("📤 远端转存失败，待重试 {left} 次"))
                             .color(self.fg(Color32::from_rgb(255, 160, 80))),
                     );
+                }
                 }
                 ui.separator();
         
@@ -16846,7 +17460,7 @@ impl App {
             .id_salt(("crash_restart_group", idx))
             .default_open(false)
             .show(ui, |ui| {
-            ui.label("进程异常退出（崩溃/强杀/断电，非手动停止）时自动重新拉起。熔断窗口内连续崩溃达到上限后停止，防止故障循环刷日志");
+            ui.label("进程异常退出（崩溃/强杀/断电，非手动停止）时自动重新拉起；熔断窗口内连续崩溃达到上限后停止");
             // run.bat 自带的 MAX_RESTARTS 重启循环与工具自重启会**叠加**（表现为"一直重启很多次"）。
             // 处理方式是**静默同步**：以脚本为准，进入本页（或切换服务器）时读一次脚本，
             // 把工具的上限对齐成脚本的值，两者一致就不会双重启；只在数值确实不一致时落盘。
@@ -17045,6 +17659,9 @@ impl App {
             let mut sync_target: Option<PathBuf> = None;
             let pin_busy = self.runtimes.get(idx).and_then(|rt| rt.pin_busy.clone());
             let sync_busy = self.runtimes.get(idx).and_then(|rt| rt.sync_busy.clone());
+            // 测试功能「备份远端转存」：整页只读一次，关闭时快照列表里不渲染「转存」按钮
+            let remote_backup_on =
+                features::is_enabled(&self.cfg.features, features::BETA_REMOTE_BACKUP);
             // 按日/月分组折叠显示（mtime 格式 %Y-%m-%d %H:%M:%S，取前 10/7 位）
             let view_mode = self.cfg.servers[idx].backup.view_mode.clone();
             let group_key = |b: &backup::BackupInfo| -> String {
@@ -17137,16 +17754,18 @@ impl App {
                                     {
                                         pin_target = Some((b.path.clone(), !pinned));
                                     }
-                                    let this_sync = sync_busy.as_deref() == Some(b.name.as_str());
-                                    if ui
-                                        .add_enabled(
-                                            !this_sync,
-                                            egui::Button::new(if this_sync { "转存中…" } else { "转存" }),
-                                        )
-                                        .on_hover_text("把该快照复制到「存储与远程」里配置的远端备份目标（本地目录 / UNC 共享）")
-                                        .clicked()
-                                    {
-                                        sync_target = Some(b.path.clone());
+                                    if remote_backup_on {
+                                        let this_sync = sync_busy.as_deref() == Some(b.name.as_str());
+                                        if ui
+                                            .add_enabled(
+                                                !this_sync,
+                                                egui::Button::new(if this_sync { "转存中…" } else { "转存" }),
+                                            )
+                                            .on_hover_text("把该快照复制到「存储与远程」里配置的远端备份目标（本地目录 / UNC 共享）")
+                                            .clicked()
+                                        {
+                                            sync_target = Some(b.path.clone());
+                                        }
                                     }
                                 }
                             });
@@ -17728,6 +18347,8 @@ impl App {
 
     /// 创建隧道：简易（表单）/ 高级（frpc.toml）两种模式，支持导入
     fn ui_tunnel_create(&mut self, ui: &mut egui::Ui) {
+        // 测试功能「穿透内核 rathole」：每帧按当前配置判断，关闭时创建入口与表单都不渲染
+        let rathole_on = features::is_enabled(&self.cfg.features, features::BETA_RATHOLE);
         ui.add_space(6.0);
         ui.label(RichText::new("创建隧道").strong());
         ui.separator();
@@ -17740,17 +18361,21 @@ impl App {
             ui.label("穿透内核:");
             ui.radio_value(&mut self.add_tunnel_kind, "frp".to_string(), "Frp（保留兼容）");
             // Rathole 内核为渐进式功能：开关关闭时不显示创建入口（已有 rathole 隧道不受影响）
-            if features::is_enabled(&self.cfg.features, features::BETA_RATHOLE) {
+            if rathole_on {
                 ui.radio_value(&mut self.add_tunnel_kind, "rathole".to_string(), "Rathole（纯 Rust）");
             }
         });
+        // 开关已关闭：把之前选中的 rathole 收回去，避免"选项没了但表单还开着"
+        if !rathole_on && self.add_tunnel_kind == "rathole" {
+            self.add_tunnel_kind = "frp".to_string();
+        }
         ui.horizontal(|ui| {
             ui.label("填写方式:");
             ui.radio_value(&mut self.add_tunnel_mode, "form".to_string(), "简易模式");
             ui.radio_value(&mut self.add_tunnel_mode, "toml".to_string(), "高级模式");
         });
         ui.separator();
-        if self.add_tunnel_kind == "rathole" {
+        if rathole_on && self.add_tunnel_kind == "rathole" {
             // Rathole 内核表单：连接 rathole server + 单隧道转发（阶段5）
             ui.label(RichText::new("rathole 服务器信息").strong());
             ui.horizontal(|ui| {
@@ -18075,7 +18700,7 @@ impl App {
                             }
                         }
                         if features::is_enabled(&self.cfg.features, features::BETA_TRAFFIC)
-                            && ui.button("🩺 诊断流量").on_hover_text("检查 frpc 进程连接与 EStats 统计是否命中，用于排查流量恒为 0").clicked()
+                            && ui.button("🩺 诊断流量").on_hover_text("检查 frpc 连接与本机 TCP 统计是否正常").clicked()
                         {
                             let pid = self
                                 .tunnel_runtimes
@@ -19513,7 +20138,7 @@ impl App {
                                 if self.cfg.close_behavior == "tray" && self.tray.is_none() {
                                     ui.label(RichText::new("⚠️ 系统托盘初始化失败（可能被其他程序占用），暂不可用，请改用“最小化”").color(self.fg(Color32::from_rgb(230, 180, 90))));
                                 }
-                                ui.label(RichText::new("有服务器运行时：选择“彻底关闭”会先询问是否静默关闭所有服务器后再退出（可取消）；选择“最小化”则无论是否有服务器运行都仅最小化；“最小化到托盘”还会隐藏任务栏按钮，恢复方式：双击/单击托盘图标或托盘菜单“显示主窗口”").weak().small());
+                                ui.label(RichText::new("有服务器运行时，“彻底关闭”会先询问是否静默关闭所有服务器；“最小化到托盘”会隐藏任务栏按钮，可双击托盘图标恢复").weak().small());
                             });
                             self.settings_sections = sections;
 
@@ -19532,7 +20157,7 @@ impl App {
                                         self.set_toast("写入注册表失败".to_string());
                                     }
                                 }
-                                ui.label(RichText::new("通过 HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run 实现；注册表项指向本程序并附带 --autostart 参数，登录后自动启动并显示主窗口").weak().small());
+                                ui.label(RichText::new("登录 Windows 后自动启动并显示主窗口").weak().small());
                             });
                             self.settings_sections = sections;
 
@@ -19598,7 +20223,7 @@ impl App {
                                         }
                                     }
                                 });
-                                ui.label(RichText::new("完全禁用会关闭系统实时病毒防护，请仅在封闭内网或离线环境使用，否则可能导致安全风险").small().color(self.fg(Color32::from_rgb(230, 120, 120))));
+                                ui.label(RichText::new("会关闭系统实时病毒防护，仅建议在离线或封闭内网使用").small().color(self.fg(Color32::from_rgb(230, 120, 120))));
                             });
                             self.settings_sections = sections;
                         }
@@ -19624,7 +20249,7 @@ impl App {
                                 ui.checkbox(&mut self.cfg.ui_animations, "启用切换动效（导航页签 / 折叠 / 按钮过渡）");
                                 // 说明：原先此处另有一个「设置页内平滑动画」开关，已并入上面的总开关
                                 // （反馈：两个开关语义重复且设置页看起来"没有动效"）。
-                                ui.label(RichText::new("关闭动效后所有过渡立即完成，后台以最低刷新率运行，进一步降低资源占用").weak().small());
+                                ui.label(RichText::new("关闭后过渡立即完成，后台刷新率降到最低").weak().small());
                                 ui.label("平滑动画速度:");
                                 ui.horizontal(|ui| {
                                     ui.add(egui::Slider::new(&mut self.cfg.anim_speed, 0.1..=2.0).logarithmic(true).fixed_decimals(2).show_value(true));
@@ -19936,7 +20561,7 @@ impl App {
                     RichText::new("以下功能处于测试阶段，可能存在 Bug 或尚未完成，默认禁用。")
                         .color(self.fg(Color32::from_rgb(255, 200, 80))),
                 );
-                ui.label("启用后功能立即生效，并可能影响服务器运行稳定性；请先在测试环境验证，再决定是否长期开启。");
+                ui.label("启用后立即生效，可能影响服务器稳定性，建议先在测试环境验证。");
                 ui.separator();
                 // 测试功能开关列表：完全由 features::REGISTRY 的 Beta 组生成（按 order 升序），
                 // 不再手写清单 —— 过去硬编码漏登记，导致「模组检查更新」等开关在界面上根本看不到。
@@ -19972,6 +20597,11 @@ impl App {
                     });
                     // 每个开关一行说明小字（来源：注册表的 desc）
                     ui.label(RichText::new(m.desc).small().weak());
+                    // 该功能在别的页面时的入口提示（告诉用户开启后去哪里看效果）
+                    let hint = features::entry_hint(m.id);
+                    if !hint.is_empty() {
+                        ui.label(RichText::new(hint).small().weak());
+                    }
                     ui.add_space(4.0);
                 }
                 ui.separator();
@@ -19979,7 +20609,7 @@ impl App {
                 // 这里不再提供开关，避免出现"点了开关但功能在别处管"的误解）。
                 ui.collapsing("其它已登记功能（只读状态）", |ui| {
                     ui.label(
-                        RichText::new("这些功能/页面已在注册表中登记，启用状态由各自页面或导航控制；此处仅展示登记情况，便于核对入口是否存在。")
+                        RichText::new("以下为已登记的功能/页面；启用状态由各自页面或导航控制。")
                             .small()
                             .weak(),
                     );
@@ -20004,6 +20634,10 @@ impl App {
                             );
                         });
                         ui.label(RichText::new(m.desc).small().weak());
+                        let hint = features::entry_hint(m.id);
+                        if !hint.is_empty() {
+                            ui.label(RichText::new(hint).small().weak());
+                        }
                     }
                 });
             },
@@ -20024,9 +20658,8 @@ impl App {
                 .show(ctx, |ui| {
                     ui.label(RichText::new(format!("确定启用测试功能「{name}」？")).strong());
                     ui.add_space(4.0);
-                    ui.label("⚠ 该功能仍在测试阶段，可能存在 Bug、数据异常或稳定性问题。");
-                    ui.label("启用后：UI 立即恢复显示，后台调度立即恢复执行。");
-                    ui.label("您可以在本页面随时一键禁用。");
+                    ui.label("测试功能可能不稳定，启用后立即生效。");
+                    ui.label("可随时在本页面一键禁用。");
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if ui.button("确认启用").clicked() {
@@ -20080,6 +20713,30 @@ impl App {
                     self.apply_bg(plugins::BgStyle::Default, &ctx, op, None);
                 }
             }
+        }
+        // BETA_MOD_UPDATE：关闭时立即撤下工具栏/模组行的入口与结果窗口，并废止进行中的检查
+        if id == features::BETA_MOD_UPDATE && !enabled {
+            for rt in self.runtimes.iter_mut() {
+                rt.modupd_open = false;
+                rt.modupd_busy = false;
+                rt.modupd_rows.clear();
+                rt.modupd_progress.clear();
+                // 通知后台线程中断后续请求（已在途的单个请求自然结束）
+                rt.modupd_cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                rt.mod_update_shared = None;
+                rt.mod_update_busy = false;
+                rt.mod_update_pending = None;
+                rt.mod_update_msg.clear();
+            }
+            self.bg_busy.remove("modupd");
+            self.modupd_vers.clear();
+            self.modupd_ver_loading.clear();
+            self.modupd_ver_err.clear();
+        }
+        // BETA_REMOTE_BACKUP：关闭时不再排队重试（已在途的转存自然收尾）
+        if id == features::BETA_REMOTE_BACKUP && !enabled {
+            self.remote_pending.clear();
         }
     }
 
@@ -20873,7 +21530,7 @@ const MATERIAL_OWNER_FALLBACK: &str = "xmst-frosted-glass-demo";
                                             .checkbox(
                                                 &mut excl,
                                                 RichText::new(
-                                                    "开启效果时把本工具排除在截屏/录屏之外（避免背景自我递归）",
+                                                    "把本工具排除在截屏/录屏之外",
                                                 )
                                                 .small()
                                                 .color(self.fg(Color32::from_rgb(170, 170, 170))),
@@ -27461,6 +28118,87 @@ mod finishing_batch_selfcheck {
             assert!(low.contains("ping"), "读到的命令行不像本进程: {s}");
         }
     }
+
+    /// run.bat 里 Java 路径的几种常见写法都要能解析（纯字符串，不落盘、不起进程）
+    #[test]
+    fn java_path_forms_from_bat() {
+        let dir = Path::new("D:\\srv");
+        // ① 无引号赋值
+        assert_eq!(
+            parse_java_from_bat_text("set JAVA_PATH=C:\\Java21\\bin\\java.exe\r\n", dir).as_deref(),
+            Some("C:\\Java21\\bin\\java.exe")
+        );
+        // ② `set "JAVA_HOME=..."`（整体带引号，值是目录，稍后补 bin\java.exe）
+        assert_eq!(
+            parse_java_from_bat_text(
+                "set \"JAVA_HOME=C:\\Program Files\\Java\\jdk-21\"\r\n",
+                dir
+            )
+            .as_deref(),
+            Some("C:\\Program Files\\Java\\jdk-21")
+        );
+        // ③ 相对路径（启动前按服务器目录展开）
+        assert_eq!(
+            parse_java_from_bat_text("set JAVA_PATH=.\\Java21\\bin\\java.exe\r\n", dir).as_deref(),
+            Some(".\\Java21\\bin\\java.exe")
+        );
+        // ④ 行内引号包裹的可执行文件（不是 set 行）
+        assert_eq!(
+            parse_java_from_bat_text(
+                "\".\\Java21\\bin\\java.exe\" -Xmx4G -jar server.jar nogui\r\n",
+                dir
+            )
+            .as_deref(),
+            Some(".\\Java21\\bin\\java.exe")
+        );
+        // ⑤ `%~dp0`（脚本所在目录）展开成实际目录，否则磁盘上找不到
+        assert_eq!(
+            parse_java_from_bat_text("set JAVA_PATH=%~dp0Java21\\bin\\java.exe\r\n", dir).as_deref(),
+            Some("D:\\srv\\Java21\\bin\\java.exe")
+        );
+        // 解析不出来时返回 None，不 panic
+        assert_eq!(
+            parse_java_from_bat_text("@echo off\r\njava -jar server.jar nogui\r\n", dir),
+            None
+        );
+    }
+
+    /// 空的 JAVA_PATH 与无关的 set 行不能误判，要继续找后面的有效赋值
+    #[test]
+    fn java_path_skips_empty_and_unrelated() {
+        let dir = Path::new("D:\\srv");
+        let text = "set JAVA_PATH=\r\nset MAX_RESTARTS=1\r\nset \"JAVA=C:\\jdk\\bin\\java.exe\"\r\n";
+        assert_eq!(
+            parse_java_from_bat_text(text, dir).as_deref(),
+            Some("C:\\jdk\\bin\\java.exe")
+        );
+    }
+
+    /// 回退判定：只有「已退出且退出码非 0」+「日志 size/mtime 无变化」才回退；
+    /// 仍在运行、退出码 0、日志有变化时都不回退
+    #[test]
+    fn fallback_judgement() {
+        // 已退出、退出码 1、日志无变化 → 回退
+        assert!(bat_start_failed(Some(Some(1)), false));
+        // 进程仍在运行 → 不回退
+        assert!(!bat_start_failed(None, false));
+        // 退出码 0 → 按需求不算 bat 启动失败
+        assert!(!bat_start_failed(Some(Some(0)), false));
+        // 日志已有变化（java 起来了）→ 不回退
+        assert!(!bat_start_failed(Some(Some(1)), true));
+        // 被异常终止（拿不到退出码）且日志无变化 → 回退
+        assert!(bat_start_failed(Some(None), false));
+    }
+
+    /// 启动方式取值归一化：只认 bat / java，其余（含旧配置缺字段的空串）按 auto
+    #[test]
+    fn launch_mode_normalize() {
+        assert_eq!(normalize_launch_mode("auto"), "auto");
+        assert_eq!(normalize_launch_mode(" BAT "), "bat");
+        assert_eq!(normalize_launch_mode("Java"), "java");
+        assert_eq!(normalize_launch_mode(""), "auto");
+        assert_eq!(normalize_launch_mode("不认识的值"), "auto");
+    }
 }
 
 #[cfg(test)]
@@ -27571,6 +28309,29 @@ mod encoding_selfcheck {
     }
 
     #[test]
+    fn run_bat_java_path_prefers_relative() {
+        let d = tmp_dir("reljava");
+        let bin = d.join("Java21").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join("java.exe");
+        std::fs::write(&exe, b"stub").unwrap();
+        // 服务器目录内的 java：写成相对写法，整个目录搬走也不用改脚本
+        assert_eq!(
+            java_path_for_run_bat(&exe.display().to_string(), &d),
+            ".\\Java21\\bin\\java.exe"
+        );
+        // 解析不到真实文件：退回原值（PATH 上的 java）
+        assert_eq!(java_path_for_run_bat("java", &d), "java");
+        // 目录外的 java：保持绝对路径
+        let out = tmp_dir("reljava_out").join("java.exe");
+        std::fs::write(&out, b"stub").unwrap();
+        assert_eq!(
+            java_path_for_run_bat(&out.display().to_string(), &d),
+            out.display().to_string()
+        );
+    }
+
+    #[test]
     fn generated_run_bat_is_cmd_safe() {
         let d = tmp_dir("genbat");
         let p = generate_run_bat(&d, "java", "", "server.jar").expect("生成 run.bat");
@@ -27588,17 +28349,20 @@ mod encoding_selfcheck {
             "生成的脚本不能有 pause 行"
         );
         assert!(text.contains("set \"MAX_RESTARTS=1\""));
-        assert!(
-            text.lines()
+        // 只有一处 `set "MAX_RESTARTS=…"` 赋值行（工具靠它同步重启次数），echo / if 里的引用不算
+        let assign_lines = |s: &str| -> usize {
+            s.lines()
                 .filter(|l| {
-                    let u = l.to_ascii_uppercase();
-                    let t = u.trim_start();
-                    !t.starts_with("REM") && !t.starts_with("::") && u.contains("MAX_RESTARTS")
+                    let t = l.trim_start();
+                    let u = t.to_ascii_uppercase();
+                    !t.to_ascii_lowercase().starts_with("rem")
+                        && !t.starts_with("::")
+                        && u.starts_with("SET")
+                        && u.contains("MAX_RESTARTS=")
                 })
                 .count()
-                == 1,
-            "MAX_RESTARTS 赋值行只能有一处"
-        );
+        };
+        assert_eq!(assign_lines(&text), 1, "MAX_RESTARTS 赋值行只能有一处");
         assert!(text.contains("-Dfile.encoding=UTF-8"));
         assert!(text.contains("-Djava.io.tmpdir=%~dp0tmp"));
         assert!(text.contains("%~dp0tmp"));
@@ -27613,20 +28377,10 @@ mod encoding_selfcheck {
         assert_eq!(enc2, TextEncoding::Gbk, "改写后仍必须是 GBK");
         assert!(after.contains("MAX_RESTARTS=3"));
         assert!(
-            after.contains("rem MAX_RESTARTS 取 1"),
+            after.lines().any(|l| l.trim_start().starts_with("rem 最大自动重启次数")),
             "注释行不能被改写成 set 赋值"
         );
-        assert!(
-            after
-                .lines()
-                .filter(|l| {
-                    let u = l.to_ascii_uppercase();
-                    let t = u.trim_start();
-                    !t.starts_with("REM") && !t.starts_with("::") && u.contains("MAX_RESTARTS")
-                })
-                .count()
-                == 1
-        );
+        assert_eq!(assign_lines(&after), 1);
     }
 
     #[test]
@@ -27667,5 +28421,51 @@ mod encoding_selfcheck {
         let n = ex.len();
         assert!(!migrate_backup_exclude_tmp(&mut cfg2));
         assert_eq!(cfg2.servers[0].backup.exclude.len(), n);
+    }
+}
+
+// ==================== 功能开关门控（测试功能） ====================
+
+/// 模组「检查更新」入口是否应渲染：每帧按当前配置判断，不缓存到启动时。
+///
+/// 关闭「模组检查更新」时，mods 页工具栏的「🔄 检查更新」与每个模组行的
+/// 「🔄 更新」「⬇ 更新」都不渲染，相关后台回传也不再消费。
+fn mod_update_ui_enabled(cfg: &config::GlobalConfig) -> bool {
+    features::is_enabled(&cfg.features, features::BETA_MOD_UPDATE)
+}
+
+#[cfg(test)]
+mod feature_gate_selfcheck {
+    use super::*;
+
+    /// 默认配置下「模组检查更新」必须关闭（beta.server.mod_update 默认禁用）
+    #[test]
+    fn mod_update_gate_closed_by_default() {
+        let cfg = config::GlobalConfig::default();
+        assert!(!mod_update_ui_enabled(&cfg));
+    }
+
+    /// 显式开启 → 立即放行；再关闭 → 立即收回（同一份配置连续读，说明没有启动时缓存）
+    #[test]
+    fn mod_update_gate_reacts_immediately() {
+        let mut cfg = config::GlobalConfig::default();
+        cfg.features.insert(
+            features::BETA_MOD_UPDATE.to_string(),
+            features::FeatureState {
+                enabled: true,
+                visible: true,
+                order: None,
+            },
+        );
+        assert!(mod_update_ui_enabled(&cfg));
+        cfg.features.insert(
+            features::BETA_MOD_UPDATE.to_string(),
+            features::FeatureState {
+                enabled: false,
+                visible: true,
+                order: None,
+            },
+        );
+        assert!(!mod_update_ui_enabled(&cfg));
     }
 }

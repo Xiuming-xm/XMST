@@ -259,6 +259,12 @@ fn default_private_tmp_name() -> String {
     "tmp".to_string()
 }
 
+/// 启动方式默认 `auto`：优先 run.bat，run.bat 启动失败（自行以非 0 退出且日志无变化）
+/// 时自动改用直连 java；旧配置里没有这个字段时也按 auto 处理。
+fn default_launch_mode() -> String {
+    "auto".to_string()
+}
+
 /// 内容衬底默认 0.5：材质之上再压一层半透明底色，保证内容区文字/控件稳定可读
 /// （Fluent 的 in-app acrylic 同样是「材质之上再压衬底」的思路）。
 /// 0.25 为历史默认，实测桌面细节仍直穿 UI（用户「半透明不够清晰」反馈的根因之一），
@@ -401,6 +407,10 @@ pub struct ServerConfig {
     pub jvm_args: Option<String>,
     /// 自定义启动命令模板，{java} {jvm} 会被替换
     pub launch_cmd: String,
+    /// 启动方式：`auto`（默认，优先 run.bat，失败自动改用直连 java）/ `bat`（只用 run.bat）/
+    /// `java`（始终直连 java，跳过 run.bat）
+    #[serde(default = "default_launch_mode")]
+    pub launch_mode: String,
     /// 启动时使用服务器目录下的独立临时目录（TEMP/TMP + java.io.tmpdir）
     #[serde(default = "default_use_private_tmp")]
     pub use_private_tmp: bool,
@@ -445,6 +455,7 @@ impl Default for ServerConfig {
             mc_version: None,
             jvm_args: None,
             launch_cmd: "{java} {jvm} -jar server.jar nogui".to_string(),
+            launch_mode: default_launch_mode(),
             use_private_tmp: default_use_private_tmp(),
             private_tmp_name: default_private_tmp_name(),
             favorited: false,

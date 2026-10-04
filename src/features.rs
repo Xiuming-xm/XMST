@@ -547,12 +547,35 @@ pub fn apply_note(m: &FeatureMeta) -> &'static str {
     }
 }
 
-/// 是否启用（无覆盖时按默认值）
+/// 是否启用（有覆盖时用覆盖值，无覆盖时用注册表默认值）。
+///
+/// 未登记的 ID 一律视为**禁用**：ID 写错时功能应当"不出现"，
+/// 而不是"开关关掉了、界面照样显示"（后者会让门控看起来失效）。
 pub fn is_enabled(features: &HashMap<String, FeatureState>, id: &str) -> bool {
     features
         .get(id)
         .map(|s| s.enabled)
-        .unwrap_or_else(|| meta(id).map(|m| m.default_enabled).unwrap_or(true))
+        .unwrap_or_else(|| meta(id).map(|m| m.default_enabled).unwrap_or(false))
+}
+
+/// 开关对应的界面入口提示：告诉用户在哪个页面的哪个位置能看到该功能
+/// （开关在「设置 → 测试功能」页，功能本身在别的页面时最需要这行字）。
+/// 返回空串表示该项没有独立界面入口。
+pub fn entry_hint(id: &str) -> &'static str {
+    match id {
+        BETA_BACKUP => "入口：服务器 → 自动功能页（「快照备份」与「快照 / 备份列表」），服务器列表右键「📦 立即备份」",
+        BETA_CRASH_ANALYSIS => "入口：服务器 → 服务器状态页底部的「崩溃报告分析」区块",
+        BETA_TRAFFIC => "入口：内网穿透 → 仪表盘 / 隧道管理（实时流量、累计用量与「🩺 诊断流量」）",
+        BETA_RATHOLE => "入口：内网穿透 → 创建隧道 → 「穿透内核」里的 Rathole 选项与对应表单",
+        BETA_REMOTE_BACKUP => "入口：服务器 → 自动功能 → 存储与远程（远端备份目标 / 账号 / 重试次数），快照列表里的「转存」按钮",
+        BETA_SPECIAL => "入口：服务器顶部页签「特殊功能」（首次开启后需切换到该页签）",
+        BETA_MOD_UPDATE => "入口：服务器 → 文件浏览 → mods 页（工具栏「🔄 检查更新」与每个模组行的「🔄 更新」）",
+        BETA_DOWNLOAD => "入口：左侧导航「下载」；文件浏览 → mods 页的「⬇️ 下载模组」",
+        BETA_PLAYERS => "入口：服务器顶部页签「玩家管理」（在线 / 白名单 / 封禁 / OP / 属性）",
+        BETA_PLUGINS => "入口：左侧导航「插件」（插件管理页与背景效果设置）",
+        FEATURE_SPARK => "入口：服务器 → 特殊功能 → Spark 性能分析（随「特殊功能」总开关显示）",
+        _ => "",
+    }
 }
 
 /// 是否可见（无覆盖时按默认值）
@@ -590,5 +613,78 @@ mod registry_selfcheck {
                 assert!(w[0].order <= w[1].order, "同组 order 未升序：{}", w[1].id);
             }
         }
+    }
+
+    /// 分组与默认值一致：items_in_group 覆盖本组全部项；默认禁用的项只允许出现在测试功能分组。
+    #[test]
+    fn group_and_defaults_consistent() {
+        for m in REGISTRY {
+            assert!(
+                items_in_group(m.group).iter().any(|x| x.id == m.id),
+                "{} 未出现在其分组的 items_in_group 结果里",
+                m.id
+            );
+            // 默认禁用的项 = 测试功能；反过来测试功能必须默认禁用（避免"看不到开关却已开启"）
+            assert!(
+                m.default_enabled || m.group == FeatureGroup::Beta,
+                "{} 默认禁用但不在测试功能分组",
+                m.id
+            );
+        }
+        let beta = items_in_group(FeatureGroup::Beta);
+        assert!(!beta.is_empty(), "测试功能分组不能为空");
+        for m in &beta {
+            assert_eq!(m.group, FeatureGroup::Beta, "{} 分组与列表不一致", m.id);
+            assert!(!m.default_enabled, "测试功能 {} 必须默认禁用", m.id);
+            assert!(
+                !entry_hint(m.id).is_empty(),
+                "测试功能 {} 缺少「开启后在哪看到」的入口提示",
+                m.id
+            );
+        }
+    }
+
+    /// Beta 常量与注册表一一对应：常量写错（或漏登记）时这里直接失败。
+    #[test]
+    fn beta_constants_registered() {
+        for id in [
+            BETA_BACKUP,
+            BETA_CRASH_ANALYSIS,
+            BETA_TRAFFIC,
+            BETA_DOWNLOAD,
+            BETA_PLAYERS,
+            BETA_PLUGINS,
+            BETA_RATHOLE,
+            BETA_REMOTE_BACKUP,
+            BETA_SPECIAL,
+            BETA_MOD_UPDATE,
+            FEATURE_SPARK,
+            FEATURE_FORCE_STOP_CONFIRM,
+        ] {
+            assert!(meta(id).is_some(), "常量 {id} 未登记到 REGISTRY");
+        }
+    }
+
+    /// set/get 往返：不依赖全局配置，直接用覆盖表验证读取结果与写入一致。
+    #[test]
+    fn enabled_roundtrip_with_overrides() {
+        let mut map: HashMap<String, FeatureState> = HashMap::new();
+        for m in REGISTRY {
+            // 无覆盖：按注册表默认值
+            assert_eq!(is_enabled(&map, m.id), m.default_enabled, "{} 默认值不符", m.id);
+            // 写入与默认相反的值：立即读到新值（不存在"启动时缓存"）
+            map.insert(
+                m.id.to_string(),
+                FeatureState {
+                    enabled: !m.default_enabled,
+                    visible: m.default_visible,
+                    order: None,
+                },
+            );
+            assert_eq!(is_enabled(&map, m.id), !m.default_enabled, "{} 覆盖未生效", m.id);
+        }
+        // 未登记 ID：一律禁用，避免 ID 拼错时功能意外开启
+        assert!(!is_enabled(&map, "not.registered.id"));
+        assert!(meta("not.registered.id").is_none());
     }
 }
