@@ -434,10 +434,11 @@ pub fn detect(dir: &Path) -> PlatformInfo {
     }
 }
 
-/// 版本号提取：从 start 起取连续的 ASCII 数字与 `.`。
+/// 版本号提取：从 start 起取连续的 ASCII 数字与 `.`（先去掉前导空白）。
 fn digits_dotted(s: &str, start: usize) -> String {
     s.get(start..)
         .unwrap_or("")
+        .trim_start()
         .chars()
         .take_while(|c| c.is_ascii_digit() || *c == '.')
         .collect()
@@ -883,20 +884,6 @@ mod tests {
     /// 正常行与紧贴行尾的完整版本号都能取到
     #[test]
     fn log_line_version_extract() {
-        let probe = "Starting minecraft server version 1.21.1";
-        assert_eq!(
-            probe.find("Starting minecraft server version"),
-            Some(0),
-            "needle={:?} probe={:?}",
-            "Starting minecraft server version",
-            probe
-        );
-        assert_eq!(
-            digits_dotted(probe, 33),
-            "1.21.1",
-            "digits raw, probe.len()={}",
-            probe.len()
-        );
         assert_eq!(
             mc_version_from_log_line("Starting minecraft server version 1.21.1").as_deref(),
             Some("1.21.1")

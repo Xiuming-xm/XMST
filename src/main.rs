@@ -11102,6 +11102,14 @@ fn safe_from(s: &str, i: usize) -> &str {
     }
     &s[i..]
 }
+/// 按字节下标安全切片：取下标**之前**的部分，下标落在多字节字符中间时向前对齐到字符边界。
+fn safe_to(s: &str, i: usize) -> &str {
+    let mut i = i.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    &s[..i]
+}
 /// 给子进程显式指定一个一定存在的工作目录。
 ///
 /// 关键修复：本程序可能被从"之后被删除的目录"启动（例如从 dist\backup\<时间戳> 运行，
@@ -13855,19 +13863,18 @@ impl App {
     /// 从日志行中 " joined/left the game" 事件位置向前提取玩家名（去掉可能的后缀 [/IP:port] 等）。
     fn extract_player_name(line: &str, event_pos: usize) -> Option<String> {
         // 事件位置由调用方的 find() 得到，这里再按字符边界夹取一次
-        let before = safe_from(line, event_pos.min(line.len()));
+        let before = safe_to(line, event_pos);
         let sep = before
             .rfind("]: ")
             .map(|i| i + 3)
             .or_else(|| before.rfind(": ").map(|i| i + 2))?;
         let name = safe_from(before, sep);
         // 取 '[' 之前的部分（不能用字节 truncate）
-        let name = name
-            .find('[')
-            .map(|b| safe_from(name, b))
-            .unwrap_or(name)
-            .trim()
-            .to_string();
+        let name = match name.find('[') {
+            Some(b) => safe_to(name, b),
+            None => name,
+        };
+        let name = name.trim().to_string();
         if name.is_empty() { None } else { Some(name) }
     }
 
