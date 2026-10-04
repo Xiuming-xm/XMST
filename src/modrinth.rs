@@ -419,6 +419,90 @@ fn version_matches(ver: &Value, mc_version: Option<&str>, loader: Option<&str>) 
     gv_ok && ld_ok
 }
 
+/// 列出项目在指定 MC 版本 + 加载器下**最近的 limit 个版本**（Modrinth 返回按发布时间倒序）。
+/// 返回 (版本号, 发布日期, 版本页地址, 是否为 release)；只读展示用，不下载任何文件。
+/// `mc` / `loader` 传空串表示不过滤。
+pub fn list_versions_for_slug(
+    slug: &str,
+    mc: &str,
+    loader: &str,
+    limit: usize,
+) -> Result<Vec<(String, String, String, bool)>, String> {
+    let slug = slug.trim();
+    if slug.is_empty() {
+        return Err("项目标识为空".to_string());
+    }
+    let mc = mc.trim();
+    let ld = loader.trim();
+    // 服务端过滤：loaders / game_versions 是 JSON 数组，必须整体 URL 编码
+    let mut query: Vec<String> = Vec::new();
+    if !ld.is_empty() {
+        query.push(format!("loaders={}", urlencode(&format!("[\"{ld}\"]"))));
+    }
+    if !mc.is_empty() {
+        query.push(format!("game_versions={}", urlencode(&format!("[\"{mc}\"]"))));
+    }
+    let base = format!(
+        "https://api.modrinth.com/v2/project/{}/version",
+        urlencode(slug)
+    );
+    let url = if query.is_empty() {
+        base
+    } else {
+        format!("{base}?{}", query.join("&"))
+    };
+    let client = new_client();
+    let v = fetch_json(&client, &url).map_err(|e| format!("{e}（{url}）"))?;
+    let arr = v
+        .as_array()
+        .ok_or_else(|| format!("version 响应异常（{url}）"))?;
+    let want = limit.max(1);
+    let mc_filter = if mc.is_empty() { None } else { Some(mc) };
+    let ld_filter = if ld.is_empty() { None } else { Some(ld) };
+    let mut out: Vec<(String, String, String, bool)> = Vec::new();
+    for ver in arr {
+        if !version_matches(ver, mc_filter, ld_filter) {
+            continue;
+        }
+        let version_number = ver["version_number"]
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if version_number.is_empty() {
+            continue;
+        }
+        // 只保留日期部分（YYYY-MM-DD），完整时间戳在列表里太长
+        let date: String = ver["date_published"]
+            .as_str()
+            .unwrap_or_default()
+            .chars()
+            .take(10)
+            .collect();
+        let is_release = ver["version_type"]
+            .as_str()
+            .unwrap_or_default()
+            .eq_ignore_ascii_case("release");
+        let page = format!(
+            "https://modrinth.com/mod/{}/version/{}",
+            urlencode(slug),
+            urlencode(&version_number)
+        );
+        out.push((version_number, date, page, is_release));
+        if out.len() >= want {
+            break;
+        }
+    }
+    if out.is_empty() {
+        return Err(format!(
+            "没有适配的版本（MC={}，加载器={}）",
+            if mc.is_empty() { "不限" } else { mc },
+            if ld.is_empty() { "不限" } else { ld }
+        ));
+    }
+    Ok(out)
+}
+
 /// 简单 URL 编码（仅转义查询串必要字符）
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());

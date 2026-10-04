@@ -1624,6 +1624,10 @@ struct ServerRuntime {
     file_favs: Vec<String>,
     /// 客户端模组排查结果（文件名列表；None=未排查）。仅临时 UI 状态，切走页面/切换服务器即清除，不持久化
     file_client_mods: Option<Vec<String>>,
+    /// mods 目录当前判定为「仅客户端」的 jar：(文件名, 判定依据)。
+    /// 由文件列表刷新（refresh_file_list）与主动排查写入，渲染只读；
+    /// 判定走 mods 目录指纹缓存，不会在每帧渲染里开 jar。
+    file_mod_clients: Vec<(String, ModSide)>,
     /// 排查客户端模组按钮的二次确认弹窗是否显示
     file_client_mods_confirm: bool,
     /// 右侧预览目标: (文件名, 大小, 是否目录, 目录内文件数)，None=未选中
@@ -1871,6 +1875,7 @@ impl Default for ServerRuntime {
             file_search: String::new(),
             file_favs: Vec::new(),
             file_client_mods: None,
+            file_mod_clients: Vec::new(),
             file_client_mods_confirm: false,
             file_preview: None,
             file_rename: None,
@@ -2382,6 +2387,12 @@ struct App {
     snapshot_pins: HashMap<PathBuf, bool>,
     /// 模组检查更新的会话内缓存（modid -> 结果），同一会话不重复请求同一个 mod
     modupd_cache: HashMap<String, ModUpdateRow>,
+    /// 「查看版本」按需加载的结果（键 = 项目标识）：版本号/日期/版本页/是否 release
+    modupd_vers: HashMap<String, Vec<(String, String, String, bool)>>,
+    /// 正在拉取版本列表的项目标识（按钮置灰用，避免重复请求）
+    modupd_ver_loading: HashSet<String>,
+    /// 版本列表拉取失败原因（键 = 项目标识）
+    modupd_ver_err: HashMap<String, String>,
     /// 启动时未正常退出的服务器记录是否已写过（每次运行只写一次 data 日志）
     resume_logged: bool,
     /// 「本次运行未生成崩溃报告」弹窗：(下标, 服务器名, 说明, 退出码, stderr 末尾, 启动命令行)
@@ -2622,17 +2633,25 @@ impl PrecheckItem {
 /// 模组检查更新的单行结果
 #[derive(Clone)]
 struct ModUpdateRow {
-    /// 模组 id（用于会话内缓存，避免同一 mod 重复请求）
-    mod_id: String,
-    /// 模组名（显示名优先，回退到文件名）
+    /// 会话内缓存键（模组文件名，小写）。缓存按"文件"而不是 modid 建：
+    /// 现在的首选匹配方式是 SHA1 指纹，压根不需要 modid。
+    cache_key: String,
+    /// 模组名（Modrinth 标题 / jar 内名称 / 文件名，按可靠度回退）
     name: String,
+    /// jar 文件名（结果行展示，也是「Modrinth 手动搜索」的关键词来源）
+    file: String,
     /// 本地版本
     local: String,
-    /// Modrinth 上的最新版本（None = 未找到或查询失败）
+    /// Modrinth 上的最新版本（None = 未匹配到项目 / 无适配版本 / 查询失败）
     latest: Option<String>,
     /// 项目页地址（可点开）
     url: String,
-    /// 说明（未找到/失败原因/已是最新）
+    /// Modrinth 项目标识（slug 或项目 id）；为空表示没匹配到项目。
+    /// 「查看版本」按需拉取该项目的版本列表（不下载任何文件）。
+    key: String,
+    /// 匹配方式：指纹 / slug / 搜索 / 未匹配 / 失败（让用户能判断结果可靠度）
+    via: String,
+    /// 说明（可更新 / 已是最新 / 未匹配 / 失败原因）
     note: String,
 }
 
@@ -2652,6 +2671,8 @@ enum BgMsg {
     ModUpdProgress(usize, usize, String),
     /// 模组检查更新结果：(服务器下标, 行)
     ModUpdDone(usize, Vec<ModUpdateRow>),
+    /// 「查看版本」按需加载结果：(项目标识, 版本列表或错误)
+    ModVersions(String, Result<Vec<(String, String, String, bool)>, String>),
 }
 
 impl App {
@@ -2863,6 +2884,9 @@ impl App {
             bg_busy: HashMap::new(),
             snapshot_pins: HashMap::new(),
             modupd_cache: HashMap::new(),
+            modupd_vers: HashMap::new(),
+            modupd_ver_loading: HashSet::new(),
+            modupd_ver_err: HashMap::new(),
             resume_logged: false,
             crash_no_report: None,
             crash_no_report_java: String::new(),
@@ -4049,6 +4073,8 @@ impl App {
         let mut close = false;
         let mut reopen = false;
         let mut cancel_now = false;
+        // 「查看版本」按需加载请求（在窗口闭包里只收集，窗口结束后再发后台任务）
+        let mut ver_req: Option<String> = None;
         egui::Window::new("🔄 模组检查更新")
             .open(&mut open)
             .collapsible(false)
@@ -4057,7 +4083,7 @@ impl App {
             .show(ctx, |ui| {
                 ui.label(RichText::new(format!("{name}：模组更新检查结果")).strong());
                 ui.label(
-                    RichText::new("只检查、只报告，不会自动替换或下载；点项目名可打开项目页。")
+                    RichText::new("只检查、只报告，不会自动替换或下载；行尾标注匹配方式：指纹＝SHA1 指纹（最可靠）· slug＝按 modid 查项目 · 搜索＝Modrinth 搜索第一条（可靠度较低）")
                         .small()
                         .weak(),
                 );
@@ -4065,16 +4091,32 @@ impl App {
                     ui.label(RichText::new(format!("检查中… {progress}")).small());
                 }
                 ui.separator();
-                let updatable = rows
-                    .iter()
-                    .filter(|r| r.note == "可更新")
-                    .count();
+                let updatable = rows.iter().filter(|r| r.note == "可更新").count();
+                let latest_n = rows.iter().filter(|r| r.note == "已是最新").count();
+                let unmatched = rows.iter().filter(|r| r.via == "未匹配").count();
+                let failed = rows
+                    .len()
+                    .saturating_sub(updatable + latest_n + unmatched);
                 ui.label(format!(
-                    "共 {} 个模组 ｜ 可更新 {updatable} 个",
+                    "共 {} 个模组：可更新 {updatable} · 已是最新 {latest_n} · 未匹配 {unmatched} · 失败 {failed}",
                     rows.len()
                 ));
+                // 全部未匹配 / 全部查询失败时明确说"匹配失败"，不能让用户误以为是"没有更新"
+                if !busy
+                    && !rows.is_empty()
+                    && updatable == 0
+                    && (unmatched == rows.len() || failed == rows.len())
+                {
+                    ui.label(
+                        RichText::new(
+                            "看起来匹配失败：请检查网络 / 加速器是否正常，或把其中一个模组文件发我看看",
+                        )
+                        .color(self.fg(Color32::from_rgb(255, 200, 80))),
+                    );
+                }
                 ui.separator();
                 egui::ScrollArea::vertical()
+                    .id_salt("modupd_rows")
                     .auto_shrink([false, false])
                     .max_height(440.0)
                     .show(ui, |ui| {
@@ -4086,17 +4128,91 @@ impl App {
                             } else {
                                 self.fg(Color32::from_rgb(160, 160, 166))
                             };
+                            // 行格式：模组名（文件名）· 本地版本 → 最新版本 · [匹配方式] · [项目页/手动搜索]
                             ui.horizontal_wrapped(|ui| {
-                                ui.label(RichText::new(&r.name).strong());
-                                let latest = r.latest.clone().unwrap_or_else(|| "—".to_string());
+                                ui.label(RichText::new(format!("{}（{}）", r.name, r.file)).strong());
+                                let latest = r.latest.clone().unwrap_or_else(|| "未知".to_string());
                                 ui.label(
                                     RichText::new(format!("{} → {}", r.local, latest)).color(col),
                                 );
+                                if !r.via.is_empty() {
+                                    ui.label(RichText::new(format!("[{}]", r.via)).small().weak());
+                                }
                                 ui.label(RichText::new(&r.note).small().weak());
-                                if !r.url.is_empty() && ui.small_button("项目页").clicked() {
-                                    open_url(&r.url);
+                                if !r.url.is_empty() {
+                                    if ui.small_button("项目页").clicked() {
+                                        open_url(&r.url);
+                                    }
+                                } else if ui
+                                    .small_button("Modrinth 手动搜索")
+                                    .on_hover_text("用文件名关键词在 Modrinth 上搜索该项目")
+                                    .clicked()
+                                {
+                                    open_url(&format!(
+                                        "https://modrinth.com/mods?q={}",
+                                        url_encode_query(&mod_search_keyword(&r.file))
+                                    ));
                                 }
                             });
+                            // 已匹配到项目的行：可展开按需查看该项目适配当前 MC/加载器的最近 5 个版本。
+                            // 折叠体只在展开时执行；首次展开即触发一次后台请求（不下载任何文件）。
+                            if !r.key.is_empty() {
+                                let loaded = self.modupd_vers.get(&r.key);
+                                let loading = self.modupd_ver_loading.contains(&r.key);
+                                let fail = self.modupd_ver_err.get(&r.key);
+                                egui::CollapsingHeader::new(
+                                    RichText::new("查看版本（适配当前 MC/加载器的最近 5 个）")
+                                        .small()
+                                        .weak(),
+                                )
+                                .id_salt(("modupd_ver", r.key.as_str()))
+                                .show(ui, |ui| {
+                                    if loading {
+                                        ui.label(
+                                            RichText::new("正在获取版本列表…").small().weak(),
+                                        );
+                                    } else if let Some(items) = loaded {
+                                        for (ver, date, page, is_release) in items {
+                                            ui.horizontal_wrapped(|ui| {
+                                                ui.label(RichText::new(ver.clone()).strong());
+                                                ui.label(
+                                                    RichText::new(if *is_release {
+                                                        "release"
+                                                    } else {
+                                                        "beta/alpha"
+                                                    })
+                                                    .small()
+                                                    .weak(),
+                                                );
+                                                ui.label(
+                                                    RichText::new(date.clone()).small().weak(),
+                                                );
+                                                if ui.small_button("版本页").clicked() {
+                                                    open_url(page);
+                                                }
+                                            });
+                                        }
+                                    } else if let Some(e) = fail {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label(
+                                                RichText::new(format!("获取失败：{e}"))
+                                                    .small()
+                                                    .color(self.fg(Color32::from_rgb(
+                                                        255, 200, 80,
+                                                    ))),
+                                            );
+                                            if ui.small_button("重试").clicked() {
+                                                ver_req = Some(r.key.clone());
+                                            }
+                                        });
+                                    } else {
+                                        ui.label(
+                                            RichText::new("正在获取版本列表…").small().weak(),
+                                        );
+                                        ver_req = Some(r.key.clone());
+                                    }
+                                });
+                            }
                         }
                     });
                 ui.separator();
@@ -4128,6 +4244,10 @@ impl App {
             if let Some(rt) = self.runtimes.get_mut(idx) {
                 rt.modupd_open = false;
             }
+        }
+        // 窗口闭包结束后再发后台请求（渲染路径里不做网络/重活）
+        if let Some(key) = ver_req {
+            self.spawn_mod_versions(idx, key);
         }
     }
 
@@ -4542,7 +4662,7 @@ impl App {
                     // 未找到/网络失败的下一轮仍会重试，避免把一次抖动固化成永久结论。
                     for r in rows.iter() {
                         if !r.url.is_empty() {
-                            self.modupd_cache.insert(r.mod_id.clone(), r.clone());
+                            self.modupd_cache.insert(r.cache_key.clone(), r.clone());
                         }
                     }
                     if let Some(rt) = self.runtimes.get_mut(idx) {
@@ -4550,6 +4670,18 @@ impl App {
                         rt.modupd_rows = rows;
                         rt.modupd_open = true;
                         rt.modupd_progress.clear();
+                    }
+                }
+                BgMsg::ModVersions(key, res) => {
+                    self.modupd_ver_loading.remove(&key);
+                    match res {
+                        Ok(items) => {
+                            self.modupd_ver_err.remove(&key);
+                            self.modupd_vers.insert(key, items);
+                        }
+                        Err(e) => {
+                            self.modupd_ver_err.insert(key, e);
+                        }
                     }
                 }
             }
@@ -4599,7 +4731,8 @@ impl App {
         });
     }
 
-    /// 模组"检查更新"：按 modid 查 Modrinth（串行 + 每个之间 200ms，避免打爆 API）。
+    /// 模组"检查更新"：三级匹配 —— SHA1 指纹（最可靠，与 modid/文件名无关）→ modid 当 slug 查
+    /// → Modrinth 搜索取第一条候选；串行 + 每个之间 200ms，避免打爆 API。
     /// 只检查、只报告，不自动替换/下载。
     fn spawn_mod_update_check(&mut self, idx: usize) {
         if idx >= self.cfg.servers.len() || idx >= self.runtimes.len() {
@@ -4614,16 +4747,14 @@ impl App {
         let mc = pinfo.mc_version.clone();
         let loader = pinfo.kind.modrinth_loader().map(|s| s.to_string());
         let mods_dir = dir.join("mods");
+        // 只要目录里有 .jar 就能查：首选匹配是 SHA1 指纹，不再要求 jar 里能读出 modid
         let mut metas = serverinfo::scan_mod_metadata(&mods_dir);
-        metas.retain(|m| {
-            let n = m.file_name.to_lowercase();
-            n.ends_with(".jar") && m.mod_id.is_some()
-        });
+        metas.retain(|m| m.file_name.to_lowercase().ends_with(".jar"));
         if metas.is_empty() {
-            self.set_toast("mods 目录里没有可识别 modid 的模组".to_string());
+            self.set_toast("mods 目录里没有可检查的模组（*.jar）".to_string());
             return;
         }
-        // 同一会话内不重复请求同一个 modid
+        // 同一会话内不重复请求同一个文件
         let cached: HashMap<String, ModUpdateRow> = self.modupd_cache.clone();
         if let Some(rt) = self.runtimes.get_mut(idx) {
             rt.modupd_busy = true;
@@ -4632,6 +4763,9 @@ impl App {
             rt.modupd_cancel
                 .store(false, std::sync::atomic::Ordering::Relaxed);
         }
+        // 新一轮检查：上一轮按项目标识缓存的「版本列表」一并丢弃，避免用到过期结果
+        self.modupd_vers.clear();
+        self.modupd_ver_err.clear();
         let cancel = self.runtimes[idx].modupd_cancel.clone();
         self.bg_busy
             .insert("modupd".to_string(), "准备检查模组更新…".to_string());
@@ -4644,62 +4778,105 @@ impl App {
                 if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                let id = m.mod_id.clone().unwrap_or_default();
-                let local = m.version.clone().unwrap_or_else(|| "?".to_string());
-                let display = m.name.clone().unwrap_or_else(|| m.file_name.clone());
+                let file = m.file_name.clone();
+                let cache_key = file.to_lowercase();
+                let local_meta = m.version.clone().unwrap_or_else(|| "?".to_string());
+                let display = m.name.clone().unwrap_or_else(|| file.clone());
                 let _ = tx.send(BgMsg::ModUpdProgress(i + 1, total, display.clone()));
-                if let Some(hit) = cached.get(&id) {
+                if let Some(hit) = cached.get(&cache_key) {
                     let mut r = hit.clone();
                     r.name = display;
-                    r.local = local;
+                    r.file = file;
                     rows.push(r);
                     continue;
                 }
                 // 串行 + 限速：几十个模组并发会把 Modrinth API 打到限流
                 std::thread::sleep(std::time::Duration::from_millis(200));
+                let path = mods_dir.join(&file);
                 let mut row = ModUpdateRow {
-                    mod_id: id.clone(),
+                    cache_key,
                     name: display.clone(),
-                    local: local.clone(),
+                    file: file.clone(),
+                    local: local_meta.clone(),
                     latest: None,
                     url: String::new(),
+                    key: String::new(),
+                    via: String::new(),
                     note: String::new(),
                 };
-                match modrinth::project_by_slug(&id) {
-                    Ok((_pid, title, slug, source_url)) => {
-                        if !title.is_empty() {
-                            row.name = title;
-                        }
-                        row.url = if source_url.trim().is_empty() {
-                            format!("https://modrinth.com/mod/{slug}")
-                        } else {
-                            source_url
-                        };
-                        match modrinth::latest_version_for_slug(
-                            &id,
-                            mc.as_deref(),
-                            loader.as_deref(),
-                            false,
-                        ) {
-                            Ok((ver, _date, _vid, _pid)) => {
-                                row.note = if ver == local {
-                                    "已是最新".to_string()
-                                } else {
-                                    "可更新".to_string()
-                                };
-                                row.latest = Some(ver);
+                match resolve_mod_match(
+                    &path,
+                    m.mod_id.as_deref(),
+                    &display,
+                    &file,
+                    mc.as_deref(),
+                    loader.as_deref(),
+                ) {
+                    Ok(Some(mm)) => {
+                        if let Some(t) = mm.title {
+                            if !t.trim().is_empty() {
+                                row.name = t;
                             }
-                            Err(e) => row.note = format!("未找到适配版本：{e}"),
                         }
+                        if let Some(l) = mm.local {
+                            row.local = l;
+                        }
+                        row.url = mm.url;
+                        row.key = mm.key;
+                        row.via = mm.via.to_string();
+                        row.latest = mm.latest.clone();
+                        row.note = match &mm.latest {
+                            Some(v) if *v == row.local => "已是最新".to_string(),
+                            Some(_) => "可更新".to_string(),
+                            None => mm.detail.unwrap_or_else(|| {
+                                "已匹配到项目，但没有适配当前 MC 版本/加载器的版本".to_string()
+                            }),
+                        };
                     }
-                    Err(_) => {
-                        // 找不到就跳过，不报错（很多 modid 与 Modrinth slug 不一致）
-                        row.note = "未在 Modrinth 找到该项目（已跳过）".to_string();
+                    Ok(None) => {
+                        row.via = "未匹配".to_string();
+                        row.note = "未在 Modrinth 匹配到（可手动搜索）".to_string();
+                    }
+                    Err(e) => {
+                        row.via = "失败".to_string();
+                        row.note = format!("查询失败：{e}");
                     }
                 }
                 rows.push(row);
             }
             let _ = tx.send(BgMsg::ModUpdDone(idx, rows));
+        });
+    }
+
+    /// 「查看版本」：后台按需拉取某个项目在**当前 MC 版本 + 加载器**下最近的 5 个版本。
+    /// 只读展示（版本号/发布类型/日期/版本页），不下载任何文件；结果按项目标识缓存在内存里。
+    fn spawn_mod_versions(&mut self, idx: usize, key: String) {
+        let key = key.trim().to_string();
+        if key.is_empty() || idx >= self.cfg.servers.len() {
+            return;
+        }
+        if self.modupd_vers.contains_key(&key) || self.modupd_ver_loading.contains(&key) {
+            return;
+        }
+        // 当前服务器的 MC 版本 / 加载器（detect_cached 有 3 秒 TTL，不会真的每帧遍历目录）
+        let pinfo = serverinfo::detect_cached(
+            &self.cfg.servers[idx].dir,
+            std::time::Duration::from_secs(3),
+        );
+        let mc = pinfo.mc_version.clone().unwrap_or_default();
+        let loader = pinfo
+            .kind
+            .modrinth_loader()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        self.modupd_ver_loading.insert(key.clone());
+        self.modupd_ver_err.remove(&key);
+        let tx = self.bg_tx.clone();
+        std::thread::spawn(move || {
+            // 与"检查更新"同款限速：上一次请求刚发完，隔 200ms 再发，避免打爆 API
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let res = modrinth::list_versions_for_slug(&key, &mc, &loader, 5);
+            let _ = tx.send(BgMsg::ModVersions(key, res));
         });
     }
 
@@ -6924,76 +7101,22 @@ impl App {
     }
 
     /// 静态解析当前文件浏览目录下所有 .jar 模组元数据，识别客户端模组。
-    /// 参考 MSL IsClientSideMod 原理：仅读 jar 内 fabric.mod.json environment / mods.toml side，
-    /// 不加载模组；解析失败的文件静默忽略，视为非客户端模组。
+    /// 判定顺序（与 mods 页显示一致）：先读 jar 内元数据的运行侧
+    /// （fabric/quilt 的 environment、forge/neoforge 的 displayTest），
+    /// 元数据没结论时用启发式兜底（客户端 mixin 段、客户端主类 class_310、文件名关键词）。
+    /// 用户主动排查 → 忽略缓存重扫；结果只保留"仅客户端/疑似仅客户端"的文件名。
     fn analyze_client_mods(&mut self, idx: usize) {
         if idx >= self.runtimes.len() {
             return;
         }
         let target = self.file_tab_target(idx);
-        let mut clients: Vec<String> = Vec::new();
-        if let Ok(rd) = std::fs::read_dir(&target) {
-            for e in rd.flatten() {
-                let name = e.file_name().to_string_lossy().to_string();
-                if name.to_lowercase().ends_with(".jar") && e.path().is_file() {
-                    if Self::jar_is_client_mod(&e.path()) {
-                        clients.push(name);
-                    }
-                }
-            }
-        }
-        clients.sort();
-        self.runtimes[idx].file_client_mods = Some(clients);
-    }
-
-    /// 静态解析单个 mod jar 是否客户端模组（启发式，参考 MSL IsClientSideMod 原理，不加载模组）：
-    /// - fabric.mod.json 的 environment == "client"；
-    /// - META-INF/mods.toml / META-INF/neoforge.mods.toml 的 [[mods]] 块：modId=minecraft 优先，否则取首个块；side == "CLIENT"。
-    /// 解析失败一律视为非客户端模组。
-    fn jar_is_client_mod(path: &std::path::Path) -> bool {
-        let Ok(file) = std::fs::File::open(path) else {
-            return false;
-        };
-        let Ok(mut z) = zip::ZipArchive::new(file) else {
-            return false;
-        };
-        // Fabric：fabric.mod.json environment
-        if let Ok(mut f) = z.by_name("fabric.mod.json") {
-            let mut buf = Vec::new();
-            if std::io::Read::read_to_end(&mut f, &mut buf).is_ok() {
-                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&buf) {
-                    if v["environment"].as_str() == Some("client") {
-                        return true;
-                    }
-                }
-            }
-        }
-        // Forge / NeoForge：META-INF/mods.toml / neoforge.mods.toml
-        for meta in ["META-INF/mods.toml", "META-INF/neoforge.mods.toml"] {
-            if let Ok(mut f) = z.by_name(meta) {
-                let mut buf = Vec::new();
-                if std::io::Read::read_to_end(&mut f, &mut buf).is_ok() {
-                    if let Ok(v) = toml::from_str::<toml::Value>(&String::from_utf8_lossy(&buf)) {
-                        let mods = v.get("mods").and_then(|m| m.as_array());
-                        let first_side = mods
-                            .and_then(|arr| arr.first())
-                            .and_then(|m| m.get("side"))
-                            .and_then(|s| s.as_str());
-                        let mc_side = mods
-                            .and_then(|arr| {
-                                arr.iter()
-                                    .find(|m| m.get("modId").and_then(|x| x.as_str()) == Some("minecraft"))
-                            })
-                            .and_then(|m| m.get("side"))
-                            .and_then(|s| s.as_str());
-                        if mc_side.or(first_side) == Some("CLIENT") {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-        false
+        let clients: Vec<(String, ModSide)> = scan_mod_sides_forced(&target)
+            .into_iter()
+            .filter(|(_, s)| s.is_client())
+            .collect();
+        let names: Vec<String> = clients.iter().map(|(n, _)| n.clone()).collect();
+        self.runtimes[idx].file_mod_clients = clients;
+        self.runtimes[idx].file_client_mods = Some(names);
     }
 
     /// 页签根目录（datapack 位于 world/datapacks�?
@@ -7075,6 +7198,15 @@ impl App {
             }
         });
         self.runtimes[idx].file_list = list;
+        // mods 页签：顺带刷新「仅客户端模组」判定（元数据 environment 为准 + 启发式兜底）。
+        // 只在文件列表刷新（刷新按钮 / 切页签 / 启停模组 / 重命名 / 删除）时执行，
+        // 内部按目录指纹缓存，渲染路径不会开 jar。
+        if self.runtimes[idx].file_tab == "mods" {
+            self.runtimes[idx].file_mod_clients = scan_mod_sides(&target)
+                .into_iter()
+                .filter(|(_, s)| s.is_client())
+                .collect();
+        }
     }
 
     fn open_file_edit(&mut self, idx: usize, name: &str) {
@@ -7444,6 +7576,294 @@ fn sha1_hex(data: &[u8]) -> String {
         h[4] = h[4].wrapping_add(e);
     }
     h.iter().map(|x| format!("{x:08x}")).collect()
+}
+
+// ==================== 模组「检查更新」三级匹配（后台线程内使用） ====================
+
+/// 模组在 Modrinth 上的一次匹配结果
+struct ModMatch {
+    /// 项目页地址
+    url: String,
+    /// 项目标识（slug 或项目 id）：查项目页 / 列版本列表都用它
+    key: String,
+    /// Modrinth 项目标题（能拿到时用它替代 jar 内名称）
+    title: Option<String>,
+    /// 本地版本：指纹命中时取 Modrinth 记录的版本号（比 jar 内元数据更准）
+    local: Option<String>,
+    /// 最新适配版本号；None = 拿不到（原因见 detail）
+    latest: Option<String>,
+    /// 匹配方式：指纹 / slug / 搜索
+    via: &'static str,
+    /// 已匹配到项目、但拿不到可用版本时的原因
+    detail: Option<String>,
+}
+
+/// Modrinth 查询错误更像"网络/接口故障"（而不是"该项目/文件不存在"）。
+/// 用途：区分「未匹配」（提示用户手动搜索）与「失败」（提示检查网络/加速器）。
+fn modrinth_err_is_network(e: &str) -> bool {
+    const KEYS: [&str; 9] = [
+        "请求失败",
+        "JSON 解析失败",
+        "HTTP 408",
+        "HTTP 429",
+        "HTTP 500",
+        "HTTP 502",
+        "HTTP 503",
+        "HTTP 504",
+        "HTTP 400",
+    ];
+    KEYS.iter().any(|k| e.contains(k))
+}
+
+/// Modrinth 项目页地址：优先 slug（可读），没有 slug 时用项目 id（Modrinth 同样能解析）
+fn modrinth_project_url(project_key: &str) -> String {
+    format!("https://modrinth.com/mod/{}", project_key.trim())
+}
+
+/// 查项目在给定 MC 版本/加载器下的最新版本号；查不到返回 (None, 原因)，不向上抛错
+fn modrinth_latest_version(
+    project_id: &str,
+    mc: Option<&str>,
+    loader: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    match crate::modrinth::latest_version_for_slug(project_id, mc, loader, false) {
+        Ok((v, _d, _id, _pid)) => (Some(v), None),
+        Err(e) => (None, Some(e)),
+    }
+}
+
+/// 一级匹配：SHA1 指纹（拿 jar 文件内容算摘要，与 modid、文件名都无关，最可靠）
+fn match_mod_by_sha1(
+    path: &std::path::Path,
+    mc: Option<&str>,
+    loader: Option<&str>,
+) -> Result<Option<ModMatch>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("读取模组文件失败: {e}"))?;
+    let sha1 = sha1_hex(&bytes);
+    match crate::modrinth::version_by_sha1(&sha1) {
+        Ok((pid, _vid, ver, _date, _furl, _fname)) => {
+            let (latest, detail) = modrinth_latest_version(&pid, mc, loader);
+            Ok(Some(ModMatch {
+                url: modrinth_project_url(&pid),
+                key: pid,
+                title: None,
+                local: if ver.trim().is_empty() { None } else { Some(ver) },
+                latest,
+                via: "指纹",
+                detail,
+            }))
+        }
+        // 指纹查不到不是错误（第三方构建 / 改过 jar 就会查不到），交给下一级兜底
+        Err(e) => {
+            if modrinth_err_is_network(&e) {
+                Err(e)
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// 二级匹配：把 modid 当 Modrinth slug 查（很多模组的 modid 恰好就是 slug）
+fn match_mod_by_slug(
+    modid: &str,
+    mc: Option<&str>,
+    loader: Option<&str>,
+) -> Result<Option<ModMatch>, String> {
+    let id = modid.trim();
+    if id.is_empty() {
+        return Ok(None);
+    }
+    match crate::modrinth::project_by_slug(id) {
+        Ok((pid, title, slug, source_url)) => {
+            let (latest, detail) = modrinth_latest_version(&pid, mc, loader);
+            let key = if slug.trim().is_empty() { pid } else { slug };
+            let url = if source_url.trim().is_empty() {
+                modrinth_project_url(&key)
+            } else {
+                source_url
+            };
+            Ok(Some(ModMatch {
+                url,
+                key: key.clone(),
+                title: Some(title),
+                local: None,
+                latest,
+                via: "slug",
+                detail,
+            }))
+        }
+        Err(e) => {
+            if modrinth_err_is_network(&e) {
+                Err(e)
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// 从文件名推搜索关键词：去扩展名，再去掉结尾的版本号片段
+/// （`carpet-extra-1.4.112.jar` → `carpet extra`；版本号留在查询串里会大幅降低命中率）
+fn mod_search_keyword(file: &str) -> String {
+    let raw = file.trim();
+    let base = raw
+        .strip_suffix(".jar")
+        .or_else(|| raw.strip_suffix(".JAR"))
+        .unwrap_or(raw);
+    let mut parts: Vec<&str> = base
+        .split(|c: char| c == '-' || c == '_' || c == ' ' || c == '.')
+        .filter(|s| !s.is_empty())
+        .collect();
+    while let Some(last) = parts.last().copied() {
+        let digits_like = last
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '.' || c == '+');
+        let v_prefixed = match last.strip_prefix('v').or_else(|| last.strip_prefix('V')) {
+            Some(rest) => {
+                !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit() || c == '.')
+            }
+            None => false,
+        };
+        if digits_like || v_prefixed {
+            parts.pop();
+        } else {
+            break;
+        }
+    }
+    if parts.is_empty() {
+        return base.trim().to_string();
+    }
+    parts.join(" ")
+}
+
+/// 三级匹配：Modrinth 搜索取第一条候选（可靠度最低，结果里会标注「搜索」）
+fn match_mod_by_search(
+    name: &str,
+    file: &str,
+    mc: Option<&str>,
+    loader: Option<&str>,
+) -> Result<Option<ModMatch>, String> {
+    let mut queries: Vec<String> = Vec::new();
+    let n = name.trim();
+    if !n.is_empty() && n.chars().count() <= 60 && n != file {
+        queries.push(n.to_string());
+    }
+    let kw = mod_search_keyword(file);
+    if !kw.is_empty() && !queries.iter().any(|q| q.eq_ignore_ascii_case(&kw)) {
+        queries.push(kw);
+    }
+    if queries.is_empty() {
+        return Ok(None);
+    }
+    let mut net_err: Option<String> = None;
+    // 每个候选先带 MC 版本/加载器过滤搜，没有结果再放宽过滤搜一次：
+    // 目的是"尽量命中"，代价是可能匹到同名项目，因此结果一律标注「搜索」提醒可靠度较低。
+    for (i, q) in queries.iter().enumerate() {
+        for (k, (f_mc, f_ld)) in [(mc, loader), (None, None)].into_iter().enumerate() {
+            if i > 0 || k > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            match crate::modrinth::search_mods(
+                q,
+                "mod",
+                f_mc.unwrap_or(""),
+                f_ld.unwrap_or(""),
+                "",
+                "relevance",
+                3,
+                0,
+            ) {
+                Ok(res) => {
+                    let Some(hit) = res.hits.first() else { continue };
+                    let pid = hit.id.clone();
+                    let (latest, detail) = modrinth_latest_version(&pid, mc, loader);
+                    let key = if hit.slug.trim().is_empty() {
+                        pid
+                    } else {
+                        hit.slug.clone()
+                    };
+                    let url = if hit.source_url.trim().is_empty() {
+                        modrinth_project_url(&key)
+                    } else {
+                        hit.source_url.clone()
+                    };
+                    return Ok(Some(ModMatch {
+                        url,
+                        key: key.clone(),
+                        title: Some(hit.title.clone()),
+                        local: None,
+                        latest,
+                        via: "搜索",
+                        detail,
+                    }));
+                }
+                Err(e) => {
+                    if modrinth_err_is_network(&e) {
+                        net_err = Some(e);
+                    }
+                }
+            }
+        }
+    }
+    match net_err {
+        Some(e) => Err(e),
+        None => Ok(None),
+    }
+}
+
+/// 三级匹配总入口：SHA1 指纹 → modid(slug) → 搜索。
+/// Ok(Some) 命中；Ok(None) 三级都没匹配到项目；Err 更像网络/接口故障（提示检查网络）
+fn resolve_mod_match(
+    path: &std::path::Path,
+    modid: Option<&str>,
+    name: &str,
+    file: &str,
+    mc: Option<&str>,
+    loader: Option<&str>,
+) -> Result<Option<ModMatch>, String> {
+    let mut net_err: Option<String> = None;
+    // 一级：SHA1 指纹
+    match match_mod_by_sha1(path, mc, loader) {
+        Ok(Some(m)) => return Ok(Some(m)),
+        Ok(None) => {}
+        Err(e) => net_err = Some(e),
+    }
+    // 二级：modid 当 slug
+    if let Some(id) = modid {
+        if !id.trim().is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            match match_mod_by_slug(id, mc, loader) {
+                Ok(Some(m)) => return Ok(Some(m)),
+                Ok(None) => {}
+                Err(e) => net_err = Some(e),
+            }
+        }
+    }
+    // 三级：搜索取第一条候选
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    match match_mod_by_search(name, file, mc, loader) {
+        Ok(Some(m)) => Ok(Some(m)),
+        Ok(None) => match net_err {
+            Some(e) => Err(e),
+            None => Ok(None),
+        },
+        Err(e) => Err(e),
+    }
+}
+
+/// 查询串 URL 编码（中文/空格等按 UTF-8 逐字节转义），用于拼「Modrinth 手动搜索」链接
+fn url_encode_query(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// Windows 文件名合法性校验：非法字符、保留名、结尾点/空格
@@ -12147,6 +12567,7 @@ impl App {
             return;
         }
 
+        ui.add_space(CONTENT_EDGE_PAD);
             });
     }
 
@@ -12162,6 +12583,7 @@ impl App {
                     .show(ui, |ui| {
                         self.ui_special_body(ui, idx);
                     });
+                ui.add_space(CONTENT_EDGE_PAD);
             });
     }
 
@@ -13054,6 +13476,7 @@ impl App {
                 }
             }
         });
+        ui.add_space(CONTENT_EDGE_PAD);
             });
     }
 
@@ -13063,9 +13486,14 @@ impl App {
         let run_bat = dir.join("run.bat");
         let jvm_args = dir.join("user_jvm_args.txt");
 
-        // 整页滚动：内容超出一屏时保证下方保存按钮可见可点
+        // 整页滚动：本页所有分区（含最底部的「🛠 生成 run.bat」「保存 user_jvm_args.txt」「Java 设置」）
+        // 必须全部待在同一个垂直 ScrollArea 内 —— 只要有一段内容在滚动容器之外，超出窗口的部分就直接被
+        // 裁剪在窗口外，既看不见也点不到（低窗口高度下最底部的保存按钮只露一小截就是这个问题）。
+        let scripts_max_h = ui.available_height();
         egui::ScrollArea::vertical()
+            .id_salt("server_scripts_scroll")
             .auto_shrink([false, false])
+            .max_height(scripts_max_h)
             .show(ui, |ui| {
         ui.add_space(6.0);
 
@@ -13254,7 +13682,6 @@ impl App {
                     }
                 }
                 self.runtimes[idx].run_bat_edit = Some(bat_content);
-            });
             });
         ui.separator();
 
@@ -13510,6 +13937,11 @@ impl App {
         if run_bat.exists() {
             ui.label(RichText::new("（run.bat 存在，启动时优先执行 run.bat，Java 以脚本内为准").weak());
         }
+        // 末尾补一段不小于内容区内边距的留白：为什么必须保证最底部内容可达——
+        // 窗口高度较低时内容区底部内边距（CONTENT_EDGE_PAD）会吃掉最后一行，
+        // 滚到底也看不到 / 点不到保存按钮，所以滚动区要包住整页并留出这段空白。
+        ui.add_space(CONTENT_EDGE_PAD);
+            });
     }
 
     /// 白名单 / 黑名单管理（whitelist.json / banned-players.json / banned-ips.json）
@@ -14065,6 +14497,7 @@ impl App {
                     // 不再渲染任何可操作控件（原实现 ui_players_props 仍保留在代码里备用）。
                     PlayerTab::Props => self.ui_players_props_disabled(ui, idx),
                 }
+                ui.add_space(CONTENT_EDGE_PAD);
             });
     }
 
@@ -14413,17 +14846,17 @@ impl App {
                 }
                 if ui
                     .button("🔍 排查客户端模组")
-                    .on_hover_text("静态解析 mods 下 .jar 的 fabric.mod.json / mods.toml，标出仅客户端模组（启发式，仅供参考）")
+                    .on_hover_text("重新扫描 mods 下所有 .jar：先读元数据的运行侧（fabric/quilt environment、forge/neoforge displayTest），再用客户端 mixin/文件名关键词兜底，标出「仅客户端」模组")
                     .clicked()
                 {
                     self.runtimes[idx].file_client_mods_confirm = true;
                 }
-                // 模组检查更新（测试功能，默认关闭）：按 modid 查 Modrinth，只报告不替换
+                // 模组检查更新（测试功能，默认关闭）：SHA1 指纹优先 + modid/搜索兜底，只报告不替换
                 if features::is_enabled(&self.cfg.features, features::BETA_MOD_UPDATE) {
                     let busy = self.runtimes[idx].modupd_busy;
                     if ui
                         .add_enabled(!busy, egui::Button::new(if busy { "检查更新中…" } else { "🔄 检查更新" }))
-                        .on_hover_text("按 modid 查询 Modrinth 的最新版本（串行请求 + 限速），只报告不替换")
+                        .on_hover_text("按 jar 的 SHA1 指纹查 Modrinth（最可靠），未命中再按 modid、最后按名称搜索；串行请求 + 限速，只报告不替换")
                         .clicked()
                     {
                         self.spawn_mod_update_check(idx);
@@ -14581,10 +15014,20 @@ impl App {
                             }
                             // 收藏的文件置顶；其后客户端模组置顶（优先级低于收藏）；再按名称列头方向排序
                             let favs = self.runtimes[idx].file_favs.clone();
-                            let client_mods = self.runtimes[idx]
+                            // 「仅客户端」集合 = 元数据/启发式判定结果 ∪ 手动排查结果（两者都会标橙置顶）
+                            let meta_clients: Vec<(String, ModSide)> =
+                                self.runtimes[idx].file_mod_clients.clone();
+                            let mut client_mods: Vec<String> =
+                                meta_clients.iter().map(|(n, _)| n.clone()).collect();
+                            for n in self.runtimes[idx]
                                 .file_client_mods
                                 .clone()
-                                .unwrap_or_default();
+                                .unwrap_or_default()
+                            {
+                                if !client_mods.contains(&n) {
+                                    client_mods.push(n);
+                                }
+                            }
                             shown.sort_by(|a, b| {
                                 let af = favs.contains(&a.0);
                                 let bf = favs.contains(&b.0);
@@ -14648,8 +15091,18 @@ impl App {
                                         } else {
                                             name.clone()
                                         };
-                                        // 客户端模组标橙显示（排查结果存在时）
-                                        let display_text = if !*is_dir && client_mods.contains(name) {
+                                        // 仅客户端模组：橙色 + 标签「仅客户端」（判定依据见 hover）
+                                        let mod_side = meta_clients
+                                            .iter()
+                                            .find(|(n, _)| n == name)
+                                            .map(|(_, s)| *s);
+                                        let is_client = !*is_dir && client_mods.contains(name);
+                                        let display = if !*is_dir && is_client {
+                                            format!("{display}  [仅客户端]")
+                                        } else {
+                                            display
+                                        };
+                                        let display_text = if is_client {
                                             RichText::new(display).color(self.fg(Color32::from_rgb(255, 170, 60)))
                                         } else {
                                             RichText::new(display)
@@ -14704,14 +15157,17 @@ impl App {
                                                 .as_ref()
                                                 .map(|(n, _, _, _)| n == name)
                                                 .unwrap_or(false);
-                                            let is_client = client_mods.contains(name);
+                                            let hover = match mod_side {
+                                                Some(s) => format!(
+                                                    "仅客户端模组：装在服务端通常会在加载阶段崩溃或不生效，建议禁用。{}。\n单击预览，双击用系统默认程序打开，右键更多操作",
+                                                    s.basis()
+                                                ),
+                                                None if is_client => "疑似客户端模组（手动排查结果，仅供参考，已标橙置顶）。\n单击预览，双击用系统默认程序打开，右键更多操作".to_string(),
+                                                None => "单击预览，双击用系统默认程序打开，右键更多操作".to_string(),
+                                            };
                                             let resp = ui
                                                 .selectable_label(sel, display_text)
-                                                .on_hover_text(if is_client {
-                                                    "疑似客户端模组（已标橙置顶，仅供参考）。单击预览，双击用系统默认程序打开，右键更多操作"
-                                                } else {
-                                                    "单击预览，双击用系统默认程序打开，右键更多操作"
-                                                });
+                                                .on_hover_text(hover);
                                             // 滚动定位：来自 Spark 分析页「📍 定位」跳转
                                             if self.runtimes[idx].file_scroll_to.as_deref() == Some(name.as_str()) {
                                                 resp.scroll_to_me(Some(egui::Align::Center));
@@ -15101,7 +15557,7 @@ impl App {
             }
         }
 
-        // 排查客户端模组二次确认（启发式分析，结果仅供参考；复用 egui Window 确认机制）
+        // 排查客户端模组二次确认（以元数据为准，启发式兜底；结果仅供参考；复用 egui Window 确认机制）
         if self.runtimes[idx].file_client_mods_confirm {
             let mut close = false;
             let mut do_scan = false;
@@ -15111,12 +15567,13 @@ impl App {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ui.ctx(), |ui| {
-                    ui.label("将扫描当前 mods 目录下的所有 .jar 模组元数据");
-                    ui.label("（fabric.mod.json 的 environment / mods.toml 的 side），");
-                    ui.label("标出标记为「仅客户端」的模组并标橙置顶显示。");
+                    ui.label("将忽略缓存重新扫描当前 mods 目录下的所有 .jar 模组：");
+                    ui.label("（fabric/quilt 的 environment、forge/neoforge 的 displayTest），");
+                    ui.label("元数据没有结论时再用客户端 mixin 段 / 客户端主类 / 文件名关键词兜底，");
+                    ui.label("标出「仅客户端」的模组并标橙置顶显示。");
                     ui.add_space(4.0);
                     ui.label(
-                        RichText::new("⚠ 客户端模组排查为启发式分析，结果不一定正确，请结合经验自行判断。")
+                        RichText::new("⚠ 判定以模组元数据为准，兜底部分属启发式，结果不一定正确，请结合经验自行判断。")
                             .color(self.fg(Color32::from_rgb(255, 170, 60))),
                     );
                     ui.add_space(6.0);
@@ -15144,9 +15601,9 @@ impl App {
                     .map(|v| v.len())
                     .unwrap_or(0);
                 self.set_toast(if n > 0 {
-                    format!("排查完成：发现 {n} 个疑似客户端模组（已标橙置顶）")
+                    format!("排查完成：发现 {n} 个「仅客户端」模组（已标橙置顶）")
                 } else {
-                    "排查完成：未发现标记为 client/CLIENT 的模组".to_string()
+                    "排查完成：未发现仅客户端模组".to_string()
                 });
             }
         }
@@ -15875,6 +16332,7 @@ impl App {
             }
         }
         }
+        ui.add_space(CONTENT_EDGE_PAD);
             });
     }
 
@@ -16021,6 +16479,7 @@ impl App {
                         TunnelSide::Logs => self.ui_tunnel_logs(ui),
                         TunnelSide::Tutorial => self.ui_tunnel_tutorial(ui),
                     }
+                    ui.add_space(CONTENT_EDGE_PAD);
                 });
         });
 
@@ -18570,6 +19029,7 @@ impl App {
                             self.ui_settings_beta(ctx, ui, use_anim);
                         }
                     }
+                    ui.add_space(CONTENT_EDGE_PAD);
                 });
         });
         // 完全禁用 Defender 的二次确认弹�?
@@ -18625,35 +19085,74 @@ impl App {
                 );
                 ui.label("启用后功能立即生效，并可能影响服务器运行稳定性；请先在测试环境验证，再决定是否长期开启。");
                 ui.separator();
-                // 测试功能：名称 + 状态 + 启用/禁用
-                // Bug6：网络下载/玩家管理/插件系统已转正式功能（Tool 组默认启用），不再作为测试功能在此展示开关
-                // 2026-10-02：特殊功能（Spark 分析）回归测试功能（Beta 组默认禁用），重新在此展示开关
-                let beta_list: [(&str, &str); 4] = [
-                    (features::BETA_BACKUP, "自动备份"),
-                    (features::BETA_CRASH_ANALYSIS, "崩溃报告分析"),
-                    (features::BETA_TRAFFIC, "内网穿透流量显示"),
-                    (features::BETA_SPECIAL, "特殊功能"),
-                ];
-                for (id, name) in beta_list {
-                    let enabled = features::is_enabled(&self.cfg.features, id);
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(name.to_string()).strong());
+                // 测试功能开关列表：完全由 features::REGISTRY 的 Beta 组生成（按 order 升序），
+                // 不再手写清单 —— 过去硬编码漏登记，导致「模组检查更新」等开关在界面上根本看不到。
+                for m in features::items_in_group(features::FeatureGroup::Beta) {
+                    let enabled = features::is_enabled(&self.cfg.features, m.id);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(m.name).strong());
+                        ui.label(RichText::new(format!("[{}]", m.id)).small().weak());
                         if enabled {
                             ui.label(RichText::new("已启用").color(self.fg(Color32::from_rgb(80, 200, 120))));
                         } else {
                             ui.label(RichText::new("已禁用").color(self.fg(Color32::from_rgb(180, 180, 180))));
                         }
+                        // 默认值与生效时机都取自注册表（默认禁用 = 必须用户手动开启）
+                        ui.label(
+                            RichText::new(format!(
+                                "默认{} · {}",
+                                if m.default_enabled { "启用" } else { "禁用" },
+                                features::apply_note(m)
+                            ))
+                            .small()
+                            .weak(),
+                        );
                         if enabled {
                             if ui.button("禁用").clicked() {
-                                self.set_feature(id, false);
-                                self.set_toast(format!("已禁用「{name}」"));
+                                self.set_feature(m.id, false);
+                                self.set_toast(format!("已禁用「{}」", m.name));
                             }
                         } else if ui.button("启用").clicked() {
                             // 开启需警告确认
-                            self.beta_confirm = Some(id.to_string());
+                            self.beta_confirm = Some(m.id.to_string());
                         }
                     });
+                    // 每个开关一行说明小字（来源：注册表的 desc）
+                    ui.label(RichText::new(m.desc).small().weak());
+                    ui.add_space(4.0);
                 }
+                ui.separator();
+                // 其余已登记功能：只读展示登记状态（它们的显示由各自页面/导航控制，
+                // 这里不再提供开关，避免出现"点了开关但功能在别处管"的误解）。
+                ui.collapsing("其它已登记功能（只读状态）", |ui| {
+                    ui.label(
+                        RichText::new("这些功能/页面已在注册表中登记，启用状态由各自页面或导航控制；此处仅展示登记情况，便于核对入口是否存在。")
+                            .small()
+                            .weak(),
+                    );
+                    let mut last_group: Option<features::FeatureGroup> = None;
+                    for m in features::all_items_ordered() {
+                        if m.group == features::FeatureGroup::Beta {
+                            continue;
+                        }
+                        if last_group != Some(m.group) {
+                            ui.add_space(4.0);
+                            ui.label(RichText::new(m.group.label()).strong());
+                            last_group = Some(m.group);
+                        }
+                        let enabled = features::is_enabled(&self.cfg.features, m.id);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new(m.name).small());
+                            ui.label(RichText::new(format!("[{}]", m.id)).small().weak());
+                            ui.label(
+                                RichText::new(if enabled { "已启用" } else { "已禁用" })
+                                    .small()
+                                    .weak(),
+                            );
+                        });
+                        ui.label(RichText::new(m.desc).small().weak());
+                    }
+                });
             },
         );
         self.settings_sections = sections;
@@ -21619,9 +22118,13 @@ impl App {
                 let q = query.trim().to_lowercase();
                 let lv = level.clone();
                 let mut shown = 0usize;
+                // 日志区高度要扣掉下方「相关设置」那一行：日志区用 auto_shrink([false, false]) 会吃掉
+                // 全部剩余高度，若不给上限，低窗口高度时下面这行设置会被窗口下边缘裁掉（滚也滚不到）。
+                let logs_max_h = (ui.available_height() - 48.0).max(80.0);
                 egui::ScrollArea::vertical()
                     .id_salt("logs_scroll")
                     .auto_shrink([false, false])
+                    .max_height(logs_max_h)
                     .stick_to_bottom(follow)
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
@@ -24861,7 +25364,391 @@ fn newest_files(dir: &Path, exts: &[&str], n: usize) -> Vec<PathBuf> {
     items.into_iter().take(n).map(|(_, p)| p).collect()
 }
 
-/// 启动前预检（7 项）。全部为"只读检查"，不修改任何文件，也不阻断启动。
+// ==================== 模组运行侧识别（仅客户端模组 / 服务端崩溃排查） ====================
+//
+// 背景：把仅客户端的模组（GUI/HUD/按键类）放进服务端 mods 目录，服务端会在加载阶段
+// 因为客户端主类（class_310 = MinecraftClient）不存在而直接退出，且往往来不及生成崩溃报告。
+// 这里只在「文件列表刷新 / 用户主动排查 / 启动前检查」时读 jar，
+// 结果按「目录 + 指纹」缓存，界面渲染路径只读缓存（绝不在每帧渲染里开 jar）。
+
+/// 模组声明的运行侧（判定结果）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModSide {
+    /// 元数据明确声明仅客户端（fabric/quilt environment=client、forge displayTest=IGNORE_SERVER_VERSION）
+    Client,
+    /// 元数据没给出结论，但启发式认为疑似仅客户端（客户端 mixin 段 / 引用客户端主类 / 文件名关键词）
+    SuspectedClient,
+    /// 明确双端
+    Both,
+    /// 明确仅服务端
+    Server,
+    /// 读不到任何可判断的信息
+    Unknown,
+}
+
+impl ModSide {
+    /// 是否需要标成「仅客户端」（元数据判定 + 启发式兜底）
+    fn is_client(self) -> bool {
+        matches!(self, ModSide::Client | ModSide::SuspectedClient)
+    }
+
+    /// 判定依据（hover 说明用，让用户知道这个结论有多可靠）
+    fn basis(self) -> &'static str {
+        match self {
+            ModSide::Client => "判定依据：模组元数据声明仅客户端",
+            ModSide::SuspectedClient => {
+                "判定依据：疑似（客户端 mixin 段 / 引用客户端主类 class_310 / 文件名关键词）"
+            }
+            _ => "",
+        }
+    }
+}
+
+/// 从 fabric.mod.json / quilt.mod.json 的 JSON 文本解析运行侧（纯函数，便于自检）。
+/// - fabric 顶层 `environment`：client / server / *
+/// - quilt 的 `minecraft.environment`：client / dedicated_server / *
+/// 解析失败、字段缺失、取值不认识 → Unknown（绝不 panic）。
+fn parse_mod_env_json(text: &str) -> ModSide {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return ModSide::Unknown;
+    };
+    let raw = v
+        .get("environment")
+        .and_then(|x| x.as_str())
+        .or_else(|| {
+            v.get("minecraft")
+                .and_then(|m| m.get("environment"))
+                .and_then(|x| x.as_str())
+        })
+        .or_else(|| {
+            v.get("quilt_loader")
+                .and_then(|q| q.get("minecraft"))
+                .and_then(|m| m.get("environment"))
+                .and_then(|x| x.as_str())
+        });
+    match raw.map(|s| s.trim().to_lowercase()) {
+        Some(s) => match s.as_str() {
+            "client" => ModSide::Client,
+            "server" | "dedicated_server" => ModSide::Server,
+            "*" | "both" | "any" => ModSide::Both,
+            _ => ModSide::Unknown,
+        },
+        None => ModSide::Unknown,
+    }
+}
+
+/// 从 mods.toml / neoforge.mods.toml 文本解析运行侧（纯函数）：
+/// `displayTest`：MATCH_VERSION=双端、IGNORE_SERVER_VERSION=仅客户端、IGNORE_ALL_VERSION=仅服务端；
+/// 读不到 displayTest 时再看 `[[mods]]` 的旧字段 `side`（CLIENT/SERVER）。都不认 → Unknown。
+fn parse_mod_env_toml(text: &str) -> ModSide {
+    let Ok(v) = toml::from_str::<toml::Value>(text) else {
+        return ModSide::Unknown;
+    };
+    let first_mod = || {
+        v.get("mods")
+            .and_then(|m| m.as_array())
+            .and_then(|a| a.first())
+    };
+    let display_test = v
+        .get("displayTest")
+        .and_then(|x| x.as_str())
+        .or_else(|| first_mod().and_then(|m| m.get("displayTest")).and_then(|x| x.as_str()));
+    if let Some(dt) = display_test {
+        return match dt.trim().to_uppercase().as_str() {
+            "MATCH_VERSION" => ModSide::Both,
+            "IGNORE_SERVER_VERSION" => ModSide::Client,
+            "IGNORE_ALL_VERSION" => ModSide::Server,
+            _ => ModSide::Unknown,
+        };
+    }
+    // 旧式 side 字段（1.12 风格 mods.toml / 部分模组仍保留）
+    let side = first_mod()
+        .and_then(|m| m.get("side"))
+        .and_then(|x| x.as_str())
+        .or_else(|| v.get("side").and_then(|x| x.as_str()));
+    match side.map(|s| s.trim().to_uppercase()) {
+        Some(s) => match s.as_str() {
+            "CLIENT" => ModSide::Client,
+            "SERVER" => ModSide::Server,
+            "BOTH" | "*" => ModSide::Both,
+            _ => ModSide::Unknown,
+        },
+        None => ModSide::Unknown,
+    }
+}
+
+/// 文件名关键词兜底（元数据读不出来时用）：常见仅客户端的 GUI/HUD/性能/按键类模组。
+const CLIENT_MOD_NAME_HINTS: [&str; 16] = [
+    "carpetgui",
+    "optifine",
+    "sodium",
+    "iris",
+    "shader",
+    "litematica",
+    "minihud",
+    "journeymap",
+    "xaero",
+    "replaymod",
+    "appleskin",
+    "modmenu",
+    "zoomify",
+    "okzoomer",
+    "betterf3",
+    "wthit",
+];
+
+/// 文件名是否命中"疑似仅客户端"关键词
+fn mod_name_hints_client(file_name: &str) -> bool {
+    let low = file_name.to_lowercase();
+    CLIENT_MOD_NAME_HINTS.iter().any(|k| low.contains(k))
+}
+
+/// jar 内的 mixin 配置是否像客户端模组：
+/// - `*.mixins.json` 里有非空的 `client` 段（客户端专用 mixin 列表）；
+/// - 或配置文本里出现客户端主类（class_310 / net.minecraft.client）。
+fn jar_mixin_looks_client(z: &mut zip::ZipArchive<std::fs::File>) -> bool {
+    let names: Vec<String> = z
+        .file_names()
+        .filter(|n| n.to_lowercase().ends_with(".mixins.json"))
+        .map(|n| n.to_string())
+        .collect();
+    for n in names {
+        let Ok(mut f) = z.by_name(&n) else { continue };
+        let mut s = String::new();
+        if std::io::Read::read_to_string(&mut f, &mut s).is_err() {
+            continue;
+        }
+        let low = s.to_lowercase();
+        if low.contains("class_310")
+            || low.contains("net.minecraft.client")
+            || low.contains("net/minecraft/client")
+        {
+            return true;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+            let has_client_section = v
+                .get("client")
+                .and_then(|c| c.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false);
+            if has_client_section {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 启发式判定（元数据没有结论时才用）：客户端 mixin 段 / 客户端主类 / 文件名关键词
+fn heuristic_client_side(z: &mut zip::ZipArchive<std::fs::File>, file_name: &str) -> bool {
+    if jar_mixin_looks_client(z) {
+        return true;
+    }
+    mod_name_hints_client(file_name)
+}
+
+/// 读单个 jar 的运行侧：Fabric/Quilt 的 environment 优先，其次 Forge/NeoForge 的 displayTest，
+/// 元数据没有结论时用启发式兜底。损坏的 jar 只按文件名兜底判断，绝不 panic。
+fn read_mod_side(path: &Path) -> ModSide {
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let hinted = mod_name_hints_client(&file_name);
+    let Ok(file) = std::fs::File::open(path) else {
+        return if hinted {
+            ModSide::SuspectedClient
+        } else {
+            ModSide::Unknown
+        };
+    };
+    let Ok(mut z) = zip::ZipArchive::new(file) else {
+        return if hinted {
+            ModSide::SuspectedClient
+        } else {
+            ModSide::Unknown
+        };
+    };
+    // 1) Fabric / Quilt：fabric.mod.json / quilt.mod.json 的 environment
+    let mut meta = ModSide::Unknown;
+    for entry in ["fabric.mod.json", "quilt.mod.json"] {
+        let Ok(mut f) = z.by_name(entry) else { continue };
+        let mut s = String::new();
+        if std::io::Read::read_to_string(&mut f, &mut s).is_err() {
+            continue;
+        }
+        let side = parse_mod_env_json(&s);
+        if side != ModSide::Unknown {
+            meta = side;
+            break;
+        }
+    }
+    // 2) Forge / NeoForge：META-INF/mods.toml / neoforge.mods.toml 的 displayTest
+    if meta == ModSide::Unknown {
+        for entry in ["META-INF/neoforge.mods.toml", "META-INF/mods.toml"] {
+            let Ok(mut f) = z.by_name(entry) else { continue };
+            let mut s = String::new();
+            if std::io::Read::read_to_string(&mut f, &mut s).is_err() {
+                continue;
+            }
+            let side = parse_mod_env_toml(&s);
+            if side != ModSide::Unknown {
+                meta = side;
+                break;
+            }
+        }
+    }
+    match meta {
+        // 元数据明确"仅服务端"时不再叠加启发式（服务端模组带客户端 mixin 段是可能的）
+        ModSide::Server => ModSide::Server,
+        ModSide::Client => ModSide::Client,
+        _ => {
+            if heuristic_client_side(&mut z, &file_name) {
+                ModSide::SuspectedClient
+            } else {
+                meta
+            }
+        }
+    }
+}
+
+/// mods 目录指纹：(jar 数量, jar 总字节, 最新 mtime 纳秒)。
+/// 只做一次 read_dir + metadata，比逐个开 jar 便宜得多（与 serverinfo 的思路一致）。
+fn mods_env_fingerprint(dir: &Path) -> (usize, u64, i64) {
+    let mut count = 0usize;
+    let mut total = 0u64;
+    let mut newest = 0i64;
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return (0, 0, 0);
+    };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !name.to_lowercase().ends_with(".jar") {
+            continue;
+        }
+        let Ok(md) = e.metadata() else { continue };
+        if !md.is_file() {
+            continue;
+        }
+        count += 1;
+        total = total.saturating_add(md.len());
+        if let Ok(mtime) = md.modified() {
+            if let Ok(d) = mtime.duration_since(std::time::UNIX_EPOCH) {
+                let ns = d.as_nanos().min(i64::MAX as u128) as i64;
+                if ns > newest {
+                    newest = ns;
+                }
+            }
+        }
+    }
+    (count, total, newest)
+}
+
+/// 运行侧扫描缓存条目（按目录 + 指纹失效，最长保留 24 小时）
+struct ModSideCacheEntry {
+    fingerprint: (usize, u64, i64),
+    at: std::time::Instant,
+    list: Vec<(String, ModSide)>,
+}
+
+const MOD_SIDE_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+fn mod_side_cache() -> &'static std::sync::Mutex<HashMap<PathBuf, ModSideCacheEntry>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, ModSideCacheEntry>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// 真正扫描 mods 目录（不查缓存）：只认 `.jar`（`.jar.disabled` 不参与），按文件名排序。
+fn scan_mod_sides_uncached(dir: &Path) -> Vec<(String, ModSide)> {
+    let mut out: Vec<(String, ModSide)> = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !name.to_lowercase().ends_with(".jar") {
+            continue;
+        }
+        let p = e.path();
+        if !p.is_file() {
+            continue;
+        }
+        out.push((name, read_mod_side(&p)));
+    }
+    out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    out
+}
+
+/// 把扫描结果写入缓存（目录数很少，超过 8 个且不含当前目录时整体清空）
+fn store_mod_sides(dir: &Path, fingerprint: (usize, u64, i64), list: &[(String, ModSide)]) {
+    let mut cache = mod_side_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= 8 && !cache.contains_key(dir) {
+        cache.clear();
+    }
+    cache.insert(
+        dir.to_path_buf(),
+        ModSideCacheEntry {
+            fingerprint,
+            at: std::time::Instant::now(),
+            list: list.to_vec(),
+        },
+    );
+}
+
+/// 扫描 mods 目录内每个 jar 的运行侧。指纹不变时直接复用缓存（最长 24 小时），
+/// 指纹变化（增删/改名/更新模组）立刻重扫。
+fn scan_mod_sides(dir: &Path) -> Vec<(String, ModSide)> {
+    let fp = mods_env_fingerprint(dir);
+    {
+        let cache = mod_side_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = cache.get(dir) {
+            if entry.fingerprint == fp && entry.at.elapsed() < MOD_SIDE_TTL {
+                return entry.list.clone();
+            }
+        }
+    }
+    let list = scan_mod_sides_uncached(dir);
+    store_mod_sides(dir, fp, &list);
+    list
+}
+
+/// 忽略缓存强制重扫（用户点「排查客户端模组」时用），结果同时刷新缓存。
+fn scan_mod_sides_forced(dir: &Path) -> Vec<(String, ModSide)> {
+    let list = scan_mod_sides_uncached(dir);
+    store_mod_sides(dir, mods_env_fingerprint(dir), &list);
+    list
+}
+
+/// logs/latest.log 末尾是否出现过"客户端主类缺失"的 Mixin 报错
+/// （class_310 = MinecraftClient；服务端加载客户端 mixin 会因此直接退出且不生成崩溃报告）。
+fn log_shows_client_class_mixin_failure(server_dir: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let p = server_dir.join("logs").join("latest.log");
+    let Ok(mut f) = std::fs::File::open(&p) else {
+        return false;
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    // 只看末尾 256 KB：日志可能很大，启动阶段的报错通常就在尾部
+    const TAIL: u64 = 256 * 1024;
+    if len > TAIL {
+        let _ = f.seek(SeekFrom::Start(len - TAIL));
+    }
+    let mut buf = Vec::new();
+    if f.take(TAIL).read_to_end(&mut buf).is_err() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&buf);
+    text.lines().any(|l| {
+        let client_class = l.contains("class_310")
+            || l.contains("net.minecraft.client")
+            || l.contains("net/minecraft/client");
+        let mixin_like = l.contains("Mixin") || l.contains("mixin") || l.contains("was not found");
+        client_class && mixin_like
+    })
+}
+
+/// 启动前预检（8 项）。全部为"只读检查"，不修改任何文件，也不阻断启动。
 fn run_precheck(sc: &ServerConfig, cfg: &GlobalConfig) -> Vec<PrecheckItem> {
     let mut items: Vec<PrecheckItem> = Vec::new();
     let pinfo = serverinfo::detect_cached(&sc.dir, std::time::Duration::from_secs(3));
@@ -25096,6 +25983,61 @@ fn run_precheck(sc: &ServerConfig, cfg: &GlobalConfig) -> Vec<PrecheckItem> {
                     missing.join("；"),
                     "从 Modrinth/CurseForge 补上缺失的前置模组（版本要与 MC 版本、加载器一致）".to_string(),
                 ));
+            }
+            // (c) 仅客户端模组：装到服务端会在加载阶段崩（客户端主类缺失）或干脆不生效
+            {
+                let mut definite: Vec<String> = Vec::new();
+                let mut suspected: Vec<String> = Vec::new();
+                for (name, side) in scan_mod_sides(&mods_dir) {
+                    match side {
+                        ModSide::Client => definite.push(name),
+                        ModSide::SuspectedClient => suspected.push(name),
+                        _ => {}
+                    }
+                }
+                let total = definite.len() + suspected.len();
+                if total == 0 {
+                    items.push(PrecheckItem::pass(
+                        "仅客户端模组",
+                        format!("未发现仅客户端模组（已检查 {} 个模组）", metas.len()),
+                    ));
+                } else {
+                    // 前 10 个文件名；元数据判定的排在前面（更可靠）
+                    let mut names: Vec<String> = definite.clone();
+                    names.extend(suspected.iter().cloned());
+                    let head: Vec<String> = names.iter().take(10).cloned().collect();
+                    let more = if names.len() > 10 {
+                        format!("…（共 {} 个）", names.len())
+                    } else {
+                        String::new()
+                    };
+                    let mut detail = format!("发现 {total} 个仅客户端模组：{}{more}", head.join("、"));
+                    if !suspected.is_empty() && !definite.is_empty() {
+                        detail.push_str(&format!(
+                            "（其中 {} 个由元数据判定，{} 个为疑似）",
+                            definite.len(),
+                            suspected.len()
+                        ));
+                    } else if definite.is_empty() {
+                        detail.push_str("（全部为疑似判定，依据见 mods 页 hover 说明）");
+                    }
+                    let crash_seen = log_shows_client_class_mixin_failure(&sc.dir);
+                    if crash_seen {
+                        items.push(PrecheckItem::fail(
+                            "仅客户端模组",
+                            format!(
+                                "{detail}；日志里已出现客户端主类（class_310）缺失的 Mixin 报错"
+                            ),
+                            "请先禁用这些仅客户端模组：把上面的文件重命名为 .jar.disabled 或移出 mods 目录后再启动（仅客户端模组应只装在客户端）".to_string(),
+                        ));
+                    } else {
+                        items.push(PrecheckItem::warn(
+                            "仅客户端模组",
+                            detail,
+                            "仅客户端模组（GUI/HUD/按键类）装在服务端通常会在加载阶段崩溃或不生效，建议禁用".to_string(),
+                        ));
+                    }
+                }
             }
         }
     }
@@ -25386,6 +26328,71 @@ fn is_builtin_dependency(id: &str) -> bool {
         "minecraft" | "java" | "fabricloader" | "fabric" | "forge" | "neoforge" | "quilt_loader"
             | "quilt_base"
     )
+}
+
+#[cfg(test)]
+mod mod_env_selfcheck {
+    use super::*;
+
+    /// fabric / quilt 的 environment 字段解析（纯字符串，不落盘、不开 jar）
+    #[test]
+    fn mod_env_json() {
+        assert_eq!(
+            parse_mod_env_json(r#"{"id":"carpetgui","environment":"client"}"#),
+            ModSide::Client
+        );
+        assert_eq!(
+            parse_mod_env_json(r#"{"id":"x","environment":"*"}"#),
+            ModSide::Both
+        );
+        assert_eq!(
+            parse_mod_env_json(r#"{"id":"x","environment":"server"}"#),
+            ModSide::Server
+        );
+        // quilt：environment 在 minecraft 段里，且服务端写 dedicated_server
+        assert_eq!(
+            parse_mod_env_json(
+                r#"{"quilt_loader":{"id":"y"},"minecraft":{"environment":"dedicated_server"}}"#
+            ),
+            ModSide::Server
+        );
+        // 字段缺失 / 取值不认识 / 根本不是 JSON → 一律 Unknown，不 panic
+        assert_eq!(parse_mod_env_json(r#"{"id":"x"}"#), ModSide::Unknown);
+        assert_eq!(parse_mod_env_json(r#"{"environment":"??"}"#), ModSide::Unknown);
+        assert_eq!(parse_mod_env_json("不是 JSON"), ModSide::Unknown);
+    }
+
+    /// forge / neoforge 的 displayTest 解析（[[mods]] 内与顶层都认）
+    #[test]
+    fn mod_env_toml() {
+        assert_eq!(
+            parse_mod_env_toml("[[mods]]\nmodId=\"a\"\ndisplayTest=\"IGNORE_SERVER_VERSION\"\n"),
+            ModSide::Client
+        );
+        assert_eq!(
+            parse_mod_env_toml("[[mods]]\nmodId=\"a\"\ndisplayTest=\"MATCH_VERSION\"\n"),
+            ModSide::Both
+        );
+        assert_eq!(
+            parse_mod_env_toml("displayTest=\"IGNORE_ALL_VERSION\"\n"),
+            ModSide::Server
+        );
+        assert_eq!(
+            parse_mod_env_toml("[[mods]]\nmodId=\"a\"\nside=\"CLIENT\"\n"),
+            ModSide::Client
+        );
+        assert_eq!(parse_mod_env_toml("[[mods]]\nmodId=\"a\"\n"), ModSide::Unknown);
+        assert_eq!(parse_mod_env_toml("不是 TOML [[["), ModSide::Unknown);
+    }
+
+    /// 文件名关键词兜底：命中常见客户端模组，普通模组不受影响
+    #[test]
+    fn mod_name_hint() {
+        assert!(mod_name_hints_client("CarpetGUI-1.2.3.jar"));
+        assert!(mod_name_hints_client("sodium-fabric-0.5.jar"));
+        assert!(!mod_name_hints_client("fabric-api-0.92.jar"));
+        assert!(!mod_name_hints_client("lithium-fabric-0.12.jar"));
+    }
 }
 
 #[cfg(test)]

@@ -7,10 +7,12 @@
 //! 3. 后续自定义 UI（布局/拖拽排序/样式/显隐）直接基于本注册表驱动，无需再动硬编码。
 //!
 //! 当前使用者：
-//! - 「测试中的功能」开关：Beta 分组功能默认禁用，启用需警告确认；
-//!   关闭 = enabled=false，UI 隐藏 + 后台调度拦截，不会出现"不显示但还在执行"。
+//! - 「测试中的功能」开关：列表完全由本注册表（`FeatureGroup::Beta`）生成，
+//!   Beta 分组功能默认禁用，启用需警告确认；关闭 = enabled=false，
+//!   UI 隐藏 + 后台调度拦截，不会出现"不显示但还在执行"。
 //!
-//! 新功能上线时必须在此登记一条 FeatureMeta，否则无法被个性化系统识别。
+//! 新功能上线时必须在此登记一条 FeatureMeta（含 `desc` 一句话说明），
+//! 否则无法被个性化系统识别，也不会出现在开关列表里。
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -40,6 +42,17 @@ impl FeatureGroup {
             FeatureGroup::Beta => "测试中的功能",
         }
     }
+
+    /// 分组展示顺序（升序），供注册表驱动的列表排序使用
+    pub fn index(&self) -> u8 {
+        match self {
+            FeatureGroup::Beta => 0,
+            FeatureGroup::Server => 1,
+            FeatureGroup::Tunnel => 2,
+            FeatureGroup::Settings => 3,
+            FeatureGroup::Tool => 4,
+        }
+    }
 }
 
 /// 功能元数据（编译期静态登记，不可变）
@@ -48,12 +61,20 @@ pub struct FeatureMeta {
     pub id: &'static str,
     /// 显示名
     pub name: &'static str,
+    /// 一句话说明（开关列表里的"风险/说明"小字，必须填写）
+    pub desc: &'static str,
     /// 所属分组
     pub group: FeatureGroup,
     /// 默认启用（false=默认禁用，仅测试功能使用）
     pub default_enabled: bool,
     /// 默认可见（false=默认隐藏 UI）
     pub default_visible: bool,
+    /// 是否需要重启程序才完全生效（true 时界面标注"下次启动生效"）
+    ///
+    /// 目前所有已登记项都在运行时读取开关（后台调度每轮重新判断），
+    /// 因此全部为 false（界面显示"立即生效"）；该字段留给将来
+    /// "只能在启动时一次性装配"的功能。
+    pub restart_required: bool,
     /// 默认排序（同组内升序）
     pub order: u32,
 }
@@ -109,308 +130,385 @@ pub const REGISTRY: &[FeatureMeta] = &[
     FeatureMeta {
         id: "server.overview",
         name: "概览",
+        desc: "服务器首页：启动/停止、核心信息与常用快捷入口。",
         group: FeatureGroup::Server,
         default_enabled: true,
         default_visible: true,
+        restart_required: false,
         order: 10,
     },
     FeatureMeta {
         id: "server.status",
         name: "状态",
+        desc: "实时查看进程 CPU/内存占用与运行时长。",
         group: FeatureGroup::Server,
         default_enabled: true,
         default_visible: true,
+        restart_required: false,
         order: 20,
     },
     FeatureMeta {
         id: "server.files",
         name: "文件",
+        desc: "在界面里浏览、编辑服务器目录下的文件。",
         group: FeatureGroup::Server,
         default_enabled: true,
         default_visible: true,
+        restart_required: false,
         order: 30,
     },
     FeatureMeta {
         id: "server.backup",
         name: "自动功能",
+        desc: "备份与自动重启等自动能力的集中入口。",
         group: FeatureGroup::Server,
         default_enabled: true,
         default_visible: true,
+        restart_required: false,
         order: 40,
     },
     FeatureMeta {
         id: "server.auto_restart",
         name: "自动重启",
+        desc: "服务器异常退出后按倒计时自动重新启动。",
         group: FeatureGroup::Server,
         default_enabled: true,
         default_visible: true,
+        restart_required: false,
         order: 50,
     },
     FeatureMeta {
         id: "server.crash_restart",
         name: "崩溃重启",
+        desc: "检测到崩溃后自动重启（反复崩溃时建议关闭）。",
         group: FeatureGroup::Server,
         default_enabled: true,
         default_visible: true,
+        restart_required: false,
         order: 51,
     },
     FeatureMeta {
         id: "server.whitelist",
         name: "白名单/黑名单管理",
+        desc: "管理白名单、封禁与 OP 名单，改动直接写入服务端文件。",
         group: FeatureGroup::Server,
         default_enabled: true,
         default_visible: true,
+        restart_required: false,
         order: 60,
     },
     FeatureMeta {
         id: "server.properties",
         name: "服务器设置",
+        desc: "图形化编辑 server.properties 与常用启动参数。",
         group: FeatureGroup::Server,
         default_enabled: true,
         default_visible: true,
+        restart_required: false,
         order: 61,
     },
     FeatureMeta {
         id: "server.scripts",
         name: "启动脚本",
+        desc: "编辑 run.bat 与 JVM 参数等启动脚本。",
         group: FeatureGroup::Server,
         default_enabled: true,
         default_visible: true,
+        restart_required: false,
         order: 62,
     },
     FeatureMeta {
         id: "server.java",
         name: "Java 设置",
+        desc: "为每台服务器指定 Java 路径与内存参数。",
         group: FeatureGroup::Server,
         default_enabled: true,
         default_visible: true,
+        restart_required: false,
         order: 63,
     },
     FeatureMeta {
         id: FEATURE_FORCE_STOP_CONFIRM,
         name: "强停二次确认",
+        desc: "强制结束服务器进程前弹窗确认，避免误点丢档。",
         group: FeatureGroup::Server,
         default_enabled: true,
         default_visible: true,
+        restart_required: false,
         order: 64,
     },
     FeatureMeta {
         id: "server.tps",
         name: "服务端性能(TPS/MSPT)",
+        desc: "从日志解析 TPS/MSPT 指标并展示变化。",
         group: FeatureGroup::Server,
         default_enabled: true,
         default_visible: true,
+        restart_required: false,
         order: 70,
     },
     // ---------- 内网穿透 ----------
     FeatureMeta {
         id: "tunnel.dashboard",
         name: "仪表盘",
+        desc: "内网穿透总览：隧道状态与连接信息。",
         group: FeatureGroup::Tunnel,
         default_enabled: true,
         default_visible: true,
+        restart_required: false,
         order: 10,
     },
     FeatureMeta {
         id: "tunnel.create",
         name: "创建隧道",
+        desc: "新建 frp/rathole 隧道并映射本地端口。",
         group: FeatureGroup::Tunnel,
         default_enabled: true,
         default_visible: true,
+        restart_required: false,
         order: 20,
     },
     FeatureMeta {
         id: "tunnel.manage",
         name: "隧道管理",
+        desc: "启停、编辑与删除已有隧道。",
         group: FeatureGroup::Tunnel,
         default_enabled: true,
         default_visible: true,
+        restart_required: false,
         order: 30,
     },
     FeatureMeta {
         id: "tunnel.logs",
         name: "隧道日志",
+        desc: "查看穿透内核输出的运行日志。",
         group: FeatureGroup::Tunnel,
         default_enabled: true,
         default_visible: true,
+        restart_required: false,
         order: 40,
     },
     FeatureMeta {
         id: "tunnel.tutorial",
         name: "教程",
+        desc: "从零开始的内网穿透图文步骤说明。",
         group: FeatureGroup::Tunnel,
         default_enabled: true,
         default_visible: true,
+        restart_required: false,
         order: 50,
     },
     FeatureMeta {
         id: "tunnel.frpc",
         name: "frpc 管理",
+        desc: "下载、更新或指定 frpc 可执行文件。",
         group: FeatureGroup::Tunnel,
         default_enabled: true,
         default_visible: true,
+        restart_required: false,
         order: 60,
     },
     // ---------- 设置 ----------
     FeatureMeta {
         id: "settings.general",
         name: "通用",
+        desc: "全局通用设置（启动行为、默认值等）。",
         group: FeatureGroup::Settings,
         default_enabled: true,
         default_visible: true,
+        restart_required: false,
         order: 10,
     },
     FeatureMeta {
         id: "settings.logs",
         name: "日志",
+        desc: "日志采集与日志库相关设置。",
         group: FeatureGroup::Settings,
         default_enabled: true,
         default_visible: true,
+        restart_required: false,
         order: 20,
     },
     FeatureMeta {
         id: "settings.ui",
         name: "界面",
+        desc: "主题、字号、动效与布局设置。",
         group: FeatureGroup::Settings,
         default_enabled: true,
         default_visible: true,
+        restart_required: false,
         order: 30,
     },
     FeatureMeta {
         id: "settings.java",
         name: "Java",
+        desc: "全局默认 Java 环境与内存参数。",
         group: FeatureGroup::Settings,
         default_enabled: true,
         default_visible: true,
+        restart_required: false,
         order: 40,
     },
     FeatureMeta {
         id: "settings.notify",
         name: "通知",
+        desc: "系统通知与弹窗提醒的开关。",
         group: FeatureGroup::Settings,
         default_enabled: true,
         default_visible: true,
+        restart_required: false,
         order: 50,
     },
     // ---------- 工具/导航 ----------
     FeatureMeta {
         id: "tool.nav.server",
         name: "服务器导航",
+        desc: "左侧导航栏的服务器入口。",
         group: FeatureGroup::Tool,
         default_enabled: true,
         default_visible: true,
+        restart_required: false,
         order: 10,
     },
     FeatureMeta {
         id: "tool.nav.tunnel",
         name: "内网穿透导航",
+        desc: "左侧导航栏的内网穿透入口。",
         group: FeatureGroup::Tool,
         default_enabled: true,
         default_visible: true,
+        restart_required: false,
         order: 20,
     },
     FeatureMeta {
         id: "tool.nav.settings",
         name: "设置导航",
+        desc: "左侧导航栏的设置入口。",
         group: FeatureGroup::Tool,
         default_enabled: true,
         default_visible: true,
+        restart_required: false,
         order: 30,
     },
     FeatureMeta {
         id: "tool.sys_notify",
         name: "系统右下角通知",
+        desc: "关服、崩溃等事件用 Windows 气泡通知提醒。",
         group: FeatureGroup::Tool,
         default_enabled: true,
         default_visible: true,
+        restart_required: false,
         order: 40,
     },
     // ---------- 测试中的功能（默认禁用，启用需警告确认） ----------
     FeatureMeta {
         id: BETA_BACKUP,
         name: "自动备份",
+        desc: "按策略自动生成世界与配置快照；启用后会定时占用磁盘与磁盘 IO。",
         group: FeatureGroup::Beta,
         default_enabled: false,
         default_visible: true,
+        restart_required: false,
         order: 10,
     },
     FeatureMeta {
         id: BETA_CRASH_ANALYSIS,
         name: "崩溃报告分析",
+        desc: "自动读取 crash-reports，给出根因归类与可疑文件定位。",
         group: FeatureGroup::Beta,
         default_enabled: false,
         default_visible: true,
+        restart_required: false,
         order: 20,
     },
     FeatureMeta {
         id: BETA_TRAFFIC,
         name: "内网穿透流量显示",
+        desc: "在穿透页面显示实时上下行流量与累计用量。",
         group: FeatureGroup::Beta,
         default_enabled: false,
         default_visible: true,
+        restart_required: false,
         order: 30,
     },
     FeatureMeta {
         id: BETA_DOWNLOAD,
         name: "网络下载（服务端下载 + 模组下载）",
+        desc: "内置服务端核心与模组下载（含 Modrinth 搜索与翻译）。",
         group: FeatureGroup::Tool,
         default_enabled: true,
         default_visible: true,
+        restart_required: false,
         order: 60,
     },
     FeatureMeta {
         id: BETA_PLAYERS,
         name: "玩家管理（在线/白名单/封禁/OP）",
+        desc: "在线玩家、白名单、封禁与 OP 四个页签的集中管理。",
         group: FeatureGroup::Tool,
         default_enabled: true,
         default_visible: true,
+        restart_required: false,
         order: 70,
     },
     FeatureMeta {
         id: BETA_PLUGINS,
         name: "插件系统（rhai + 热加载）",
+        desc: "用 rhai 脚本扩展 XMST，支持 zip 热加载与自定义界面效果。",
         group: FeatureGroup::Tool,
         default_enabled: true,
         default_visible: true,
+        restart_required: false,
         order: 80,
     },
     FeatureMeta {
         id: BETA_RATHOLE,
         name: "穿透内核 rathole（纯 Rust 反向代理）",
+        desc: "启用后可创建 rathole 隧道替代 frp（需自备 rathole 服务端）。",
         group: FeatureGroup::Beta,
         default_enabled: false,
         default_visible: true,
+        restart_required: false,
         order: 70,
     },
     FeatureMeta {
         id: BETA_REMOTE_BACKUP,
         name: "备份远端转存（本地/UNC/WebDAV）",
+        desc: "把备份额外转存到远端目录或网络位置，实现异地留存。",
         group: FeatureGroup::Beta,
         default_enabled: false,
         default_visible: true,
+        restart_required: false,
         order: 80,
     },
     FeatureMeta {
         id: BETA_SPECIAL,
         name: "特殊功能",
+        desc: "特殊功能页总开关（当前包含 Spark 性能分析），默认禁用。",
         group: FeatureGroup::Beta,
         default_enabled: false,
         default_visible: true,
+        restart_required: false,
         order: 90,
-    },    FeatureMeta {
+    },
+    FeatureMeta {
         id: BETA_MOD_UPDATE,
         name: "模组检查更新",
+        desc: "读取 mods 内模组版本并与 Modrinth 比对，只报告可更新版本，不自动替换。",
         group: FeatureGroup::Beta,
         default_enabled: false,
         default_visible: true,
+        restart_required: false,
         order: 91,
     },
     FeatureMeta {
         id: FEATURE_SPARK,
         name: "Spark 分析",
+        desc: "解析 Spark 报告，定位卡顿的模组、维度与实体。",
         group: FeatureGroup::Server,
         default_enabled: true,
         default_visible: true,
+        restart_required: false,
         order: 91,
     },
 ];
@@ -418,6 +516,35 @@ pub const REGISTRY: &[FeatureMeta] = &[
 /// 按 ID 查询元数据
 pub fn meta(id: &str) -> Option<&'static FeatureMeta> {
     REGISTRY.iter().find(|m| m.id == id)
+}
+
+/// 取某分组内的注册项，按 `order` 升序（order 相同时按 id 兜底，保证顺序稳定）
+pub fn items_in_group(group: FeatureGroup) -> Vec<&'static FeatureMeta> {
+    let mut v: Vec<&'static FeatureMeta> = REGISTRY.iter().filter(|m| m.group == group).collect();
+    v.sort_by(|a, b| a.order.cmp(&b.order).then_with(|| a.id.cmp(b.id)));
+    v
+}
+
+/// 全部注册项：先按分组顺序、再按 `order` 升序排列（设置页只想看一遍登记情况时用）
+pub fn all_items_ordered() -> Vec<&'static FeatureMeta> {
+    let mut v: Vec<&'static FeatureMeta> = REGISTRY.iter().collect();
+    v.sort_by(|a, b| {
+        a.group
+            .index()
+            .cmp(&b.group.index())
+            .then_with(|| a.order.cmp(&b.order))
+            .then_with(|| a.id.cmp(b.id))
+    });
+    v
+}
+
+/// 开关生效时机提示文案（注册表驱动，避免界面里再写死一份清单）
+pub fn apply_note(m: &FeatureMeta) -> &'static str {
+    if m.restart_required {
+        "下次启动生效"
+    } else {
+        "立即生效"
+    }
 }
 
 /// 是否启用（无覆盖时按默认值）
@@ -434,4 +561,34 @@ pub fn is_visible(features: &HashMap<String, FeatureState>, id: &str) -> bool {
         .get(id)
         .map(|s| s.visible)
         .unwrap_or_else(|| meta(id).map(|m| m.default_visible).unwrap_or(true))
+}
+
+#[cfg(test)]
+mod registry_selfcheck {
+    use super::*;
+
+    /// 注册表完整性：ID 唯一、非空、有说明文案；Beta 组必须全部能在开关列表里出现。
+    #[test]
+    fn registry_ids_unique_and_described() {
+        let mut seen: Vec<&str> = Vec::new();
+        for m in REGISTRY {
+            assert!(!m.id.trim().is_empty(), "注册项 ID 不能为空");
+            assert!(!m.name.trim().is_empty(), "{} 缺少显示名", m.id);
+            assert!(!m.desc.trim().is_empty(), "{} 缺少一句话说明", m.id);
+            assert!(!seen.contains(&m.id), "注册项 ID 重复：{}", m.id);
+            seen.push(m.id);
+        }
+        // 测试功能列表由 Beta 组生成：确认三个"曾经找不到入口"的项都在其中
+        let beta: Vec<&str> = items_in_group(FeatureGroup::Beta).iter().map(|m| m.id).collect();
+        for id in [BETA_MOD_UPDATE, BETA_RATHOLE, BETA_REMOTE_BACKUP] {
+            assert!(beta.contains(&id), "Beta 组缺少 {id}");
+        }
+        // 分组排序稳定：同组内 order 单调不减
+        let all = all_items_ordered();
+        for w in all.windows(2) {
+            if w[0].group == w[1].group {
+                assert!(w[0].order <= w[1].order, "同组 order 未升序：{}", w[1].id);
+            }
+        }
+    }
 }
