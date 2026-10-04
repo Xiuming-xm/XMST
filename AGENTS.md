@@ -191,3 +191,61 @@ egui 的 `ui_*` 每帧执行。曾出现（已修/部分修）：
 - [ ] 无 Zone.Identifier（MOTW）；若对外分发建议用普通 zip（并提示用 7-Zip 解压）
 - [ ] 已 git 提交
 - [ ] 插件/配置目录正确：`dist/data/plugins`、`dist/data/`
+
+---
+
+## 8. 省 token 工作法（协作约定）
+
+> 目标：同样工作量花更少输入 token。历史上曾出现"单会话从早拖到深夜"，越到后面每轮越贵（长历史被反复重读）。
+
+### 8.1 会话
+- **一个任务一个会话**：做完一件事开新会话；状态靠 `AGENTS.md`（约定/经验）+ git（改动）+ `CHANGELOG.md`（成果）传递，不要靠长对话记忆。
+- **先计划后执行**：先给 3-5 步计划，确认后再动手，避免"试探—纠正—再试探"。
+- **结论落文件**：新坑与新约定随手写进本文件；下个会话读文件远比重读历史便宜。
+
+### 8.2 输入
+- **截图贵**（约 1-2k tokens/张，且每轮重读）：只贴关键几行；UI 问题用"页面 + 位置 + 期望"描述。
+- **大日志/大文件不要整份发**：先说明需要哪几行（给 `Select-String` 的结果）。
+- **命令输出必须截断**：`Select-Object -First/-Tail N`、`cargo --message-format short`。
+
+### 8.3 执行
+- **不要给同一个文件并行开多个代理**（会互相覆盖）✗：串行，或一人一个文件范围；写入前重新读取并复核交集。
+- **攒批再构建**：`cargo build --release` 约 4 分钟，小改动先攒着一起构建。
+- **先拿证据再改**：优先取原始输出（stderr、日志、诊断），不要先猜后验。
+- **子代理的长报告写文件**（`temp\*_report.md`），只把结论与关键行带回主线。
+
+### 8.4 换成自有 API 后
+- **命中 prompt cache**：稳定内容放会话前部（本文件、项目约定），不要频繁改动前缀。
+- **分层用模型**：检索/样板用便宜或本地模型，判断与审查交给贵的模型。
+- **流程脚本化**：`tools/release.ps1`（发版）、`XMST_OPEN_PAGE`（无头回归）这类"一条命令完成"的入口越多越省。
+
+---
+
+## 9. 2026-10-04 事故与教训补记
+
+### 9.1 低完整性（Low IL）第二次：`D:\Desktop`
+`D:\Desktop` 整棵树带 Low 标签 → 其中 `java.exe` 以 Low IL 运行 → **连 `logs\latest.log` 都写不出来**，表现为"工具启动服务器连日志都没有、退出码 1、stderr 为空"，而同一条 `run.bat` 在 PowerShell 里能正常启动。修复：
+
+```powershell
+icacls "D:\Desktop" /setintegritylevel M /T /C /Q
+```
+
+判定：`icacls <目录> | Select-String 'Mandatory Label'`。**凡"同一操作在别的 shell 能成、在程序里不成"，先查目录/文件的完整性标签**（见 §4.1、§4.2）。
+
+### 9.2 栈溢出不走 panic 钩子
+`log_rows_cached` 一度自我递归 → 主线程栈溢出 → 进程直接消失（`0xC00000FD`、`thread 'main' has overflowed its stack`），而 `data\crash.log` **没有任何记录** ✗。排查"闪退且无日志"时：用 `tools/run_with_capture.ps1` 重定向捕获 stderr，或用 `XMST_OPEN_PAGE=<页面> [帧数]` 无头复现。
+
+### 9.3 部署要核对三处 SHA 并防占用
+程序仍运行时 `Copy-Item` 覆盖 `dist\*.exe` 会**失败**（曾出现 `dist` 旧、`versions` 新）。流程：结束进程 → 带重试复制 → 核对 `target\release\xmst.exe`、`dist\...exe`、`versions\<版本>\...exe` **三处 SHA256 一致**。
+
+### 9.4 `cargo test` 用系统默认 TEMP
+把 `TMP/TEMP` 指到 `F:\XMST\temp\ctmp`（构建需要）会让 `encoding_selfcheck` 的若干测试因 rename 失败而红。**构建**用工作区临时目录，**测试**用系统默认 TEMP。
+
+### 9.5 文本编码
+`safe_from`/`safe_to` 是 UTF-8 边界安全切片工具，所有按字节截断处都必须使用。工具生成的 `run.bat` 必须写 **GBK/CP936 + CRLF + 无 BOM**；保存任何已存在的文本文件都要**按原编码写回 + 先备份**（曾有用户的 `run.bat` 被按 UTF-8 重写后中文乱码、cmd 解析失败、服务器完全起不来）。
+
+### 9.6 已知问题：工具用 `cmd /c run.bat` 启动会失败
+同一台机器上 `cmd /c run.bat` 在 PowerShell 里能启动服务器，但由本工具（无控制台 GUI + 管道句柄）拉起时 `cmd` 约 0.7s 退出、java 从未启动。已提供：每个服务器的**启动方式**（`auto` 默认，bat 失败自动改直连 java / `java` / `bat`）、`data\launch.log` 启动诊断与「🧪 启动诊断」按钮。根因（Job/句柄层差异）未完全定位，回退方案可用。
+
+### 9.7 日志页 = 工具日志
+左侧「日志」应展示**工具自身运行事件**（启动/停止、备份快照、崩溃熔断、配置保存、下载、隧道、插件、更新检查…）；服务器控制台日志属于「服务器 → 日志」，穿透日志属于隧道页。三者不要混排。
