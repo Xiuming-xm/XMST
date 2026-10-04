@@ -1622,14 +1622,18 @@ struct ServerRuntime {
     file_search: String,
     /// 收藏的文件名（置顶显示）
     file_favs: Vec<String>,
-    /// 客户端模组排查结果（文件名列表；None=未排查）。仅临时 UI 状态，切走页面/切换服务器即清除，不持久化
-    file_client_mods: Option<Vec<String>>,
-    /// mods 目录当前判定为「仅客户端」的 jar：(文件名, 判定依据)。
+    /// mods 目录里**元数据明确声明仅客户端**的 jar：(文件名, 元数据判定)。
     /// 由文件列表刷新（refresh_file_list）与主动排查写入，渲染只读；
     /// 判定走 mods 目录指纹缓存，不会在每帧渲染里开 jar。
     file_mod_clients: Vec<(String, ModSide)>,
-    /// 排查客户端模组按钮的二次确认弹窗是否显示
-    file_client_mods_confirm: bool,
+    /// mods 目录里的**启发式疑似客户端**候选：(文件名, 线索)。
+    /// 弱化判定，仅供参考：默认不在列表里标记/置顶，只在「排查客户端模组」窗口里列出。
+    file_mod_suspected: Vec<(String, Vec<ModHint>)>,
+    /// 「排查客户端模组」窗口是否显示；窗口内是否已完成一次扫描（先说明，点「开始排查」才重扫）
+    file_client_mods_window: bool,
+    file_client_mods_scanned: bool,
+    /// 是否在 mods 列表里高亮启发式候选（窗口内开关，默认关；不持久化）
+    file_client_mods_highlight: bool,
     /// 右侧预览目标: (文件名, 大小, 是否目录, 目录内文件数)，None=未选中
     file_preview: Option<(String, u64, bool, usize)>,
     /// 文件重命名弹窗: Some(旧文件名)
@@ -1874,9 +1878,11 @@ impl Default for ServerRuntime {
             file_content_meta: None,
             file_search: String::new(),
             file_favs: Vec::new(),
-            file_client_mods: None,
             file_mod_clients: Vec::new(),
-            file_client_mods_confirm: false,
+            file_mod_suspected: Vec::new(),
+            file_client_mods_window: false,
+            file_client_mods_scanned: false,
+            file_client_mods_highlight: false,
             file_preview: None,
             file_rename: None,
             file_rename_draft: String::new(),
@@ -2569,10 +2575,11 @@ fn scan_external_instances(
 
 // ==================== 启动前预检 ====================
 
-/// 预检单项严重级别
+/// 预检单项严重级别（Info 只作参考信息，不计入警告/失败）
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CheckLevel {
     Pass,
+    Info,
     Warn,
     Fail,
 }
@@ -2581,6 +2588,7 @@ impl CheckLevel {
     fn icon(self) -> &'static str {
         match self {
             CheckLevel::Pass => "✅",
+            CheckLevel::Info => "ℹ️",
             CheckLevel::Warn => "⚠️",
             CheckLevel::Fail => "❌",
         }
@@ -2588,6 +2596,7 @@ impl CheckLevel {
     fn label(self) -> &'static str {
         match self {
             CheckLevel::Pass => "通过",
+            CheckLevel::Info => "提示",
             CheckLevel::Warn => "警告",
             CheckLevel::Fail => "失败",
         }
@@ -2618,6 +2627,15 @@ impl PrecheckItem {
             title: title.to_string(),
             detail,
             advice,
+        }
+    }
+    /// 参考信息：只提示，不计入警告/失败计数
+    fn info(title: &str, detail: String) -> Self {
+        Self {
+            level: CheckLevel::Info,
+            title: title.to_string(),
+            detail,
+            advice: String::new(),
         }
     }
     fn fail(title: &str, detail: String, advice: String) -> Self {
@@ -3894,7 +3912,12 @@ impl App {
                 let fails = items.iter().filter(|i| i.level == CheckLevel::Fail).count();
                 let warns = items.iter().filter(|i| i.level == CheckLevel::Warn).count();
                 let passes = items.iter().filter(|i| i.level == CheckLevel::Pass).count();
-                ui.label(format!("通过 {passes} 项 ｜ 警告 {warns} 项 ｜ 失败 {fails} 项"));
+                let infos = items.iter().filter(|i| i.level == CheckLevel::Info).count();
+                if infos > 0 {
+                    ui.label(format!("通过 {passes} 项 ｜ 警告 {warns} 项 ｜ 失败 {fails} 项 ｜ 参考 {infos} 项"));
+                } else {
+                    ui.label(format!("通过 {passes} 项 ｜ 警告 {warns} 项 ｜ 失败 {fails} 项"));
+                }
                 ui.separator();
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -3903,6 +3926,7 @@ impl App {
                         for it in &items {
                             let col = match it.level {
                                 CheckLevel::Pass => self.fg(Color32::from_rgb(80, 200, 120)),
+                                CheckLevel::Info => self.fg(Color32::from_rgb(140, 180, 220)),
                                 CheckLevel::Warn => self.fg(Color32::from_rgb(240, 176, 96)),
                                 CheckLevel::Fail => self.fg(Color32::from_rgb(220, 90, 90)),
                             };
@@ -7083,8 +7107,10 @@ impl App {
     /// 清除所有服务器文件浏览的客户端模组排查标记（切走页面/切换服务器时调用，状态不持久化）
     fn clear_client_mod_marks(&mut self) {
         for rt in &mut self.runtimes {
-            rt.file_client_mods = None;
-            rt.file_client_mods_confirm = false;
+            rt.file_mod_suspected.clear();
+            rt.file_client_mods_window = false;
+            rt.file_client_mods_scanned = false;
+            rt.file_client_mods_highlight = false;
         }
     }
 
@@ -7103,20 +7129,24 @@ impl App {
     /// 静态解析当前文件浏览目录下所有 .jar 模组元数据，识别客户端模组。
     /// 判定顺序（与 mods 页显示一致）：先读 jar 内元数据的运行侧
     /// （fabric/quilt 的 environment、forge/neoforge 的 displayTest），
-    /// 元数据没结论时用启发式兜底（客户端 mixin 段、客户端主类 class_310、文件名关键词）。
-    /// 用户主动排查 → 忽略缓存重扫；结果只保留"仅客户端/疑似仅客户端"的文件名。
+    /// 这是「仅客户端」的唯一依据；mixin 配置/文件名只产出弱化的「疑似」候选（仅供参考）。
+    /// 用户主动排查 → 忽略缓存重扫；结果分别写入元数据判定与启发式候选两个列表。
     fn analyze_client_mods(&mut self, idx: usize) {
         if idx >= self.runtimes.len() {
             return;
         }
         let target = self.file_tab_target(idx);
-        let clients: Vec<(String, ModSide)> = scan_mod_sides_forced(&target)
-            .into_iter()
-            .filter(|(_, s)| s.is_client())
-            .collect();
-        let names: Vec<String> = clients.iter().map(|(n, _)| n.clone()).collect();
+        let mut clients: Vec<(String, ModSide)> = Vec::new();
+        let mut suspected: Vec<(String, Vec<ModHint>)> = Vec::new();
+        for (name, info) in scan_mod_sides_forced(&target) {
+            if info.side.is_metadata_client() {
+                clients.push((name, info.side));
+            } else if !info.hints.is_empty() {
+                suspected.push((name, info.hints));
+            }
+        }
         self.runtimes[idx].file_mod_clients = clients;
-        self.runtimes[idx].file_client_mods = Some(names);
+        self.runtimes[idx].file_mod_suspected = suspected;
     }
 
     /// 页签根目录（datapack 位于 world/datapacks�?
@@ -7198,14 +7228,21 @@ impl App {
             }
         });
         self.runtimes[idx].file_list = list;
-        // mods 页签：顺带刷新「仅客户端模组」判定（元数据 environment 为准 + 启发式兜底）。
+        // mods 页签：顺带刷新两侧判定 —— 元数据明确的「仅客户端」与启发式「疑似」候选。
         // 只在文件列表刷新（刷新按钮 / 切页签 / 启停模组 / 重命名 / 删除）时执行，
         // 内部按目录指纹缓存，渲染路径不会开 jar。
         if self.runtimes[idx].file_tab == "mods" {
-            self.runtimes[idx].file_mod_clients = scan_mod_sides(&target)
-                .into_iter()
-                .filter(|(_, s)| s.is_client())
-                .collect();
+            let mut clients: Vec<(String, ModSide)> = Vec::new();
+            let mut suspected: Vec<(String, Vec<ModHint>)> = Vec::new();
+            for (name, info) in scan_mod_sides(&target) {
+                if info.side.is_metadata_client() {
+                    clients.push((name, info.side));
+                } else if !info.hints.is_empty() {
+                    suspected.push((name, info.hints));
+                }
+            }
+            self.runtimes[idx].file_mod_clients = clients;
+            self.runtimes[idx].file_mod_suspected = suspected;
         }
     }
 
@@ -12974,8 +13011,10 @@ impl App {
         self.runtimes[idx].file_sub.clear();
         self.runtimes[idx].file_search = jar_name.clone();
         self.runtimes[idx].file_scroll_to = Some(jar_name.clone());
-        self.runtimes[idx].file_client_mods = None;
-        self.runtimes[idx].file_client_mods_confirm = false;
+        self.runtimes[idx].file_mod_suspected.clear();
+        self.runtimes[idx].file_client_mods_window = false;
+        self.runtimes[idx].file_client_mods_scanned = false;
+        self.runtimes[idx].file_client_mods_highlight = false;
         self.refresh_file_list(idx);
         self.server_tab = ServerTab::Files;
         self.set_toast(format!("已定位模组：{jar_name}"));
@@ -14798,8 +14837,10 @@ impl App {
                 if ui.selectable_label(selected, t).clicked() {
                     self.runtimes[idx].file_tab = t.to_string();
                     // 切换页签即恢复：客户端模组排查标记不跨页签保留（状态不持久化）
-                    self.runtimes[idx].file_client_mods = None;
-                    self.runtimes[idx].file_client_mods_confirm = false;
+                    self.runtimes[idx].file_mod_suspected.clear();
+                    self.runtimes[idx].file_client_mods_window = false;
+                    self.runtimes[idx].file_client_mods_scanned = false;
+                    self.runtimes[idx].file_client_mods_highlight = false;
                     self.refresh_file_list(idx);
                 }
             }
@@ -14846,10 +14887,11 @@ impl App {
                 }
                 if ui
                     .button("🔍 排查客户端模组")
-                    .on_hover_text("重新扫描 mods 下所有 .jar：先读元数据的运行侧（fabric/quilt environment、forge/neoforge displayTest），再用客户端 mixin/文件名关键词兜底，标出「仅客户端」模组")
+                    .on_hover_text("重新扫描 mods 下所有 .jar：只按元数据（fabric/quilt 的 environment、forge/neoforge 的 displayTest）判断「仅客户端」；mixin 配置与文件名只作为「疑似」候选列出，仅供参考")
                     .clicked()
                 {
-                    self.runtimes[idx].file_client_mods_confirm = true;
+                    self.runtimes[idx].file_client_mods_window = true;
+                    self.runtimes[idx].file_client_mods_scanned = false;
                 }
                 // 模组检查更新（测试功能，默认关闭）：SHA1 指纹优先 + modid/搜索兜底，只报告不替换
                 if features::is_enabled(&self.cfg.features, features::BETA_MOD_UPDATE) {
@@ -15012,20 +15054,24 @@ impl App {
                                     ui.label(RichText::new(t).weak());
                                 }
                             }
-                            // 收藏的文件置顶；其后客户端模组置顶（优先级低于收藏）；再按名称列头方向排序
+                            // 收藏的文件置顶；其后仅客户端模组置顶（优先级低于收藏）；
+                            // 启发式候选默认不参与（只有窗口里打开「在列表中高亮这些」才置顶，默认关）。
                             let favs = self.runtimes[idx].file_favs.clone();
-                            // 「仅客户端」集合 = 元数据/启发式判定结果 ∪ 手动排查结果（两者都会标橙置顶）
+                            // 「仅客户端」集合 = 元数据明确声明仅客户端的 jar（唯一依据）
                             let meta_clients: Vec<(String, ModSide)> =
                                 self.runtimes[idx].file_mod_clients.clone();
                             let mut client_mods: Vec<String> =
                                 meta_clients.iter().map(|(n, _)| n.clone()).collect();
-                            for n in self.runtimes[idx]
-                                .file_client_mods
-                                .clone()
-                                .unwrap_or_default()
-                            {
-                                if !client_mods.contains(&n) {
-                                    client_mods.push(n);
+                            // 启发式候选：默认不标不置顶；用户在排查窗口打开开关才临时参与
+                            let suspected: Vec<(String, Vec<ModHint>)> =
+                                if self.runtimes[idx].file_client_mods_highlight {
+                                    self.runtimes[idx].file_mod_suspected.clone()
+                                } else {
+                                    Vec::new()
+                                };
+                            for (n, _) in &suspected {
+                                if !client_mods.contains(n) {
+                                    client_mods.push(n.clone());
                                 }
                             }
                             shown.sort_by(|a, b| {
@@ -15091,19 +15137,32 @@ impl App {
                                         } else {
                                             name.clone()
                                         };
-                                        // 仅客户端模组：橙色 + 标签「仅客户端」（判定依据见 hover）
+                                        // 元数据明确仅客户端 → 橙色 + 标签「仅客户端」；
+                                        // 启发式候选只有在窗口里打开高亮开关时才用弱化色标「疑似客户端」
                                         let mod_side = meta_clients
                                             .iter()
                                             .find(|(n, _)| n == name)
                                             .map(|(_, s)| *s);
-                                        let is_client = !*is_dir && client_mods.contains(name);
-                                        let display = if !*is_dir && is_client {
+                                        let is_client = !*is_dir && meta_clients.iter().any(|(n, _)| n == name);
+                                        let sus_hints = if *is_dir {
+                                            None
+                                        } else {
+                                            suspected
+                                                .iter()
+                                                .find(|(n, _)| n == name)
+                                                .map(|(_, h)| h.clone())
+                                        };
+                                        let display = if is_client {
                                             format!("{display}  [仅客户端]")
+                                        } else if sus_hints.is_some() {
+                                            format!("{display}  [疑似客户端]")
                                         } else {
                                             display
                                         };
                                         let display_text = if is_client {
                                             RichText::new(display).color(self.fg(Color32::from_rgb(255, 170, 60)))
+                                        } else if sus_hints.is_some() {
+                                            RichText::new(display).color(self.fg(Color32::from_rgb(190, 160, 90)))
                                         } else {
                                             RichText::new(display)
                                         };
@@ -15157,13 +15216,21 @@ impl App {
                                                 .as_ref()
                                                 .map(|(n, _, _, _)| n == name)
                                                 .unwrap_or(false);
-                                            let hover = match mod_side {
-                                                Some(s) => format!(
-                                                    "仅客户端模组：装在服务端通常会在加载阶段崩溃或不生效，建议禁用。{}。\n单击预览，双击用系统默认程序打开，右键更多操作",
+                                            // hover 文案分三级：元数据判定（可靠）＞ 启发式线索（仅供参考）＞ 普通
+                                            let hover = if let (true, Some(s)) = (is_client, mod_side) {
+                                                format!(
+                                                    "仅客户端模组：{}，装在服务端通常会在加载阶段崩溃或不生效，建议禁用。\n单击预览，双击用系统默认程序打开，右键更多操作",
                                                     s.basis()
-                                                ),
-                                                None if is_client => "疑似客户端模组（手动排查结果，仅供参考，已标橙置顶）。\n单击预览，双击用系统默认程序打开，右键更多操作".to_string(),
-                                                None => "单击预览，双击用系统默认程序打开，右键更多操作".to_string(),
+                                                )
+                                            } else if let Some(hints) = &sus_hints {
+                                                let basis: Vec<&str> =
+                                                    hints.iter().map(|h| h.label()).collect();
+                                                format!(
+                                                    "疑似客户端（启发式，仅供参考，不代表只能用于客户端）：{}。\nCarpet/Lithium 等双端模组出现属正常。\n单击预览，双击用系统默认程序打开，右键更多操作",
+                                                    basis.join("；")
+                                                )
+                                            } else {
+                                                "单击预览，双击用系统默认程序打开，右键更多操作".to_string()
                                             };
                                             let resp = ui
                                                 .selectable_label(sel, display_text)
@@ -15557,54 +15624,124 @@ impl App {
             }
         }
 
-        // 排查客户端模组二次确认（以元数据为准，启发式兜底；结果仅供参考；复用 egui Window 确认机制）
-        if self.runtimes[idx].file_client_mods_confirm {
+        // 「排查客户端模组」窗口：先说明，点「开始排查」后列出结果。
+        // 元数据判定（可靠、「仅客户端」的唯一依据）与启发式候选（仅供参考）分开呈现；
+        // 候选默认不在 mods 列表里标色/置顶，只有窗口里的开关（默认关）才临时高亮。
+        if self.runtimes[idx].file_client_mods_window {
             let mut close = false;
             let mut do_scan = false;
-            egui::Window::new("排查客户端模组")
+            let scanned = self.runtimes[idx].file_client_mods_scanned;
+            let mut highlight = self.runtimes[idx].file_client_mods_highlight;
+            let meta_clients = self.runtimes[idx].file_mod_clients.clone();
+            let suspected = self.runtimes[idx].file_mod_suspected.clone();
+            egui::Window::new("🔍 排查客户端模组")
                 .resizable(true)
                 .collapsible(false)
-                .resizable(false)
+                .default_width(640.0)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ui.ctx(), |ui| {
-                    ui.label("将忽略缓存重新扫描当前 mods 目录下的所有 .jar 模组：");
-                    ui.label("（fabric/quilt 的 environment、forge/neoforge 的 displayTest），");
-                    ui.label("元数据没有结论时再用客户端 mixin 段 / 客户端主类 / 文件名关键词兜底，");
-                    ui.label("标出「仅客户端」的模组并标橙置顶显示。");
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new("⚠ 判定以模组元数据为准，兜底部分属启发式，结果不一定正确，请结合经验自行判断。")
+                    if !scanned {
+                        ui.label("将忽略缓存重新扫描当前 mods 目录下的所有 .jar 模组。");
+                        ui.label("「仅客户端」只按模组元数据判定（fabric/quilt 的 environment、forge/neoforge 的 displayTest）。");
+                        ui.label("mixin 配置里的 client 段、客户端类名引用、文件名关键词只作为启发式候选列出，仅供参考。");
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("取消").clicked() {
+                                close = true;
+                            }
+                            if ui
+                                .button(RichText::new("开始排查").color(self.fg(Color32::from_rgb(120, 230, 160))))
+                                .clicked()
+                            {
+                                do_scan = true;
+                            }
+                        });
+                    } else {
+                        ui.label(
+                            RichText::new("以下为启发式推测，仅作参考，不代表只能用于客户端；Carpet/Lithium 等双端模组出现属正常。")
+                                .color(self.fg(Color32::from_rgb(200, 170, 100))),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "元数据明确声明仅客户端：{} 个",
+                                meta_clients.len()
+                            ))
+                            .strong()
                             .color(self.fg(Color32::from_rgb(255, 170, 60))),
-                    );
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("取消").clicked() {
-                            close = true;
+                        );
+                        if meta_clients.is_empty() {
+                            ui.label(RichText::new("（无）").small().weak());
+                        } else {
+                            for (n, s) in meta_clients.iter().take(20) {
+                                ui.label(
+                                    RichText::new(format!("· {n}　—— {}", s.basis()))
+                                        .small()
+                                        .color(self.fg(Color32::from_rgb(255, 170, 60))),
+                                );
+                            }
                         }
-                        if ui
-                            .button(RichText::new("开始排查").color(self.fg(Color32::from_rgb(120, 230, 160))))
-                            .clicked()
-                        {
-                            do_scan = true;
-                            close = true;
+                        ui.add_space(4.0);
+                        ui.separator();
+                        ui.label(
+                            RichText::new(format!(
+                                "启发式疑似候选（仅供参考）：{} 个",
+                                suspected.len()
+                            ))
+                            .strong()
+                            .color(self.fg(Color32::from_rgb(190, 160, 90))),
+                        );
+                        if suspected.is_empty() {
+                            ui.label(RichText::new("（无）").small().weak());
+                        } else {
+                            egui::ScrollArea::vertical()
+                                .max_height(240.0)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    for (n, hints) in &suspected {
+                                        let basis: Vec<&str> =
+                                            hints.iter().map(|h| h.label()).collect();
+                                        ui.label(RichText::new(format!("· {n}")).small());
+                                        ui.label(
+                                            RichText::new(format!("　　依据：{}", basis.join("；")))
+                                                .small()
+                                                .weak(),
+                                        );
+                                    }
+                                });
                         }
-                    });
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new("注：mixin 配置含 client 段在 mods 里是常态，双端/服务端模组也会命中，因此这些候选不计入任何警告。")
+                                .small()
+                                .weak(),
+                        );
+                        ui.add_space(4.0);
+                        ui.checkbox(&mut highlight, "在列表中高亮这些（默认关）");
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("重新扫描").clicked() {
+                                do_scan = true;
+                            }
+                            if ui.button("关闭").clicked() {
+                                close = true;
+                            }
+                        });
+                    }
                 });
+            self.runtimes[idx].file_client_mods_highlight = highlight;
             if close {
-                self.runtimes[idx].file_client_mods_confirm = false;
+                self.runtimes[idx].file_client_mods_window = false;
+                self.runtimes[idx].file_client_mods_scanned = false;
             }
             if do_scan {
                 self.analyze_client_mods(idx);
-                let n = self.runtimes[idx]
-                    .file_client_mods
-                    .as_ref()
-                    .map(|v| v.len())
-                    .unwrap_or(0);
-                self.set_toast(if n > 0 {
-                    format!("排查完成：发现 {n} 个「仅客户端」模组（已标橙置顶）")
-                } else {
-                    "排查完成：未发现仅客户端模组".to_string()
-                });
+                self.runtimes[idx].file_client_mods_scanned = true;
+                let n = self.runtimes[idx].file_mod_clients.len();
+                let s = self.runtimes[idx].file_mod_suspected.len();
+                self.set_toast(format!(
+                    "排查完成：元数据判定仅客户端 {n} 个；启发式疑似候选 {s} 个（仅供参考）"
+                ));
             }
         }
 
@@ -25368,40 +25505,72 @@ fn newest_files(dir: &Path, exts: &[&str], n: usize) -> Vec<PathBuf> {
 //
 // 背景：把仅客户端的模组（GUI/HUD/按键类）放进服务端 mods 目录，服务端会在加载阶段
 // 因为客户端主类（class_310 = MinecraftClient）不存在而直接退出，且往往来不及生成崩溃报告。
+// ★ 判定分级：「仅客户端」只由元数据决定（fabric/quilt environment、forge/neoforge displayTest、
+//   旧式 side）；mixin 配置里的 client 段、客户端类名引用、文件名关键词都只是弱化的
+//   「疑似客户端（启发式，仅供参考）」——绝大多数模组 jar 都带 client mixin 段，
+//   Carpet/Lithium 这类双端/服务端为主的模组也会命中，所以它们绝不算「仅客户端」。
 // 这里只在「文件列表刷新 / 用户主动排查 / 启动前检查」时读 jar，
 // 结果按「目录 + 指纹」缓存，界面渲染路径只读缓存（绝不在每帧渲染里开 jar）。
 
-/// 模组声明的运行侧（判定结果）
+/// 模组元数据声明的运行侧（★ 「仅客户端」结论只由元数据决定，启发式不参与）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModSide {
-    /// 元数据明确声明仅客户端（fabric/quilt environment=client、forge displayTest=IGNORE_SERVER_VERSION）
+    /// 元数据明确声明仅客户端（fabric/quilt environment=client、
+    /// forge/neoforge displayTest=IGNORE_SERVER_VERSION、旧式 side=CLIENT）
     Client,
-    /// 元数据没给出结论，但启发式认为疑似仅客户端（客户端 mixin 段 / 引用客户端主类 / 文件名关键词）
-    SuspectedClient,
-    /// 明确双端
+    /// 元数据明确双端
     Both,
-    /// 明确仅服务端
+    /// 元数据明确仅服务端
     Server,
-    /// 读不到任何可判断的信息
+    /// 元数据缺失或取值不可识别
     Unknown,
 }
 
 impl ModSide {
-    /// 是否需要标成「仅客户端」（元数据判定 + 启发式兜底）
-    fn is_client(self) -> bool {
-        matches!(self, ModSide::Client | ModSide::SuspectedClient)
+    /// 元数据是否明确声明「仅客户端」——mods 列表标橙置顶、启动前检查给警告只用这一条
+    fn is_metadata_client(self) -> bool {
+        matches!(self, ModSide::Client)
     }
 
-    /// 判定依据（hover 说明用，让用户知道这个结论有多可靠）
+    /// 元数据判定依据（hover 说明用）
     fn basis(self) -> &'static str {
         match self {
-            ModSide::Client => "判定依据：模组元数据声明仅客户端",
-            ModSide::SuspectedClient => {
-                "判定依据：疑似（客户端 mixin 段 / 引用客户端主类 class_310 / 文件名关键词）"
+            ModSide::Client => {
+                "元数据声明仅客户端（environment=client / displayTest=IGNORE_SERVER_VERSION / side=CLIENT）"
             }
-            _ => "",
+            ModSide::Both => "元数据声明为双端",
+            ModSide::Server => "元数据声明为仅服务端",
+            ModSide::Unknown => "元数据未声明运行侧",
         }
     }
+}
+
+/// 启发式线索（★ 弱化判定：只表示「疑似客户端，仅供参考」，绝不构成「仅客户端」结论）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModHint {
+    /// mixin 配置里有 client 段（绝大多数模组都有，属常态，几乎不能作为证据）
+    MixinClientSection,
+    /// mixin 配置里引用客户端主类（class_310 / net.minecraft.client）
+    ClientClassRef,
+    /// 文件名命中客户端关键词
+    FileNameKeyword,
+}
+
+impl ModHint {
+    fn label(self) -> &'static str {
+        match self {
+            ModHint::MixinClientSection => "mixin 配置含 client 段",
+            ModHint::ClientClassRef => "引用客户端主类 class_310 / net.minecraft.client",
+            ModHint::FileNameKeyword => "文件名命中客户端关键词",
+        }
+    }
+}
+
+/// 单个 jar 的识别结果：元数据判定（唯一依据）+ 启发式线索（弱化，仅供参考）
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModSideInfo {
+    side: ModSide,
+    hints: Vec<ModHint>,
 }
 
 /// 从 fabric.mod.json / quilt.mod.json 的 JSON 文本解析运行侧（纯函数，便于自检）。
@@ -25477,7 +25646,8 @@ fn parse_mod_env_toml(text: &str) -> ModSide {
     }
 }
 
-/// 文件名关键词兜底（元数据读不出来时用）：常见仅客户端的 GUI/HUD/性能/按键类模组。
+/// 文件名关键词表（★ 仅供参考的启发式线索，不能作为「仅客户端」结论）：
+/// 常见客户端侧的 GUI/HUD/性能/按键类模组名。
 const CLIENT_MOD_NAME_HINTS: [&str; 16] = [
     "carpetgui",
     "optifine",
@@ -25497,77 +25667,74 @@ const CLIENT_MOD_NAME_HINTS: [&str; 16] = [
     "wthit",
 ];
 
-/// 文件名是否命中"疑似仅客户端"关键词
+/// 文件名是否命中客户端关键词（只产出「疑似」线索，不决定判定）
 fn mod_name_hints_client(file_name: &str) -> bool {
     let low = file_name.to_lowercase();
     CLIENT_MOD_NAME_HINTS.iter().any(|k| low.contains(k))
 }
 
-/// jar 内的 mixin 配置是否像客户端模组：
-/// - `*.mixins.json` 里有非空的 `client` 段（客户端专用 mixin 列表）；
-/// - 或配置文本里出现客户端主类（class_310 / net.minecraft.client）。
-fn jar_mixin_looks_client(z: &mut zip::ZipArchive<std::fs::File>) -> bool {
-    let names: Vec<String> = z
-        .file_names()
-        .filter(|n| n.to_lowercase().ends_with(".mixins.json"))
-        .map(|n| n.to_string())
-        .collect();
-    for n in names {
-        let Ok(mut f) = z.by_name(&n) else { continue };
-        let mut s = String::new();
-        if std::io::Read::read_to_string(&mut f, &mut s).is_err() {
-            continue;
+/// jar 的 mixin 配置是否有客户端线索，以及具体是哪些（纯函数，便于自检；不落盘、不开 jar）。
+/// 注意：`client` 段在 mods jar 里是常态（很多双端/服务端模组都有），只能算「疑似」参考信息。
+fn mixin_client_hints(text: &str) -> Vec<ModHint> {
+    let mut out: Vec<ModHint> = Vec::new();
+    let low = text.to_lowercase();
+    if low.contains("class_310")
+        || low.contains("net.minecraft.client")
+        || low.contains("net/minecraft/client")
+    {
+        out.push(ModHint::ClientClassRef);
+    }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+        let has_client_section = v
+            .get("client")
+            .and_then(|c| c.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false);
+        if has_client_section {
+            out.push(ModHint::MixinClientSection);
         }
-        let low = s.to_lowercase();
-        if low.contains("class_310")
-            || low.contains("net.minecraft.client")
-            || low.contains("net/minecraft/client")
-        {
-            return true;
-        }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
-            let has_client_section = v
-                .get("client")
-                .and_then(|c| c.as_array())
-                .map(|a| !a.is_empty())
-                .unwrap_or(false);
-            if has_client_section {
-                return true;
+    }
+    out
+}
+
+/// 元数据判定 + 启发式线索合成识别结果（纯函数，便于自检）。
+/// ★ 元数据优先且不可被启发式覆盖：线索只进 `hints`，永远不会把 side 变成 Client，
+/// 所以「含 client mixin 段但 environment=* 或缺失」的 jar 不会被判成「仅客户端」。
+fn classify_mod(side: ModSide, mixin_texts: &[String], file_name: &str) -> ModSideInfo {
+    // 元数据明确「仅服务端」时不再收集线索（服务端模组带客户端 mixin 段是常态，列出来只会增加噪音）
+    if side == ModSide::Server {
+        return ModSideInfo {
+            side,
+            hints: Vec::new(),
+        };
+    }
+    let mut hints: Vec<ModHint> = Vec::new();
+    for t in mixin_texts {
+        for h in mixin_client_hints(t) {
+            if !hints.contains(&h) {
+                hints.push(h);
             }
         }
     }
-    false
-}
-
-/// 启发式判定（元数据没有结论时才用）：客户端 mixin 段 / 客户端主类 / 文件名关键词
-fn heuristic_client_side(z: &mut zip::ZipArchive<std::fs::File>, file_name: &str) -> bool {
-    if jar_mixin_looks_client(z) {
-        return true;
+    if mod_name_hints_client(file_name) && !hints.contains(&ModHint::FileNameKeyword) {
+        hints.push(ModHint::FileNameKeyword);
     }
-    mod_name_hints_client(file_name)
+    ModSideInfo { side, hints }
 }
 
-/// 读单个 jar 的运行侧：Fabric/Quilt 的 environment 优先，其次 Forge/NeoForge 的 displayTest，
-/// 元数据没有结论时用启发式兜底。损坏的 jar 只按文件名兜底判断，绝不 panic。
-fn read_mod_side(path: &Path) -> ModSide {
+/// 读单个 jar 的识别结果：Fabric/Quilt 的 environment 优先，其次 Forge/NeoForge 的 displayTest；
+/// 启发式（mixin 配置 / 文件名）只填「疑似」线索，绝不改变元数据判定。
+/// 损坏的 jar 只按文件名给线索，绝不 panic。
+fn read_mod_side(path: &Path) -> ModSideInfo {
     let file_name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
-    let hinted = mod_name_hints_client(&file_name);
     let Ok(file) = std::fs::File::open(path) else {
-        return if hinted {
-            ModSide::SuspectedClient
-        } else {
-            ModSide::Unknown
-        };
+        return classify_mod(ModSide::Unknown, &[], &file_name);
     };
     let Ok(mut z) = zip::ZipArchive::new(file) else {
-        return if hinted {
-            ModSide::SuspectedClient
-        } else {
-            ModSide::Unknown
-        };
+        return classify_mod(ModSide::Unknown, &[], &file_name);
     };
     // 1) Fabric / Quilt：fabric.mod.json / quilt.mod.json 的 environment
     let mut meta = ModSide::Unknown;
@@ -25598,18 +25765,29 @@ fn read_mod_side(path: &Path) -> ModSide {
             }
         }
     }
-    match meta {
-        // 元数据明确"仅服务端"时不再叠加启发式（服务端模组带客户端 mixin 段是可能的）
-        ModSide::Server => ModSide::Server,
-        ModSide::Client => ModSide::Client,
-        _ => {
-            if heuristic_client_side(&mut z, &file_name) {
-                ModSide::SuspectedClient
-            } else {
-                meta
-            }
-        }
+    // 元数据已明确「仅服务端」就不用再开 mixin 配置了（线索会被丢弃）
+    if meta == ModSide::Server {
+        return ModSideInfo {
+            side: meta,
+            hints: Vec::new(),
+        };
     }
+    // 3) 启发式线索：只读 *.mixins.json 的文本，结果只进 hints
+    let names: Vec<String> = z
+        .file_names()
+        .filter(|n| n.to_lowercase().ends_with(".mixins.json"))
+        .map(|n| n.to_string())
+        .collect();
+    let mut mixin_texts: Vec<String> = Vec::new();
+    for n in names {
+        let Ok(mut f) = z.by_name(&n) else { continue };
+        let mut s = String::new();
+        if std::io::Read::read_to_string(&mut f, &mut s).is_err() {
+            continue;
+        }
+        mixin_texts.push(s);
+    }
+    classify_mod(meta, &mixin_texts, &file_name)
 }
 
 /// mods 目录指纹：(jar 数量, jar 总字节, 最新 mtime 纳秒)。
@@ -25648,7 +25826,7 @@ fn mods_env_fingerprint(dir: &Path) -> (usize, u64, i64) {
 struct ModSideCacheEntry {
     fingerprint: (usize, u64, i64),
     at: std::time::Instant,
-    list: Vec<(String, ModSide)>,
+    list: Vec<(String, ModSideInfo)>,
 }
 
 const MOD_SIDE_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
@@ -25660,8 +25838,8 @@ fn mod_side_cache() -> &'static std::sync::Mutex<HashMap<PathBuf, ModSideCacheEn
 }
 
 /// 真正扫描 mods 目录（不查缓存）：只认 `.jar`（`.jar.disabled` 不参与），按文件名排序。
-fn scan_mod_sides_uncached(dir: &Path) -> Vec<(String, ModSide)> {
-    let mut out: Vec<(String, ModSide)> = Vec::new();
+fn scan_mod_sides_uncached(dir: &Path) -> Vec<(String, ModSideInfo)> {
+    let mut out: Vec<(String, ModSideInfo)> = Vec::new();
     let Ok(rd) = std::fs::read_dir(dir) else {
         return out;
     };
@@ -25681,7 +25859,7 @@ fn scan_mod_sides_uncached(dir: &Path) -> Vec<(String, ModSide)> {
 }
 
 /// 把扫描结果写入缓存（目录数很少，超过 8 个且不含当前目录时整体清空）
-fn store_mod_sides(dir: &Path, fingerprint: (usize, u64, i64), list: &[(String, ModSide)]) {
+fn store_mod_sides(dir: &Path, fingerprint: (usize, u64, i64), list: &[(String, ModSideInfo)]) {
     let mut cache = mod_side_cache().lock().unwrap_or_else(|e| e.into_inner());
     if cache.len() >= 8 && !cache.contains_key(dir) {
         cache.clear();
@@ -25698,7 +25876,7 @@ fn store_mod_sides(dir: &Path, fingerprint: (usize, u64, i64), list: &[(String, 
 
 /// 扫描 mods 目录内每个 jar 的运行侧。指纹不变时直接复用缓存（最长 24 小时），
 /// 指纹变化（增删/改名/更新模组）立刻重扫。
-fn scan_mod_sides(dir: &Path) -> Vec<(String, ModSide)> {
+fn scan_mod_sides(dir: &Path) -> Vec<(String, ModSideInfo)> {
     let fp = mods_env_fingerprint(dir);
     {
         let cache = mod_side_cache().lock().unwrap_or_else(|e| e.into_inner());
@@ -25714,7 +25892,7 @@ fn scan_mod_sides(dir: &Path) -> Vec<(String, ModSide)> {
 }
 
 /// 忽略缓存强制重扫（用户点「排查客户端模组」时用），结果同时刷新缓存。
-fn scan_mod_sides_forced(dir: &Path) -> Vec<(String, ModSide)> {
+fn scan_mod_sides_forced(dir: &Path) -> Vec<(String, ModSideInfo)> {
     let list = scan_mod_sides_uncached(dir);
     store_mod_sides(dir, mods_env_fingerprint(dir), &list);
     list
@@ -25984,59 +26162,66 @@ fn run_precheck(sc: &ServerConfig, cfg: &GlobalConfig) -> Vec<PrecheckItem> {
                     "从 Modrinth/CurseForge 补上缺失的前置模组（版本要与 MC 版本、加载器一致）".to_string(),
                 ));
             }
-            // (c) 仅客户端模组：装到服务端会在加载阶段崩（客户端主类缺失）或干脆不生效
+            // (c) 仅客户端模组：★ 只有元数据明确声明仅客户端的才计入并给警告；
+            //     启发式候选与日志线索一律只作参考信息（Info，不计入警告/失败）。
             {
                 let mut definite: Vec<String> = Vec::new();
                 let mut suspected: Vec<String> = Vec::new();
-                for (name, side) in scan_mod_sides(&mods_dir) {
-                    match side {
-                        ModSide::Client => definite.push(name),
-                        ModSide::SuspectedClient => suspected.push(name),
-                        _ => {}
+                for (name, info) in scan_mod_sides(&mods_dir) {
+                    if info.side.is_metadata_client() {
+                        definite.push(name);
+                    } else if !info.hints.is_empty() {
+                        suspected.push(name);
                     }
                 }
-                let total = definite.len() + suspected.len();
-                if total == 0 {
+                if definite.is_empty() {
                     items.push(PrecheckItem::pass(
                         "仅客户端模组",
-                        format!("未发现仅客户端模组（已检查 {} 个模组）", metas.len()),
+                        format!(
+                            "未发现元数据声明仅客户端的模组（已检查 {} 个模组）",
+                            metas.len()
+                        ),
                     ));
                 } else {
-                    // 前 10 个文件名；元数据判定的排在前面（更可靠）
-                    let mut names: Vec<String> = definite.clone();
-                    names.extend(suspected.iter().cloned());
-                    let head: Vec<String> = names.iter().take(10).cloned().collect();
-                    let more = if names.len() > 10 {
-                        format!("…（共 {} 个）", names.len())
+                    let head: Vec<String> = definite.iter().take(10).cloned().collect();
+                    let more = if definite.len() > 10 {
+                        format!("…（共 {} 个）", definite.len())
                     } else {
                         String::new()
                     };
-                    let mut detail = format!("发现 {total} 个仅客户端模组：{}{more}", head.join("、"));
-                    if !suspected.is_empty() && !definite.is_empty() {
-                        detail.push_str(&format!(
-                            "（其中 {} 个由元数据判定，{} 个为疑似）",
+                    items.push(PrecheckItem::warn(
+                        "仅客户端模组",
+                        format!(
+                            "发现 {} 个元数据声明仅客户端的模组：{}{more}",
                             definite.len(),
-                            suspected.len()
-                        ));
-                    } else if definite.is_empty() {
-                        detail.push_str("（全部为疑似判定，依据见 mods 页 hover 说明）");
-                    }
-                    let crash_seen = log_shows_client_class_mixin_failure(&sc.dir);
-                    if crash_seen {
-                        items.push(PrecheckItem::fail(
-                            "仅客户端模组",
-                            format!(
-                                "{detail}；日志里已出现客户端主类（class_310）缺失的 Mixin 报错"
-                            ),
-                            "请先禁用这些仅客户端模组：把上面的文件重命名为 .jar.disabled 或移出 mods 目录后再启动（仅客户端模组应只装在客户端）".to_string(),
-                        ));
+                            head.join("、")
+                        ),
+                        "仅客户端模组（GUI/HUD/按键类）装在服务端通常会在加载阶段崩溃或不生效，建议禁用：把上面的文件重命名为 .jar.disabled 或移出 mods 目录（仅客户端模组应只装在客户端）".to_string(),
+                    ));
+                }
+                // 启发式候选：弱化文案、只作参考，不计入警告/失败
+                if !suspected.is_empty() {
+                    let head: Vec<String> = suspected.iter().take(8).cloned().collect();
+                    let more = if suspected.len() > 8 {
+                        format!("…（共 {} 个）", suspected.len())
                     } else {
-                        items.push(PrecheckItem::warn(
-                            "仅客户端模组",
-                            detail,
-                            "仅客户端模组（GUI/HUD/按键类）装在服务端通常会在加载阶段崩溃或不生效，建议禁用".to_string(),
-                        ));
-                    }
+                        String::new()
+                    };
+                    items.push(PrecheckItem::info(
+                        "疑似客户端（启发式，仅供参考）",
+                        format!(
+                            "{} 个模组带客户端线索（mixin 配置含 client 段 / 引用客户端主类 / 文件名关键词）：{}{more}。这不代表它们只能用于客户端，Carpet/Lithium 等双端模组出现属正常，不计入警告；可在 mods 页「🔍 排查客户端模组」里查看每个候选的判定依据",
+                            suspected.len(),
+                            head.join("、")
+                        ),
+                    ));
+                }
+                // 日志里确实出现客户端主类缺失的 mixin 报错 → 只给提示（不再升级为失败）
+                if log_shows_client_class_mixin_failure(&sc.dir) {
+                    items.push(PrecheckItem::info(
+                        "客户端类缺失报错（日志）",
+                        "日志中出现客户端类缺失的 mixin 报错，通常由某个仅在客户端可用的模组引起，可用『排查客户端模组』查看启发式候选（仅供参考）".to_string(),
+                    ));
                 }
             }
         }
@@ -26385,13 +26570,80 @@ mod mod_env_selfcheck {
         assert_eq!(parse_mod_env_toml("不是 TOML [[["), ModSide::Unknown);
     }
 
-    /// 文件名关键词兜底：命中常见客户端模组，普通模组不受影响
+    /// 文件名关键词：只作为启发式线索（命中常见客户端模组，普通模组不受影响）
     #[test]
     fn mod_name_hint() {
         assert!(mod_name_hints_client("CarpetGUI-1.2.3.jar"));
         assert!(mod_name_hints_client("sodium-fabric-0.5.jar"));
         assert!(!mod_name_hints_client("fabric-api-0.92.jar"));
         assert!(!mod_name_hints_client("lithium-fabric-0.12.jar"));
+    }
+
+    /// ★ 启发式只产出「疑似」线索，永远不产出「仅客户端」：
+    /// 含 `"client"` mixin 段（甚至引用客户端主类）但 environment 是 `*` / 缺失的 jar
+    /// 不得被判定为仅客户端。纯字符串输入，不落盘、不读真实 jar。
+    #[test]
+    fn heuristic_only_yields_suspected() {
+        // 元数据说双端（environment="*"），mixin 配置里同时有 client 段与客户端主类引用
+        let meta = parse_mod_env_json(r#"{"id":"carpet-extra","environment":"*"}"#);
+        assert_eq!(meta, ModSide::Both);
+        let info = classify_mod(
+            meta,
+            &[r#"{"required":true,"client":["a.b.CMixin"],"server":["a.b.SMixin"],"mixinConfigs":["net.minecraft.client.Minecraft"]}"#.to_string()],
+            "carpet-extra-1.4.7.jar",
+        );
+        assert_eq!(info.side, ModSide::Both);
+        assert!(!info.side.is_metadata_client());
+        assert!(info.hints.contains(&ModHint::MixinClientSection));
+        assert!(info.hints.contains(&ModHint::ClientClassRef));
+
+        // 元数据完全缺失（连 environment 都没有）+ 有 client 段 → 仍是 Unknown + 线索，不判仅客户端
+        let info = classify_mod(
+            ModSide::Unknown,
+            &[r#"{"client":["a.b.CMixin"]}"#.to_string()],
+            "collective-1.0.jar",
+        );
+        assert_eq!(info.side, ModSide::Unknown);
+        assert!(!info.side.is_metadata_client());
+        assert_eq!(info.hints, vec![ModHint::MixinClientSection]);
+
+        // 文件名关键词也只是线索：sodium 双端/客户端侧命名不得因此变成「仅客户端」
+        let info = classify_mod(ModSide::Unknown, &[], "sodium-fabric-0.5.jar");
+        assert!(!info.side.is_metadata_client());
+        assert_eq!(info.hints, vec![ModHint::FileNameKeyword]);
+
+        // 元数据明确仅服务端时不收集线索（服务端模组带 client 段是常态，列出来只是噪音）
+        let info = classify_mod(
+            ModSide::Server,
+            &[r#"{"client":["a.b.CMixin"]}"#.to_string()],
+            "carpet-1.4.7.jar",
+        );
+        assert!(!info.side.is_metadata_client());
+        assert!(info.hints.is_empty());
+
+        // 只有元数据明确 client 才是「仅客户端」（此时线索不影响结论）
+        let info = classify_mod(
+            ModSide::Client,
+            &[r#"{"client":["a.b.CMixin"]}"#.to_string()],
+            "some-gui-mod-1.0.jar",
+        );
+        assert!(info.side.is_metadata_client());
+    }
+
+    /// mixin 客户端线索提取：client 段与客户端主类引用分别识别（纯字符串）
+    #[test]
+    fn mixin_hint_extract() {
+        assert_eq!(mixin_client_hints(r#"{"server":["a.b.S"]}"#), Vec::new());
+        assert_eq!(
+            mixin_client_hints(r#"{"client":["a.b.C"]}"#),
+            vec![ModHint::MixinClientSection]
+        );
+        assert_eq!(
+            mixin_client_hints("not json but mentions class_310"),
+            vec![ModHint::ClientClassRef]
+        );
+        // 空 client 段不算线索
+        assert_eq!(mixin_client_hints(r#"{"client":[]}"#), Vec::new());
     }
 }
 
