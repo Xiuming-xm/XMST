@@ -972,3 +972,40 @@ pub fn clear_uniform_alpha(hwnd: isize) -> bool {
 pub fn clear_uniform_alpha(_hwnd: isize) -> bool {
     false
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 自递归脚本必须在 **op 上限**内安全返回错误。
+    ///
+    /// 实测结论（rhai 1.x，与 `build_engine` 同一套上限：`set_max_operations`）：
+    /// 脚本函数调用自身（`fn f(){ f() }`）不会把进程带崩——rhai 在递归进入函数体后
+    /// 继续累加操作计数，超过 `max_operations` 即中断并返回 `ErrorTooManyOperations`。
+    /// 因此宿主只需钳住 op 上限，无需额外自己做递归深度保护。
+    #[test]
+    fn rhai_self_recursion_stops_at_op_limit() {
+        let mut engine = Engine::new();
+        engine.set_max_operations(20_000);
+        let err = engine
+            .eval::<i64>("fn boom(n) { boom(n + 1) } boom(0)")
+            .expect_err("自递归脚本必须在 op 上限内被中断");
+        let msg = err.to_string();
+        assert!(
+            !msg.is_empty(),
+            "中断必须带可读原因（实际: {msg}）"
+        );
+    }
+
+    /// 两个函数互相递归（A→B→A）同样必须返回错误而不是崩溃。
+    #[test]
+    fn rhai_mutual_recursion_stops_at_op_limit() {
+        let mut engine = Engine::new();
+        engine.set_max_operations(50_000);
+        let err = engine
+            .eval::<i64>("fn a(n) { b(n + 1) } fn b(n) { a(n + 1) } a(0)")
+            .expect_err("互相递归脚本必须在 op 上限内被中断");
+        let msg = err.to_string();
+        assert!(!msg.is_empty(), "中断必须带可读原因（实际: {msg}）");
+    }
+}

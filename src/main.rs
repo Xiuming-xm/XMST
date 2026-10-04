@@ -15,6 +15,7 @@ mod process;
 mod server_download;
 mod serverinfo;
 mod spark_analysis;
+mod stats;
 mod theme;
 mod toollog;
 
@@ -1392,6 +1393,8 @@ struct DlUiState {
     mod_search_error: Option<String>,
     mod_download_name: String,
     mod_download_target: String,
+    /// 远端给出的期望字节数（Modrinth 的 size；None = 未知，不做大小核对）
+    mod_download_size: Option<u64>,
     mod_dl_busy: bool,
     mod_dl_progress: download::DlProgress,
     // 日志
@@ -1518,6 +1521,7 @@ impl Default for DlUiState {
             mod_search_error: None,
             mod_download_name: String::new(),
             mod_download_target: String::new(),
+            mod_download_size: None,
             mod_dl_busy: false,
             mod_dl_progress: download::DlProgress::default(),
             dl_log: Vec::new(),
@@ -2468,6 +2472,8 @@ struct App {
     servers_collapsed: bool,
     /// 服务器列表侧栏折叠动画进度 (0=折叠, 1=展开)
     servers_anim: f32,
+    /// 仪表盘成就卡片：「查看全部」是否展开（展开后列出含未解锁的全部成就）
+    ach_show_all: bool,
     /// 服务器页签滑块动画进�?(0..3)
     tab_anim: f32,
     /// 备份到期扫描节流（后台轻量）
@@ -3258,6 +3264,19 @@ impl App {
             ),
         );
         let mut cfg = load_config(&config_path);
+        // 成就统计：与工具日志同目录（`data\stats.json`），先建立内存缓存并记一次服务器数峰值
+        //（老用户已有的服务器数量在第一次运行时就能对上，删除服务器不回退）
+        stats::init(&exe_dir.join("data"));
+        stats::note_server_count(cfg.servers.len() as u64);
+        // 启动时先判一次：老用户已有数据（服务器数等）立刻解锁，避免"进度满格但仍灰显"；
+        // 这里还没有 App，只能记工具日志，不能弹通知（通知在事件路径上发）
+        for a in stats::evaluate() {
+            toollog::tool_log(
+                toollog::ToolLevel::Info,
+                "成就",
+                format!("成就解锁：{}（{}）", a.name, a.desc),
+            );
+        }
         let nav_collapsed_init = cfg.nav_collapsed;
         // 老配置兼容：admin_port 缺失时统一为 7400，重新编号避免端口冲突
         {
@@ -3500,6 +3519,7 @@ impl App {
             nav_anim: 0.0,
             servers_collapsed: false,
             servers_anim: 1.0,
+            ach_show_all: false,
             tab_anim: 0.0,
             last_backup_check: std::time::Instant::now(),
             mem_risk_active: false,
@@ -3848,6 +3868,8 @@ impl App {
         self.runtimes.push(ServerRuntime::default());
         self.selected_server = Some(self.cfg.servers.len() - 1);
         self.save_config();
+        // 成就统计：服务器数量峰值（判定与通知走统一入口）
+        self.stats_event_server_count();
         self.set_toast("已添加服务器".to_string());
     }
 
@@ -4369,6 +4391,8 @@ impl App {
                     sc.start_count = sc.start_count.saturating_add(1);
                     self.save_config();
                 }
+                // 成就统计：本次已成功接管进程（与上面的 start_count 同口径，含 run.bat 回退启动）
+                self.stats_event(stats::StatKind::Launches, 1);
                 process::launch_log_ctx(
                     &ctx,
                     &format!(
@@ -4778,6 +4802,8 @@ impl App {
             }
         }
         if had_proc {
+            // 成就统计：强停同样是本次运行的结束（优雅停止中的进程已不在 proc 上，不会重复累加）
+            self.stats_play_secs(idx);
             if let Some(pm) = self.plugins.as_mut() {
                 pm.emit("server_stopped", vec![Dynamic::from(srv_name), Dynamic::from("killed")]);
             }
@@ -5921,6 +5947,8 @@ impl App {
                 let new_crash = self.server_new_crash_report(idx);
                 self.try_exit_snapshot(idx, true, None, &tail, new_crash);
             }
+            // 成就统计：本次运行时长（放在崩溃报告判定之后，避免影响"是否有新崩溃报告"的时间基准）
+            self.stats_play_secs(idx);
         }
         // 确认退出模式：所有服务器均已停止、无停止中任务、且关服快照已写完，放行退出
         // （只等退出时触发的快照，耗时的手动备份不阻塞退出；否则进程退出会打断线程、丢掉最后一份快照）
@@ -6358,6 +6386,8 @@ impl App {
                                     fmt_size(size)
                                 ),
                             );
+                            // 成就统计：诊断包导出成功
+                            self.stats_event(stats::StatKind::DiagPack, 1);
                         }
                         Err(e) => {
                             self.push_toast("XMST - 导出诊断包失败", &e);
@@ -6963,8 +6993,9 @@ impl App {
 
     /// 处理关闭请求：返�?true 表示放行关闭（退出程序），false 表示已拦�?
     fn handle_close_request(&mut self, ctx: &egui::Context) -> bool {
-        // 关闭前把去抖中的配置立刻落盘（避免丢改动）
+        // 关闭前把去抖中的配置立刻落盘（避免丢改动）；成就统计同样兜一次（累加时已写，幂等）
         self.flush_config();
+        stats::save();
         // 无头回归（XMST_OPEN_PAGE 等）：没有人能点确认弹窗，确认类弹窗直接按
         // 「不阻塞退出」处理 —— 关闭确认不询问、也不按"最小化到托盘"拦住关闭。
         // 这里刻意提前返回，绕过下面 ctx_close_pending 分支里的
@@ -7083,6 +7114,8 @@ impl App {
     let mut plugin_evts: Vec<PluginEvt> = Vec::new();
     // 本帧检测到的服务器退出事件：(序号, 退出码, 日志尾部, 是否有新崩溃报告)
     let mut exit_events: Vec<(usize, Option<i32>, String, bool)> = Vec::new();
+    // 本帧成就统计事件（循环内不能回调 self，统一在循环结束后投递）
+    let mut stat_events: Vec<(stats::StatKind, u64)> = Vec::new();
     // 本帧判定为「run.bat 启动失败」、需要自动回退直连 java 的服务器序号
     // （循环内不能回调 self，统一在循环结束后重启，避免与 runtimes 的可变借用冲突）
     let mut fallback_queue: Vec<usize> = Vec::new();
@@ -7278,6 +7311,8 @@ impl App {
                 }
                 // 关服/崩溃快照统一入口（本帧先登记，循环结束后再起线程）
                 exit_events.push((idx, code_opt, tail, new_crash));
+                // 成就统计：本次运行时长（起点在这里取走，保证每次运行只算一次）
+                push_play_secs_evt(&mut stat_events, rt);
                 if normal {
                     rt.proc = None;
                     rt.last_msg = format!("服务器已退出（exit code {code}），按正常关服处理");
@@ -7303,6 +7338,8 @@ impl App {
                                     format!("{name}：{first}（详见「崩溃分析」窗口）"),
                                 ));
                                 self.crash_report = Some((idx, name.clone(), finding));
+                                // 成就统计：崩溃报告分析出了结论
+                                stat_events.push((stats::StatKind::CrashScanOk, 1));
                             }
                             Err(msg) => {
                                 // 本次运行没有崩溃报告：展示退出码 + stderr 最后 30 行 + 命令行
@@ -7513,6 +7550,8 @@ impl App {
                     }
                 }
                 if joined {
+                    // 成就统计：内网穿透连接成功
+                    stat_events.push((stats::StatKind::TunnelOk, 1));
                     toollog::tool_log(
                         toollog::ToolLevel::Info,
                         "隧道",
@@ -7603,6 +7642,10 @@ impl App {
     // 统一投递本次收集的通知（循环结束后避免借用冲突）桌面弹窗 + 工具内通知同步
     for (title, body) in notify_queue {
         self.notify(&title, &body);
+    }
+    // 统一投递本次收集的成就统计事件（累加 → 判定新解锁 → 通知 + 工具日志）
+    for (kind, n) in stat_events {
+        self.stats_event(kind, n);
     }
     // 已计划崩溃重启的通知：带「取消自动重启」按钮（托盘态只入列表，恢复窗口后即可见并操作）
     for (i, title, body) in cancel_restart_toasts {
@@ -7712,6 +7755,8 @@ impl App {
                             rep.failed.len()
                         ),
                     );
+                    // 成就统计：回退成功
+                    self.stats_event(stats::StatKind::RestoreOk, 1);
                 }
                 Err(e) => {
                     self.set_toast(format!("回退失败: {e}"));
@@ -7800,6 +7845,11 @@ impl App {
                                 fmt_size(r.bytes)
                             ),
                         );
+                        // 成就统计：本次快照创建成功（关服自动快照另计一种，用于「善始善终」）
+                        self.stats_event(stats::StatKind::Backups, 1);
+                        if r.reason == backup::BackupReason::Stop {
+                            self.stats_event(stats::StatKind::StopBackups, 1);
+                        }
                         // 插件事件：backup_done（成功且有关键数据才触发）
                         if let Some(pm) = self.plugins.as_mut() {
                             let srv_name = self
@@ -9430,7 +9480,9 @@ impl App {
         }
         let target = self.file_tab_target(idx);
         // 文件列表被刷新（刷新按钮 / 启用禁用模组 / 重命名 / 删除 / 更新完成）意味着数据可能变了，
-        // 立刻失效平台识别与 mods 元数据缓存，让 UI 立即反映变化（不依赖 3 秒 TTL 自然过期）。
+        // 立刻失效平台识别与 mods 元数据缓存，让 UI 立即反映变化（不依赖 3 秒 TTL 自然过期）；
+        // 目录统计（每文件夹 walkdir）同样立即失效，避免显示旧体积。
+        invalidate_dir_stats();
         if let Some(sc) = self.cfg.servers.get(idx) {
             serverinfo::invalidate_cache(&sc.dir);
             serverinfo::invalidate_cache(&sc.dir.join("mods"));
@@ -9444,8 +9496,8 @@ impl App {
                     .or_else(|_| e.metadata().map(|m| m.is_dir()))
                     .unwrap_or(false);
                 let size = if is_dir {
-                    // 文件夹显示真实总大小（递归统计），便于排序与展示
-                    dir_stats(&e.path()).0
+                    // 文件夹显示真实总大小（递归统计，走 6 秒 TTL 缓存）
+                    dir_stats_cached(&e.path()).0
                 } else {
                     e.metadata().map(|m| m.len()).unwrap_or(0)
                 };
@@ -10782,6 +10834,49 @@ impl App {
         }
     }
 
+    /// 成就事件入口：累加一次 → 判定新解锁 → 右下角工具内通知 + 工具日志（类别「成就」）。
+    /// **只在事件真的成功时调用一次**，不得放进每帧渲染路径；启动成功同时记一次"今天有服务器在线"。
+    /// 之所以只弹工具内通知（不用 `notify`）：一次启动可能同时解开多项，系统级气泡会连着弹一串。
+    fn stats_event(&mut self, kind: stats::StatKind, n: u64) {
+        stats::bump(kind, n);
+        if kind == stats::StatKind::Launches {
+            stats::note_online_today();
+        }
+        self.stats_announce(stats::evaluate());
+    }
+
+    /// 服务器数量峰值入统计（新增服务器 / 建服完成时调用），并立即判定/通知新解锁
+    fn stats_event_server_count(&mut self) {
+        stats::note_server_count(self.cfg.servers.len() as u64);
+        self.stats_announce(stats::evaluate());
+    }
+
+    /// 把本次新解锁的成就告诉用户：右下角通知 + 工具日志（类别「成就」）
+    fn stats_announce(&mut self, newly: Vec<stats::Achievement>) {
+        for a in newly {
+            self.push_toast("🏆 成就解锁", &format!("{}（{}）", a.name, a.desc));
+            toollog::tool_log(
+                toollog::ToolLevel::Info,
+                "成就",
+                format!("成就解锁：{}（{}）", a.name, a.desc),
+            );
+        }
+    }
+
+    /// 本次运行时长入统计：取走起点（每次运行只算一次），无运行记录时什么也不做。
+    /// 停止回传（优雅停止 / 超时强杀）与强停路径调用。
+    fn stats_play_secs(&mut self, idx: usize) {
+        let secs = self
+            .runtimes
+            .get_mut(idx)
+            .and_then(|rt| rt.started_at.take())
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
+        if secs > 0 {
+            self.stats_event(stats::StatKind::PlaySecs, secs);
+        }
+    }
+
     /// 右下角自绘通知（替代系统气泡）：按配置的弹出方式与滞留时间渲染
     fn push_toast(&mut self, title: &str, body: &str) {
         // 同类通知合并：标题与正文完全相同（例如后台线程连续报同一个错误）时只保留最新一条，
@@ -11460,6 +11555,49 @@ fn dir_stats(path: &std::path::Path) -> (u64, usize) {
         }
     }
     (total, files)
+}
+
+/// `dir_stats` 的 TTL 缓存（键 = 目录路径）。
+///
+/// 为什么需要：每个文件夹都要跑一次 walkdir，文件页只要有一批子目录就会累积成
+/// 数百毫秒级卡顿。缓存后同一目录在 TTL 内只遍历一次；文件操作（上传 / 删除 /
+/// 重命名 / 切换服务器）走 `invalidate_dir_stats` 立即失效。
+fn dir_stats_cache(
+) -> &'static std::sync::Mutex<HashMap<PathBuf, (std::time::Instant, (u64, usize))>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<PathBuf, (std::time::Instant, (u64, usize))>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// 带 TTL 的目录统计（6 秒）。渲染路径只读缓存，不遍历目录。
+fn dir_stats_cached(path: &std::path::Path) -> (u64, usize) {
+    const TTL: std::time::Duration = std::time::Duration::from_secs(6);
+    let cache = dir_stats_cache();
+    {
+        let g = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, v)) = g.get(path) {
+            if at.elapsed() < TTL {
+                return *v;
+            }
+        }
+    }
+    // 遍历在锁外执行：walkdir 可能很慢，不能持锁
+    let v = dir_stats(path);
+    let mut g = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if g.len() > 256 {
+        g.clear();
+    }
+    g.insert(path.to_path_buf(), (std::time::Instant::now(), v));
+    v
+}
+
+/// 文件操作（上传 / 删除 / 重命名 / 切换服务器）后立即失效目录统计缓存
+fn invalidate_dir_stats() {
+    dir_stats_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 /// 异步加载 CJK 字体（启动仅 ASCII，不阻塞；托盘态不加载；恢复/可见后懒加载一次）。
@@ -14114,69 +14252,50 @@ impl eframe::App for App {
         self.ui_clear_confirm(ctx);
 
         // 回退确认弹窗（二次确认；回退全程在后台线程执行）
-        if self.confirm_restore.is_some() {
-            let mut do_it = false;
-            egui::Window::new("确认回退")
-                .resizable(true)
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    if let Some((_, _, name, scope)) = &self.confirm_restore {
-                        let scope_txt = if scope.is_empty() {
-                            "全部".to_string()
+        if let Some((_, _, name, scope)) = self.confirm_restore.clone() {
+            let scope_txt = if scope.is_empty() {
+                "全部".to_string()
+            } else {
+                scope.join(" / ")
+            };
+            match confirm_dialog(
+                ctx,
+                "确认回退",
+                &format!("将从备份 [{name}] 恢复：{scope_txt}"),
+                "服务器会先被停止；回退前自动生成一份当前快照，原数据移动到 .mcsrv_trash/。",
+                "确认回退",
+            ) {
+                ConfirmAction::Cancel => self.confirm_restore = None,
+                ConfirmAction::Confirm => {
+                    if let Some((idx, path, _name, scope)) = self.confirm_restore.take() {
+                        let folders = if scope.is_empty() {
+                            self.restore_scope_folders(idx)
                         } else {
-                            scope.join(" / ")
+                            scope
                         };
-                        ui.label(format!("将从备份 [{name}] 恢复：{scope_txt}"));
-                        ui.label(RichText::new("服务器会先被停止，回退前自动生成一份当前快照，原数据移动到 .mcsrv_trash/").color(Color32::YELLOW));
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            if ui.button("确认回退").clicked() {
-                                do_it = true;
-                            }
-                            if ui.button("取消").clicked() {
-                                self.confirm_restore = None;
-                            }
-                        });
+                        self.spawn_restore(idx, path, folders);
+                        self.set_toast("回退已开始（后台执行：关服 → 生成恢复前快照 → 恢复）".to_string());
                     }
-                });
-            if do_it {
-                if let Some((idx, path, _name, scope)) = self.confirm_restore.take() {
-                    let folders = if scope.is_empty() {
-                        self.restore_scope_folders(idx)
-                    } else {
-                        scope
-                    };
-                    self.spawn_restore(idx, path, folders);
-                    self.set_toast("回退已开始（后台执行：关服 → 生成恢复前快照 → 恢复）".to_string());
                 }
+                ConfirmAction::None => {}
             }
         }
 
         // 删除备份确认弹窗
-        if self.confirm_delete_backup.is_some() {
-            let mut do_it = false;
-            egui::Window::new("确认删除备份")
-                .resizable(true)
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    if let Some((_, _, name)) = &self.confirm_delete_backup {
-                        ui.label(format!("确定删除备份 [{name}] 吗？"));
-                        ui.label(RichText::new("该操作不可撤销。").color(Color32::YELLOW));
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            if ui.button("确认删除").clicked() {
-                                do_it = true;
-                            }
-                            if ui.button("取消").clicked() {
-                                self.confirm_delete_backup = None;
-                            }
-                        });
-                    }
-                });
-            if do_it {
-                self.do_delete_backup();
+        if let Some((_, _, name)) = self.confirm_delete_backup.clone() {
+            match confirm_dialog(
+                ctx,
+                "确认删除备份",
+                &format!("确定删除备份 [{name}] 吗？"),
+                "该操作不可撤销。",
+                "确认删除",
+            ) {
+                ConfirmAction::Cancel => self.confirm_delete_backup = None,
+                ConfirmAction::Confirm => {
+                    self.confirm_delete_backup = None;
+                    self.do_delete_backup();
+                }
+                ConfirmAction::None => {}
             }
         }
 
@@ -14462,6 +14581,154 @@ fn content_frame(mut frame: egui::Frame) -> egui::Frame {
     frame
 }
 
+// ---------------------------------------------------------------- 界面令牌
+//
+// 间距 / 控件高度 / 块内边距 / 圆角统一由这里取值：各页面工具条、卡片、分组
+// 都引用同一组常量，避免"每页各写一套数字"造成的参差。
+// 圆角与字号沿用主题层（theme::apply 的 corner_scale / ui_font_scale），此处不重复定义。
+
+/// 控件统一高度（工具条上的输入框与按钮同高）
+const UI_CTL_H: f32 = 26.0;
+/// 控件横向间距
+const UI_SPACE_X: f32 = 8.0;
+/// 控件纵向间距
+const UI_SPACE_Y: f32 = 6.0;
+/// 页面顶部留白
+const UI_PAGE_TOP: f32 = 8.0;
+/// 块（卡片 / 分组）内边距
+const UI_BLOCK_PAD: f32 = 8.0;
+/// 小圆角（卡片 / 分组框）
+const UI_RADIUS: f32 = 6.0;
+/// 快捷键提示的统一写法（全站只有这一处定义，避免各页各写一种格式）
+const HINT_SHORTCUT_SHOT: &str = "快捷键 F12：保存窗口截图到 data 目录";
+/// 按明暗主题适配一个固定颜色（与各页面内联的 fg 闭包同一行为）
+fn uifg(light: bool, c: egui::Color32) -> egui::Color32 {
+    if light {
+        theme::light_adapt(c)
+    } else {
+        c
+    }
+}
+
+/// 服务器页签显示名（工具条与页签栏共用，避免两处文案漂移）
+fn server_tab_label(tab: ServerTab) -> &'static str {
+    match tab {
+        ServerTab::Overview => "概览",
+        ServerTab::Console => "控制台",
+        ServerTab::Files => "文件",
+        ServerTab::Backup => "备份",
+        ServerTab::Scripts => "设置",
+        ServerTab::Players => "玩家",
+        ServerTab::Special => "特殊功能",
+    }
+}
+
+/// 每页统一顶部工具条：**左侧**关键字 / 过滤，**右侧**主操作按钮。
+struct PageToolbar<'a> {
+    ui: &'a mut egui::Ui,
+    title: &'a str,
+}
+
+/// 开始一条页面工具条（见 PageToolbar::show）。
+fn page_toolbar<'a>(ui: &'a mut egui::Ui, title: &'a str) -> PageToolbar<'a> {
+    PageToolbar { ui, title }
+}
+
+impl<'a> PageToolbar<'a> {
+    /// 左侧：关键字 / 过滤控件；右侧：主操作按钮。两条闭包在同一条工具条内排布。
+    fn show<F, A>(self, filter: F, action: A)
+    where
+        F: FnOnce(&mut egui::Ui),
+        A: FnOnce(&mut egui::Ui),
+    {
+        let Self { ui, title } = self;
+        let item_h = UI_CTL_H;
+        let pad = UI_BLOCK_PAD;
+        egui::Frame::none()
+            .fill(ui.visuals().faint_bg_color)
+            .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+            .rounding(egui::Rounding::same(UI_RADIUS))
+            .inner_margin(egui::Margin::symmetric(pad, pad * 0.5))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                // 统一控件高度：输入框与按钮同高，右侧主操作区保持同一基线
+                ui.spacing_mut().interact_size.y = item_h;
+                ui.spacing_mut().item_spacing.x = UI_SPACE_X;
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.horizontal(|ui| {
+                    ui.set_min_height(item_h);
+                    if !title.is_empty() {
+                        ui.label(RichText::new(title).strong().size(14.0));
+                        ui.add_space(2.0);
+                    }
+                    filter(ui);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        action(ui);
+                    });
+                });
+            });
+    }}
+
+/// 低频 / 开发者向项的统一折叠容器（审计表 §4）：**默认折叠**。
+/// 展开状态由 egui 按 `id` 记忆（工具条与页面共用同一套 id 规则），无需另建状态。
+fn advanced_fold(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash,
+    add: impl FnOnce(&mut egui::Ui),
+) {
+    egui::CollapsingHeader::new(RichText::new("高级").strong())
+        .id_salt(id)
+        .default_open(false)
+        .show(ui, |ui| {
+            add(ui);
+        });
+}
+
+/// 仪表盘成就网格单元：图标 + 名称 + 进度条；未解锁灰显，hover 显示条件与当前进度。
+fn ach_cell(ui: &mut egui::Ui, a: &stats::Achievement) {
+    let hover = format!("{}\n进度：{} / {}", a.desc, a.cur, a.target);
+    let (icon, txt) = if a.unlocked {
+        ("🏆", ui.visuals().text_color())
+    } else {
+        ("🔒", ui.visuals().weak_text_color())
+    };
+    let fill = if a.unlocked {
+        ui.visuals().selection.bg_fill
+    } else {
+        ui.visuals().widgets.inactive.bg_fill
+    };
+    ui.vertical(|ui| {
+        ui.label(
+            RichText::new(format!("{icon} {}", a.name))
+                .color(txt)
+                .strong()
+                .size(13.0),
+        )
+        .on_hover_text(hover.clone());
+        ui.add(
+            egui::ProgressBar::new(a.progress)
+                .desired_width(130.0)
+                .desired_height(8.0)
+                .fill(fill)
+                .text(RichText::new(format!("{} / {}", a.cur, a.target)).size(9.0)),
+        )
+        .on_hover_text(hover);
+    });
+}
+
+/// 进程退出路径的运行时长入统计：该处拿不到 `&mut self`（runtimes 已被循环借用），
+/// 先把事件排进队列，循环结束后统一投递。
+fn push_play_secs_evt(out: &mut Vec<(stats::StatKind, u64)>, rt: &mut ServerRuntime) {
+    let secs = rt
+        .started_at
+        .take()
+        .map(|t| t.elapsed().as_secs())
+        .unwrap_or(0);
+    if secs > 0 {
+        out.push((stats::StatKind::PlaySecs, secs));
+    }
+}
+
 impl App {
     fn ui_dashboard(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
@@ -14482,9 +14749,32 @@ impl App {
             );
             _inner.set_width(_w);
             let ui = &mut _inner;
-            ui.add_space(8.0);
+            ui.add_space(UI_PAGE_TOP);
             ui.label(RichText::new("📊 仪表盘").size(20.0).strong());
             ui.separator();
+            // 公告位：当前无内容时不渲染（整块隐藏，不占位）
+            self.announcement_area(ui);
+            // 统一工具条：左侧服务器数（只读概览），右侧刷新
+            let n_servers = self.cfg.servers.len();
+            page_toolbar(ui, "").show(
+                move |ui| {
+                    ui.label(
+                        RichText::new(format!("共 {n_servers} 台服务器"))
+                            .weak()
+                            .small(),
+                    );
+                },
+                |ui| {
+                    if ui
+                        .add_sized([84.0, UI_CTL_H], egui::Button::new("🔄 刷新"))
+                        .on_hover_text("立即重绘并重新采样运行状态")
+                        .clicked()
+                    {
+                        self.set_toast("已刷新运行状态".to_string());
+                    }
+                },
+            );
+            ui.add_space(UI_SPACE_Y);
             let total_start: u64 = self.cfg.servers.iter().map(|s| s.start_count).sum();
             let total_dl: u64 = self.cfg.servers.iter().map(|s| s.download_count).sum();
             let first_dl: Option<String> = self
@@ -14543,9 +14833,15 @@ impl App {
             ui.separator();
             if online.is_empty() {
                 ui.add_space(8.0);
-                ui.centered_and_justified(|ui| {
-                    ui.label("当前没有在线服务器");
-                });
+                // 空状态只占固定高度：`centered_and_justified` 会吃掉剩余高度，
+                // 把下方的「成就」卡片顶出可视区（本页没有滚动条，顶出去就彻底看不到）
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 96.0),
+                    egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                    |ui| {
+                        ui.label("当前没有在线服务器");
+                    },
+                );
             } else {
                 egui::Grid::new("dash_online")
                     .num_columns(5)
@@ -14573,7 +14869,118 @@ impl App {
                         }
                     });
             }
+            ui.add_space(10.0);
+            self.ui_achievements_card(ui);
         });
+    }
+
+    /// 仪表盘公告位（占位）：接入方式待定 —— 优先读本地公告文件 `data\announcement.md`，
+    /// 联网拉取尚未决定（见 `docs\UI-审计表.md` §7.2 第 18 条 / §8.3）。
+    /// **拍板前不写任何联网代码**；无公告时整块不显示（不占位、不留空白标题）。
+    fn announcement_area(&mut self, _ui: &mut egui::Ui) {}
+
+    /// 仪表盘「成就」卡片：标题 + 已解锁 X / Y + 网格（每行 3 个）+「查看全部」折叠 + 总开关。
+    /// 只读 `stats::snapshot()` 的内存克隆，不读文件；进度由事件累加时写入。
+    fn ui_achievements_card(&mut self, ui: &mut egui::Ui) {
+        let snap = stats::snapshot();
+        let list = stats::all();
+        let unlocked_n = list.iter().filter(|a| a.unlocked).count();
+        let total = list.len();
+        let mut want_enabled: Option<bool> = None;
+        egui::Frame::none()
+            .fill(Color32::from_rgba_unmultiplied(255, 190, 90, 14))
+            .stroke(egui::Stroke::new(
+                1.0,
+                Color32::from_rgba_unmultiplied(255, 190, 90, 60),
+            ))
+            .inner_margin(egui::Margin::same(10.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("🏆 成就").strong());
+                    ui.label(
+                        RichText::new(format!("已解锁 {unlocked_n} / {total}"))
+                            .weak()
+                            .small(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let mut on = snap.enabled;
+                        if ui
+                            .checkbox(&mut on, "启用成就统计")
+                            .on_hover_text("关闭后不再累计与通知；已有数据保留")
+                            .changed()
+                        {
+                            want_enabled = Some(on);
+                        }
+                    });
+                });
+                ui.separator();
+                if !snap.enabled {
+                    ui.label(
+                        RichText::new("成就统计已关闭：不再记录进度，也不弹解锁通知（已有数据保留）")
+                            .weak()
+                            .small(),
+                    );
+                    return;
+                }
+                let today = Local::now().format("%Y-%m-%d").to_string();
+                let cur_streak = stats::current_streak(&snap.online_days, &today);
+                let mut show_all = self.ach_show_all;
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "在线天数：{} 天（当前连续 {cur_streak} 天）",
+                            snap.online_days.len()
+                        ))
+                        .weak()
+                        .small(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .selectable_label(show_all, if show_all { "收起" } else { "查看全部" })
+                            .clicked()
+                        {
+                            show_all = !show_all;
+                        }
+                    });
+                });
+                self.ach_show_all = show_all;
+                // 网格：每行 3 个；「查看全部」关闭时只显示已解锁 + 进度最高的几个未解锁项
+                let shown: Vec<&stats::Achievement> = if show_all {
+                    list.iter().collect()
+                } else {
+                    let mut v: Vec<&stats::Achievement> =
+                        list.iter().filter(|a| a.unlocked).collect();
+                    let mut rest: Vec<&stats::Achievement> =
+                        list.iter().filter(|a| !a.unlocked).collect();
+                    rest.sort_by(|a, b| {
+                        b.progress
+                            .partial_cmp(&a.progress)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    v.extend(rest.into_iter().take(6));
+                    v
+                };
+                ui.add_space(4.0);
+                egui::Grid::new("dash_achievements")
+                    .num_columns(3)
+                    .spacing([10.0, 8.0])
+                    .show(ui, |ui| {
+                        for (i, a) in shown.iter().enumerate() {
+                            ach_cell(ui, a);
+                            if i % 3 == 2 {
+                                ui.end_row();
+                            }
+                        }
+                    });
+            });
+        if let Some(v) = want_enabled {
+            stats::set_enabled(v);
+            self.set_toast(if v {
+                "已启用成就统计".to_string()
+            } else {
+                "已关闭成就统计（已有数据保留）".to_string()
+            });
+        }
     }
 
     fn ui_servers(&mut self, ctx: &egui::Context) {
@@ -14860,35 +15267,22 @@ impl App {
                 .get(i)
                 .map(|s| s.name.clone())
                 .unwrap_or_default();
-            let mut close = false;
-            let mut do_delete = false;
-            egui::Window::new("删除服务器")
-                .resizable(true)
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label(format!("确定要删除服务器「{name}」吗？"));
-                    ui.label(RichText::new("仅删除工具内的服务器配置，服务器文件与存档不会动。").weak());
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("取消").clicked() {
-                            close = true;
-                        }
-                        if ui.button(RichText::new("确认删除配置").color(self.fg(Color32::from_rgb(230, 120, 120)))).clicked() {
-                            do_delete = true;
-                            close = true;
-                        }
-                    });
-                });
-            if close {
-                self.confirm_delete_server = None;
-            }
-            if do_delete {
-                self.remove_server(i);
-                if self.selected_server == Some(i) {
-                    self.selected_server = None;
+            match confirm_dialog(
+                ctx,
+                "删除服务器",
+                &format!("确定要删除服务器「{name}」吗？"),
+                "仅删除工具内的服务器配置，服务器文件与存档不会动。",
+                "确认删除配置",
+            ) {
+                ConfirmAction::Cancel => self.confirm_delete_server = None,
+                ConfirmAction::Confirm => {
+                    self.confirm_delete_server = None;
+                    self.remove_server(i);
+                    if self.selected_server == Some(i) {
+                        self.selected_server = None;
+                    }
                 }
+                ConfirmAction::None => {}
             }
         }
 
@@ -14910,6 +15304,76 @@ impl App {
             );
             _inner.set_width(_w);
             let ui = &mut _inner;
+            // 统一工具条（服务器列表 / 详情共用同一条）：左侧当前服务器与页签，右侧主操作
+            let tb_name = self
+                .selected_server
+                .and_then(|i| self.cfg.servers.get(i))
+                .map(|s| s.name.clone())
+                .unwrap_or_else(|| "未选择服务器".to_string());
+            let tb_tab = server_tab_label(self.server_tab);
+            let tb_idx = self.selected_server;
+            let tb_running = tb_idx
+                .and_then(|i| self.runtimes.get(i))
+                .and_then(|rt| rt.proc.as_ref())
+                .map(|p| process::is_running(p))
+                .unwrap_or(false);
+            let mut tb_toggle: Option<usize> = None;
+            let mut tb_refresh = false;
+            let mut tb_save = false;
+            page_toolbar(ui, "").show(
+            |tbf| {
+                tbf.label(RichText::new(tb_name).strong().size(14.0));
+                tbf.label(RichText::new(format!("· {tb_tab}")).weak().small());
+            },
+            |tba| {
+                if tba
+                    .add_sized([84.0, UI_CTL_H], egui::Button::new("💾 保存"))
+                    .on_hover_text("立即把当前配置写入磁盘（平时自动保存）")
+                    .clicked()
+                {
+                    tb_save = true;
+                }
+                if tba
+                    .add_sized([84.0, UI_CTL_H], egui::Button::new("🔄 刷新"))
+                    .on_hover_text("重新读取文件列表与服务器信息")
+                    .clicked()
+                {
+                    tb_refresh = true;
+                }
+                if let Some(i) = tb_idx {
+                    if tba
+                        .add_sized(
+                            [104.0, UI_CTL_H],
+                            egui::Button::new(if tb_running { "⏹ 停止" } else { "▶ 启动" }),
+                        )
+                        .clicked()
+                    {
+                        tb_toggle = Some(i);
+                    }
+                }
+            },
+            );
+            if tb_save {
+                self.save_config();
+                self.set_toast("配置已保存".to_string());
+            }
+            if tb_refresh {
+                if let Some(i) = tb_idx {
+                    self.refresh_file_list(i);
+                    if let Some(sc) = self.cfg.servers.get(i) {
+                        serverinfo::invalidate_cache(&sc.dir);
+                    }
+                }
+                self.set_toast("已刷新".to_string());
+            }
+            if let Some(i) = tb_toggle {
+                if tb_running {
+                    self.stop_server(i);
+                } else {
+                    self.start_server(i);
+                }
+            }
+            ui.add_space(UI_SPACE_Y);
             let Some(idx) = self.selected_server else {
                 ui.centered_and_justified(|ui| {
                     ui.label("在左侧添加或选择一个服务器");
@@ -15097,18 +15561,66 @@ impl App {
     /// 两处合并后 `ServerTab::Status` / `ui_status` 不再存在（审计表 §3.1）。
     /// 日志渲染与滚动仍走 `show_colored_log`（自动贴底、点击聚焦命令输入），未重写。
     fn ui_console(&mut self, ui: &mut egui::Ui, idx: usize) {
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
         let running = self
             .runtimes
             .get(idx)
             .and_then(|r| r.proc.as_ref())
             .map(|p| process::is_running(p))
             .unwrap_or(false);
+        // 统一工具条：左侧运行状态与在线玩家数，右侧主操作（清空输出 / 刷新）
+        let tb_players = self
+            .runtimes
+            .get(idx)
+            .map(|r| r.players_online.len())
+            .unwrap_or(0);
+        let mut tb_clear = false;
+        let mut tb_refresh = false;
+        page_toolbar(ui, "🖥 控制台").show(
+            move |tbf| {
+                tbf.label(
+                    RichText::new(if running { "● 运行中" } else { "○ 已停止" })
+                        .color(if running {
+                            egui::Color32::from_rgb(120, 220, 120)
+                        } else {
+                            egui::Color32::from_rgb(170, 170, 170)
+                        })
+                        .small(),
+                );
+                if running {
+                    tbf.label(RichText::new(format!("· 在线 {tb_players} 人")).weak().small());
+                }
+            },
+            |tba| {
+                if tba
+                    .add_sized([104.0, UI_CTL_H], egui::Button::new("🗑 清空输出"))
+                    .on_hover_text("清空本页输出缓冲（会先弹出二次确认）")
+                    .clicked()
+                {
+                    tb_clear = true;
+                }
+                if tba
+                    .add_sized([84.0, UI_CTL_H], egui::Button::new("🔄 刷新"))
+                    .on_hover_text("重新读取崩溃来源与日志列表")
+                    .clicked()
+                {
+                    tb_refresh = true;
+                }
+            },
+        );
+        if tb_clear {
+            self.confirm_clear_console = Some(idx);
+        }
+        if tb_refresh {
+            let sc = self.cfg.servers[idx].clone();
+            self.runtimes[idx].crash_list = collect_crash_sources(&sc.dir);
+            self.runtimes[idx].crash_analysis = None;
+        }
+        ui.add_space(UI_SPACE_Y);
 
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
         // ---------- 运行状态 + 性能条（原「服务器状态」页的性能段） ----------
-        ui.add_space(6.0);
         ui.label(RichText::new("服务器状态").strong());
         ui.separator();
         if !running {
@@ -16240,10 +16752,10 @@ impl App {
             .auto_shrink([false, false])
             .max_height(scripts_max_h)
             .show(ui, |ui| {
-        ui.add_space(6.0);
-        ui.label(RichText::new("设置").strong());
+        ui.add_space(UI_PAGE_TOP);
+        ui.label(RichText::new("🛠 服务器设置").strong());
         ui.label(
-            RichText::new("启动脚本 / 服务器属性 / Java 与 JVM / 开机自启 / 自动重启 / 崩溃重启")
+            RichText::new("基础 / 启动脚本 / 服务器属性 / Java 与 JVM / 高级")
                 .weak()
                 .small(),
         );
@@ -17488,44 +18000,55 @@ impl App {
             return;
         }
         let dir = self.cfg.servers[idx].dir.clone();
-        ui.add_space(6.0);
-        ui.label(RichText::new("玩家管理").size(15.0).strong());
-        ui.label(RichText::new("在线=日志解析；白名单/封禁/OP=读取服务器 JSON；操作优先命令，服务端未运行时写文件并提示")
-            .weak().small());
+        // 统一工具条：左侧子页签 + 状态，右侧刷新
+        let mut new_ptab: Option<PlayerTab> = None;
+        let status_txt = match self.runtimes[idx].players_state {
+            PlayersState::Ready => "数据就绪 · 每 5 秒自动刷新".to_string(),
+            PlayersState::Refreshing => "正在刷新…".to_string(),
+            PlayersState::Unknown => "状态未知（等待首次刷新）".to_string(),
+        };
+        let mut tb_refresh = false;
+        page_toolbar(ui, "👥 玩家管理").show(
+            |tbf| {
+                for (label, tab) in [
+                    ("🌐 在线", PlayerTab::Online),
+                    ("📜 白名单", PlayerTab::Whitelist),
+                    ("🔨 封禁", PlayerTab::Banned),
+                    ("⭐ OP", PlayerTab::Ops),
+                ] {
+                    let sel = self.runtimes[idx].players_tab == tab;
+                    if tbf.selectable_label(sel, label).clicked() {
+                        new_ptab = Some(tab);
+                    }
+                }
+                tbf.label(RichText::new(&status_txt).weak().small());
+            },
+            |tba| {
+                if tba
+                    .add_sized([84.0, UI_CTL_H], egui::Button::new("🔄 刷新"))
+                    .on_hover_text("立即重新读取名单与在线玩家")
+                    .clicked()
+                {
+                    tb_refresh = true;
+                }
+            },
+        );
+        if let Some(tab) = new_ptab {
+            self.runtimes[idx].players_tab = tab;
+        }
+        if tb_refresh {
+            self.refresh_players_snapshot(idx);
+        }
+        ui.add_space(UI_SPACE_Y);
         if !dir.exists() {
             ui.label(RichText::new("服务器目录不存在，无法读取玩家数据").weak());
+            ui.label(RichText::new("先到「设置 → 概览」确认服务器目录，或重新添加服务器。").weak().small());
             return;
         }
         // 首次进入立即刷新一次
         if self.runtimes[idx].players_snapshot.is_none() && self.runtimes[idx].players_seq == 0 {
             self.refresh_players_snapshot(idx);
         }
-        // 子页签（原「🧬 属性」禁用占位已删除，见 PlayerTab 注释）
-        ui.horizontal(|ui| {
-            let tabs = [
-                ("🌐 在线", PlayerTab::Online),
-                ("📜 白名单", PlayerTab::Whitelist),
-                ("🔨 封禁", PlayerTab::Banned),
-                ("⭐ OP", PlayerTab::Ops),
-            ];
-            for (label, tab) in tabs {
-                let sel = self.runtimes[idx].players_tab == tab;
-                if ui.selectable_label(sel, label).clicked() {
-                    self.runtimes[idx].players_tab = tab;
-                }
-            }
-            ui.separator();
-            if ui.button("🔄 刷新").clicked() {
-                self.refresh_players_snapshot(idx);
-            }
-        });
-        let st = match self.runtimes[idx].players_state {
-            PlayersState::Ready => "数据就绪 · 前台每 5 秒自动刷新".to_string(),
-            PlayersState::Refreshing => "正在刷新…".to_string(),
-            PlayersState::Unknown => "状态未知（等待首次刷新）".to_string(),
-        };
-        ui.label(RichText::new(st).weak().small());
-        ui.separator();
         egui::ScrollArea::vertical()
             .id_salt(("players_scroll", idx))
             .auto_shrink([false, false])
@@ -17801,63 +18324,123 @@ impl App {
 
     fn ui_files(&mut self, ui: &mut egui::Ui, idx: usize) {
         let tabs = ["mods", "config", "logs", "crash-reports", "datapack"];
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            for t in tabs {
-                let selected = self.runtimes[idx].file_tab == t;
-                if ui.selectable_label(selected, t).clicked() {
-                    self.runtimes[idx].file_tab = t.to_string();
-                    // 切换页签即恢复：客户端模组排查标记不跨页签保留（状态不持久化）
-                    self.runtimes[idx].file_mod_suspected.clear();
-                    self.runtimes[idx].file_client_mods_window = false;
-                    self.runtimes[idx].file_client_mods_scanned = false;
-                    self.runtimes[idx].file_client_mods_highlight = false;
-                    self.refresh_file_list(idx);
+        ui.add_space(UI_SPACE_Y);
+        // 统一工具条：左侧页签 + 关键字过滤，右侧主操作
+        let mut new_tab: Option<&'static str> = None;
+        let mut do_refresh = false;
+        let mut want_open_dir = false;
+        page_toolbar(ui, "").show(
+            |tbf| {
+                for t in tabs {
+                    let selected = self.runtimes[idx].file_tab == t;
+                    if tbf.selectable_label(selected, t).clicked() {
+                        new_tab = Some(match t {
+                            "mods" => "mods",
+                            "config" => "config",
+                            "logs" => "logs",
+                            "crash-reports" => "crash-reports",
+                            _ => "datapack",
+                        });
+                    }
                 }
-            }
+                tbf.add_space(4.0);
+                tbf.label("🔍");
+                tbf.add(
+                    TextEdit::singleline(&mut self.runtimes[idx].file_search)
+                        .frame(false)
+                        .hint_text("Search...")
+                        .desired_width(220.0),
+                );
+                if !self.runtimes[idx].file_search.is_empty()
+                    && tbf.small_button("清除").clicked()
+                {
+                    self.runtimes[idx].file_search.clear();
+                }
+            },
+            |tba| {
+                tba.horizontal(|ui| {
+                    if ui
+                        .add_sized([88.0, UI_CTL_H], egui::Button::new("🔄 刷新"))
+                        .on_hover_text("重新读取当前目录")
+                        .clicked()
+                    {
+                        do_refresh = true;
+                    }
+                    if ui
+                        .add_sized([124.0, UI_CTL_H], egui::Button::new("📂 打开当前目录"))
+                        .on_hover_text("在资源管理器中打开当前目录")
+                        .clicked()
+                    {
+                        want_open_dir = true;
+                    }
+                });
+            },
+        );
+        if let Some(t) = new_tab {
+            self.runtimes[idx].file_tab = t.to_string();
+            // 切换页签即恢复：客户端模组排查标记不跨页签保留（状态不持久化）
+            self.runtimes[idx].file_mod_suspected.clear();
+            self.runtimes[idx].file_client_mods_window = false;
+            self.runtimes[idx].file_client_mods_scanned = false;
+            self.runtimes[idx].file_client_mods_highlight = false;
+            self.refresh_file_list(idx);
+        }
+        if do_refresh {
+            self.refresh_file_list(idx);
+        }
+        if want_open_dir {
+            let p = self.file_tab_target(idx);
+            self.open_folder(&p);
+        }
+        // 低频 / 开发者向项（审计表 §4）：默认折叠，收进「高级」
+        advanced_fold(ui, ("files_advanced", idx), |ui| {
             if self.runtimes[idx].file_tab == "mods" {
                 // 测试功能「网络下载」关闭时不渲染「下载模组」入口（避免"按钮在、点了才说没启用"）
                 if features::is_enabled(&self.cfg.features, features::BETA_DOWNLOAD) {
-                // 功能优化：进入模组页即识别该服务端平台 ——
-                // 原版/纯插件端不支持模组，直接把「下载模组」按钮置灰并说明原因；
-                // 模组端则把识别到的加载器/版本记下来，点下载时自动套用。
-                // 平台识别走 3 秒 TTL 缓存（渲染路径，直接 detect 会每帧遍历目录）
-                let pinfo = serverinfo::detect_cached(
-                    &self.cfg.servers[idx].dir,
-                    std::time::Duration::from_secs(3),
-                );
-                let can_mod = pinfo.kind.is_modded();
-                let btn = ui.add_enabled(
-                    can_mod,
-                    egui::Button::new("⬇️ 下载模组").min_size(egui::vec2(96.0, 24.0)),
-                );
-                let btn = if can_mod {
-                    btn.on_hover_text(format!(
-                        "将按 {} 自动选择加载器与 MC 版本",
-                        pinfo.summary()
-                    ))
-                } else {
-                    btn.on_disabled_hover_text(format!(
-                        "当前服务端识别为「{}」，不支持模组（原版/纯插件端）。\n如需模组请改装 Fabric/Forge/NeoForge 服务端。",
-                        pinfo.kind.label()
-                    ))
-                };
-                if btn.clicked() {
-                    if let Some(dl) = self.dl.as_mut() {
-                        dl.mod_project_type = "mod".to_string();
-                        dl.mod_target_use_server = true;
-                        dl.mod_target_dir = self.cfg.servers[idx].dir.display().to_string();
-                        if let Some(loader) = pinfo.kind.modrinth_loader() {
-                            dl.mod_loader = loader.to_string();
-                        }
-                        if let Some(v) = &pinfo.mc_version {
-                            dl.mod_mc_version = v.clone();
-                        }
-                        self.nav = Nav::Download;
+                    // 功能优化：进入模组页即识别该服务端平台 ——
+                    // 原版/纯插件端不支持模组，直接把「下载模组」按钮置灰并说明原因；
+                    // 模组端则把识别到的加载器/版本记下来，点下载时自动套用。
+                    // 平台识别走 3 秒 TTL 缓存（渲染路径，直接 detect 会每帧遍历目录）
+                    let pinfo = serverinfo::detect_cached(
+                        &self.cfg.servers[idx].dir,
+                        std::time::Duration::from_secs(3),
+                    );
+                    let can_mod = pinfo.kind.is_modded();
+                    let btn = ui.add_enabled(
+                        can_mod,
+                        egui::Button::new("⬇️ 下载模组").min_size(egui::vec2(96.0, 24.0)),
+                    );
+                    let btn = if can_mod {
+                        btn.on_hover_text(format!(
+                            "将按 {} 自动选择加载器与 MC 版本",
+                            pinfo.summary()
+                        ))
                     } else {
-                        self.set_toast("下载功能未启用".to_string());
+                        btn.on_disabled_hover_text(format!(
+                            "当前服务端识别为「{}」，不支持模组（原版/纯插件端）。\n如需模组请改装 Fabric/Forge/NeoForge 服务端。",
+                            pinfo.kind.label()
+                        ))
+                    };
+                    if btn.clicked() {
+                        // 目标目录先取出：dl 与 self.cfg 同时借用会冲突（E0502）
+                        let sdir = self.cfg.servers[idx].dir.display().to_string();
+                        let loader = pinfo.kind.modrinth_loader().map(|s| s.to_string());
+                        let mc = pinfo.mc_version.clone();
+                        if let Some(dl) = self.dl.as_mut() {
+                            dl.mod_project_type = "mod".to_string();
+                            dl.mod_target_use_server = true;
+                            dl.mod_target_dir = sdir;
+                            if let Some(loader) = loader {
+                                dl.mod_loader = loader;
+                            }
+                            if let Some(v) = mc {
+                                dl.mod_mc_version = v;
+                            }
+                            self.nav = Nav::Download;
+                        } else {
+                            self.set_toast("下载功能未启用".to_string());
+                        }
                     }
-                }
                 }
                 if ui
                     .button("🔍 排查客户端模组")
@@ -17867,7 +18450,7 @@ impl App {
                     self.runtimes[idx].file_client_mods_window = true;
                     self.runtimes[idx].file_client_mods_scanned = false;
                 }
-                // 模组检查更新（测试功能，默认关闭）：关闭时工具栏不渲染该按钮，每帧按当前配置判断
+                // 模组检查更新（测试功能，默认关闭）：关闭时工具条不渲染该按钮，每帧按当前配置判断
                 if mod_update_ui_enabled(&self.cfg) {
                     let busy = self.runtimes[idx].modupd_busy;
                     if ui
@@ -17881,26 +18464,6 @@ impl App {
                         ui.label(RichText::new(self.runtimes[idx].modupd_progress.clone()).small().weak());
                     }
                 }
-            }
-            ui.separator();
-            if ui.button("🔄 刷新").clicked() {
-                self.refresh_file_list(idx);
-            }
-            if ui.button("📂 打开当前目录").clicked() {
-                let p = self.file_tab_target(idx);
-                self.open_folder(&p);
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label("🔍");
-            ui.add(
-                TextEdit::singleline(&mut self.runtimes[idx].file_search)
-                    .frame(false)
-                    .hint_text("Search...")
-                    .desired_width(260.0),
-            );
-            if !self.runtimes[idx].file_search.is_empty() && ui.button("清除").clicked() {
-                self.runtimes[idx].file_search.clear();
             }
         });
         // mods 页：启用/禁用过滤（沿用页面的 selectable_label 小分段风格），
@@ -18157,7 +18720,7 @@ impl App {
                                             }
                                             if resp.clicked() {
                                                 let target = self.file_tab_target(idx);
-                                                let (sz, fc) = dir_stats(&target.join(name));
+                                                let (sz, fc) = dir_stats_cached(&target.join(name));
                                                 self.runtimes[idx].file_preview = Some((name.clone(), sz, true, fc));
                                             }
                                             if resp.double_clicked() {
@@ -18727,61 +19290,40 @@ impl App {
 
         // 阶段16④：文件删除二次确认（确认后删到回收站，禁止永久删除）
         if let Some(del_name) = self.runtimes[idx].file_delete_confirm.clone() {
-            let mut close = false;
-            let mut do_delete = false;
-            egui::Window::new("删除文件")
-                .resizable(true)
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ui.ctx(), |ui| {
-                    ui.label(RichText::new("确定删除以下文件/目录？").strong());
-                    ui.label(RichText::new(&del_name).color(self.fg(Color32::from_rgb(120, 180, 255))));
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new("删除后将移入系统回收站（可还原），不会永久删除。")
-                            .color(self.fg(Color32::from_rgb(150, 150, 150))),
-                    );
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("取消").clicked() {
-                            close = true;
-                        }
-                        if ui
-                            .button(RichText::new("确认删除").color(self.fg(Color32::from_rgb(230, 110, 110))))
-                            .clicked()
-                        {
-                            do_delete = true;
-                            close = true;
-                        }
-                    });
-                });
-            if close {
-                self.runtimes[idx].file_delete_confirm = None;
-            }
-            if do_delete {
-                let target = self.file_tab_target(idx);
-                let p = target.join(&del_name);
-                match self.delete_to_recycle_bin(&p) {
-                    Ok(()) => {
-                        // 清理关联状态：收藏、预览、当前子目录栈（删除的正是当前目录时退回上级）
-                        self.runtimes[idx].file_favs.retain(|x| x != &del_name);
-                        if let Some((pn, _, _, _)) = &self.runtimes[idx].file_preview {
-                            if pn == &del_name {
-                                self.runtimes[idx].file_preview = None;
+            match confirm_dialog(
+                ui.ctx(),
+                "删除文件",
+                &format!("确定删除「{del_name}」吗？"),
+                "删除后移入系统回收站（可还原），不会永久删除。",
+                "确认删除",
+            ) {
+                ConfirmAction::Cancel => self.runtimes[idx].file_delete_confirm = None,
+                ConfirmAction::Confirm => {
+                    self.runtimes[idx].file_delete_confirm = None;
+                    let target = self.file_tab_target(idx);
+                    let p = target.join(&del_name);
+                    match self.delete_to_recycle_bin(&p) {
+                        Ok(()) => {
+                            // 清理关联状态：收藏、预览、当前子目录栈（删除的正是当前目录时退回上级）
+                            self.runtimes[idx].file_favs.retain(|x| x != &del_name);
+                            if let Some((pn, _, _, _)) = &self.runtimes[idx].file_preview {
+                                if pn == &del_name {
+                                    self.runtimes[idx].file_preview = None;
+                                }
                             }
-                        }
-                        if let Some(top) = self.runtimes[idx].file_sub.last() {
-                            if top == &del_name {
-                                self.runtimes[idx].file_sub.pop();
-                                self.runtimes[idx].file_preview = None;
+                            if let Some(top) = self.runtimes[idx].file_sub.last() {
+                                if top == &del_name {
+                                    self.runtimes[idx].file_sub.pop();
+                                    self.runtimes[idx].file_preview = None;
+                                }
                             }
+                            self.refresh_file_list(idx);
+                            self.set_toast(format!("已删除到回收站：「{del_name}」"));
                         }
-                        self.refresh_file_list(idx);
-                        self.set_toast(format!("已删除到回收站：「{del_name}」"));
+                        Err(e) => self.set_toast(format!("删除失败: {e}")),
                     }
-                    Err(e) => self.set_toast(format!("删除失败: {e}")),
                 }
+                ConfirmAction::None => {}
             }
         }
     }
@@ -18796,9 +19338,65 @@ impl App {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-        ui.add_space(6.0);
+        ui.add_space(UI_PAGE_TOP);
         ui.label(RichText::new("备份").strong());
         ui.separator();
+
+        // 统一工具条：左侧快照概况，右侧主操作（备份 / 清理 / 刷新）
+        let tb_count = self.backup_list_cached(idx).len();
+        let mut tb_backup = false;
+        let mut tb_retention = false;
+        let mut tb_refresh = false;
+        page_toolbar(ui, "").show(
+            move |tbf| {
+                tbf.label(
+                    RichText::new(if tb_count == 0 {
+                        "暂无备份".to_string()
+                    } else {
+                        format!("共 {tb_count} 份备份")
+                    })
+                    .weak()
+                    .small(),
+                );
+            },
+            |tba| {
+                if tba
+                    .add_sized([120.0, UI_CTL_H], egui::Button::new("🔄 刷新列表"))
+                    .on_hover_text("重新读取快照与旧版 zip 列表")
+                    .clicked()
+                {
+                    tb_refresh = true;
+                }
+                if tba
+                    .add_sized([132.0, UI_CTL_H], egui::Button::new("🧹 按策略清理"))
+                    .on_hover_text("按保留策略清理超出部分")
+                    .clicked()
+                {
+                    tb_retention = true;
+                }
+                if tba
+                    .add_sized([124.0, UI_CTL_H], egui::Button::new("🔄 立即备份"))
+                    .on_hover_text("马上生成一份快照（不等待定时器）")
+                    .clicked()
+                {
+                    tb_backup = true;
+                }
+            },
+        );
+        if tb_refresh {
+            self.backup_cache = None;
+            self.backup_stats_cache = None;
+            self.set_toast("已刷新备份列表".to_string());
+        }
+        if tb_retention {
+            self.spawn_retention(idx);
+            self.set_toast("正在后台清理超出保留策略的快照…".to_string());
+        }
+        if tb_backup {
+            self.spawn_backup(idx, backup::BackupReason::Manual, true);
+            self.set_toast("快照已开始在后台生成（完成后提示）".to_string());
+        }
+        ui.add_space(UI_SPACE_Y);
 
         if features::is_enabled(&self.cfg.features, features::BETA_BACKUP) {
             let mut b = sc.backup.clone();
@@ -18984,17 +19582,7 @@ impl App {
                 });
                 }
                 ui.separator();
-        
-                ui.horizontal(|ui| {
-                    if ui.button("🔄 立即备份一次").clicked() {
-                        self.spawn_backup(idx, backup::BackupReason::Manual, true);
-                        self.set_toast("快照已开始在后台生成（完成后提示）".to_string());
-                    }
-                    if ui.button("🧹 立即按保留策略清理").clicked() {
-                        self.spawn_retention(idx);
-                        self.set_toast("正在后台清理超出保留策略的快照…".to_string());
-                    }
-                });
+                // 「立即备份 / 按策略清理」已收进页面顶部工具条（同一动作只保留一处入口）
                 if self.backup_inflight.contains(&idx) {
                     ui.label(RichText::new("🔄 快照进行中").color(self.fg(Color32::from_rgb(255, 200, 80))));
                 }
@@ -19396,6 +19984,30 @@ impl App {
             );
             _inner.set_width(_w);
             let ui = &mut _inner;
+            // 统一工具条：左侧当前二级页与隧道数，右侧刷新
+            let tb_tunnels = self.cfg.tunnels.len();
+            let tb_side = match self.tunnel_side {
+                TunnelSide::Dashboard => "仪表盘",
+                TunnelSide::Create => "创建隧道",
+                TunnelSide::Manage => "隧道管理",
+                TunnelSide::Logs => "隧道日志",
+                TunnelSide::Tutorial => "教程",
+            };
+            page_toolbar(ui, "📡 内网穿透").show(
+                move |tbf| {
+                    tbf.label(RichText::new(format!("{tb_side} · 共 {tb_tunnels} 条隧道")).weak().small());
+                },
+                |tba| {
+                    if tba
+                        .add_sized([84.0, UI_CTL_H], egui::Button::new("🔄 刷新"))
+                        .on_hover_text("立即重绘页面（状态与流量按固定周期刷新）")
+                        .clicked()
+                    {
+                        tba.ctx().request_repaint();
+                    }
+                },
+            );
+            ui.add_space(UI_SPACE_Y);
             egui::ScrollArea::vertical()
                 .id_salt("tunnel_content_scroll")
                 .auto_shrink([false, false])
@@ -19419,9 +20031,6 @@ impl App {
 
     /// 仪表盘：隧道统计 + frpc 状态
     fn ui_tunnel_dashboard(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(6.0);
-        ui.label(RichText::new("内网穿透仪表盘").strong());
-        ui.separator();
         // 隧道统计
         let total = self.cfg.tunnels.len();
         let online = self
@@ -19957,32 +20566,54 @@ impl App {
 
     /// 隧道管理：折叠/展开、信息展示、配置弹窗、删除二次确认、收藏
     fn ui_tunnel_manage(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(6.0);
         // 高亮过期自动清除（从仪表盘双击跳转后高亮约 3 秒）
         if let Some((_, until)) = self.tunnel_highlight {
             if now_secs_f64() > until {
                 self.tunnel_highlight = None;
             }
         }
-        ui.label(RichText::new("隧道管理").strong());
-        ui.separator();
+        // 统一工具条：左侧关键字过滤，右侧主操作（创建隧道 / 刷新）
+        let mut tb_new = false;
+        page_toolbar(ui, "📡 隧道管理").show(
+            |tbf| {
+                tbf.label("🔍");
+                tbf.add(
+                    TextEdit::singleline(&mut self.tunnel_search)
+                        .frame(false)
+                        .hint_text("按备注 / 名称 / 端口过滤")
+                        .desired_width(240.0),
+                );
+                if !self.tunnel_search.is_empty() && tbf.small_button("清除").clicked() {
+                    self.tunnel_search.clear();
+                }
+                let n = self.cfg.tunnels.len();
+                tbf.label(RichText::new(format!("共 {n} 条")).weak().small());
+            },
+            |tba| {
+                if tba
+                    .add_sized([84.0, UI_CTL_H], egui::Button::new("🔄 刷新"))
+                    .on_hover_text("立即重绘页面")
+                    .clicked()
+                {
+                    tba.ctx().request_repaint();
+                }
+                if tba
+                    .add_sized([112.0, UI_CTL_H], egui::Button::new("➕ 创建隧道"))
+                    .on_hover_text("转到创建隧道页")
+                    .clicked()
+                {
+                    tb_new = true;
+                }
+            },
+        );
+        if tb_new {
+            self.tunnel_side = TunnelSide::Create;
+        }
+        ui.add_space(UI_SPACE_Y);
         if self.cfg.tunnels.is_empty() {
-            ui.label("暂无穿透配置，请先在「创建隧道」中添加");
+            ui.label("暂无穿透配置，点上方「➕ 创建隧道」添加一条");
             return;
         }
-        ui.horizontal(|ui| {
-            ui.label("🔍");
-            ui.add(
-                TextEdit::singleline(&mut self.tunnel_search)
-                    .frame(false)
-                    .hint_text("Search...")
-                    .desired_width(240.0),
-            );
-            if !self.tunnel_search.is_empty() && ui.button("清除").clicked() {
-                self.tunnel_search.clear();
-            }
-        });
-        ui.separator();
         // 收藏优先（未收藏保持原有顺序）
         let mut order: Vec<usize> = (0..self.cfg.tunnels.len()).collect();
         order.sort_by_key(|&i| !self.cfg.tunnels[i].favorited);
@@ -20630,35 +21261,20 @@ impl App {
             return;
         }
         let name = self.cfg.tunnels[i].name.clone();
-        let mut close = false;
-        let mut do_delete = false;
-        egui::Window::new("删除隧道")
-                .resizable(true)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.label(format!("确定要删除隧道「{name}」吗？"));
-                ui.label(RichText::new("删除后需重新创建；若隧道正在运行会一并停止。").weak());
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.button("取消").clicked() {
-                        close = true;
-                    }
-                    if ui
-                        .button(RichText::new("确认删除").color(self.fg(Color32::from_rgb(230, 120, 120))))
-                        .clicked()
-                    {
-                        do_delete = true;
-                        close = true;
-                    }
-                });
-            });
-        if close {
-            self.confirm_remove_tunnel = None;
-        }
-        if do_delete {
-            self.remove_tunnel(i);
+        // 统一确认弹窗（取消 / 确认红），删除隧道不再有 Shift 直删后门
+        match confirm_dialog(
+            ctx,
+            "删除隧道",
+            &format!("确定要删除隧道「{name}」吗？"),
+            "删除后需重新创建；若隧道正在运行会一并停止。",
+            "确认删除",
+        ) {
+            ConfirmAction::Cancel => self.confirm_remove_tunnel = None,
+            ConfirmAction::Confirm => {
+                self.confirm_remove_tunnel = None;
+                self.remove_tunnel(i);
+            }
+            ConfirmAction::None => {}
         }
     }
 
@@ -20675,7 +21291,7 @@ impl App {
         }
     }
 
-    /// 清空类操作的二次确认（服务器控制台日志 / 工具日志视图）
+    /// 清空类操作的二次确认（服务器控制台日志 / 工具日志视图 / 日志库）
     fn ui_clear_confirm(&mut self, ctx: &egui::Context) {
         if let Some(idx) = self.confirm_clear_console {
             let name = self
@@ -20684,67 +21300,37 @@ impl App {
                 .get(idx)
                 .map(|s| s.name.clone())
                 .unwrap_or_default();
-            let mut close = false;
-            let mut do_clear = false;
-            egui::Window::new("清空服务器输出日志")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label(format!("确定要清空「{name}」的输出日志吗？"));
-                    ui.label(RichText::new("只清空本页显示缓冲；日志文件保留，但旧内容不会回灌到本页。").weak());
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("取消").clicked() {
-                            close = true;
-                        }
-                        if ui
-                            .button(RichText::new("确认清空").color(self.fg(Color32::from_rgb(230, 120, 120))))
-                            .clicked()
-                        {
-                            do_clear = true;
-                            close = true;
-                        }
-                    });
-                });
-            if close {
-                self.confirm_clear_console = None;
-            }
-            if do_clear {
-                self.clear_server_console(idx);
-                self.set_toast("已清空输出日志缓冲".to_string());
+            match confirm_dialog(
+                ctx,
+                "清空服务器输出日志",
+                &format!("确定要清空「{name}」的输出日志吗？"),
+                "只清空本页显示缓冲；日志文件保留，但旧内容不会回灌到本页。",
+                "确认清空",
+            ) {
+                ConfirmAction::Cancel => self.confirm_clear_console = None,
+                ConfirmAction::Confirm => {
+                    self.confirm_clear_console = None;
+                    self.clear_server_console(idx);
+                    self.set_toast("已清空输出日志缓冲".to_string());
+                }
+                ConfirmAction::None => {}
             }
         }
         if self.confirm_clear_tool_log {
-            let mut close = false;
-            let mut do_clear = false;
-            egui::Window::new("清空日志视图")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label("确定要清空本页的日志显示吗？");
-                    ui.label(RichText::new("只清空本页内存缓冲，data\\tool.log 文件不会被删除；可用「📂 打开日志文件」查看历史。").weak());
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("取消").clicked() {
-                            close = true;
-                        }
-                        if ui
-                            .button(RichText::new("确认清空").color(self.fg(Color32::from_rgb(230, 120, 120))))
-                            .clicked()
-                        {
-                            do_clear = true;
-                            close = true;
-                        }
-                    });
-                });
-            if close {
-                self.confirm_clear_tool_log = false;
-            }
-            if do_clear {
-                toollog::clear();
-                self.set_toast("已清空本页视图（内存缓冲），日志文件未删除".to_string());
+            match confirm_dialog(
+                ctx,
+                "清空日志视图",
+                "确定要清空本页的日志显示吗？",
+                "只清空本页内存缓冲，data\\tool.log 文件不会被删除；可用「📂 打开日志文件」查看历史。",
+                "确认清空",
+            ) {
+                ConfirmAction::Cancel => self.confirm_clear_tool_log = false,
+                ConfirmAction::Confirm => {
+                    self.confirm_clear_tool_log = false;
+                    toollog::clear();
+                    self.set_toast("已清空本页视图（内存缓冲），日志文件未删除".to_string());
+                }
+                ConfirmAction::None => {}
             }
         }
     }
@@ -20939,6 +21525,19 @@ impl App {
         // 圆角轮廓由系统裁剪（含背景图/面板/内容），不是画在界面上的遮罩。
         self.win_r_points = win_r;
         self.apply_window_round_region(ctx, win_r);
+        // 全局间距 / 控件高度：与圆角（theme::apply 的 corner_scale）、字号（下面的
+        // ui_font_scale）同属"界面"统一令牌，在设置 → 界面里各暴露一项；此处每帧写回，
+        // 只覆盖 spacing 的两个字段，不动主题的其它样式。
+        {
+            let sp = self.cfg.ui_item_spacing.clamp(4.0, 16.0);
+            let ch = self.cfg.ui_ctl_h.clamp(20.0, 34.0);
+            let mut style = (*ctx.style()).clone();
+            style.spacing.item_spacing.x = sp;
+            style.spacing.item_spacing.y = (sp * 0.75).max(2.0);
+            style.spacing.interact_size.y = ch;
+            style.spacing.button_padding.y = ((ch - 20.0) * 0.5).max(1.0);
+            ctx.set_style(style);
+        }
         // 界面字号：以启动时系统 DPI 为基线，按 scaled_font(1.0, ui_font_scale) 缩放
         // （统一辅助函数，11.0..=20.0 钳制与字号比例定义集中在 theme::scaled_font）。
         let want_ppp = self.base_ppp * theme::scaled_font(1.0, self.cfg.ui_font_scale);
@@ -21452,6 +22051,28 @@ impl App {
                 }
             });
         }
+        // 全局间距与控件高度（与上面的圆角、字号同属"界面"统一令牌）
+        ui.horizontal(|ui| {
+            ui.label("控件间距:");
+            if ui
+                .add(egui::Slider::new(&mut self.cfg.ui_item_spacing, 4.0..=16.0).fixed_decimals(1).suffix(" px"))
+                .changed()
+            {
+                self.save_config();
+            }
+            ui.label(RichText::new("工具条与卡片内控件之间的横向间距").weak().small());
+        });
+        ui.horizontal(|ui| {
+            ui.label("控件高度:");
+            if ui
+                .add(egui::Slider::new(&mut self.cfg.ui_ctl_h, 20.0..=34.0).fixed_decimals(1).suffix(" px"))
+                .changed()
+            {
+                self.save_config();
+            }
+            ui.label(RichText::new("按钮与输入框的统一高度（工具条上两者同高）").weak().small());
+        });
+        ui.label(RichText::new(HINT_SHORTCUT_SHOT).weak().small());
         // F1：窗口位置/大小记忆的重置入口。
         // 记忆功能一旦把「巨大尺寸」写进配置，用户需要一条明确的退路
         // （也方便切显示器/拔掉显示器后把窗口找回来）。
@@ -21586,27 +22207,48 @@ impl App {
             );
             _inner.set_width(_w);
             let ui = &mut _inner;
+            // 统一工具条：左侧关键字搜索（命中会提示跳转分组），右侧保存配置
+            let mut settings_q = self.settings_search.clone();
+            let mut tb_clear = false;
+            let mut tb_save = false;
+            page_toolbar(ui, "⚙ 设置").show(
+                |tbf| {
+                    tbf.label("🔍");
+                    tbf.add(
+                        TextEdit::singleline(&mut settings_q)
+                            .frame(false)
+                            .hint_text("搜索设置项，如 JVM / 通知 / 主题")
+                            .desired_width(260.0),
+                    );
+                    if !settings_q.is_empty() && tbf.small_button("清除").clicked() {
+                        tb_clear = true;
+                    }
+                },
+                |tba| {
+                    if tba
+                        .add_sized([110.0, UI_CTL_H], egui::Button::new("💾 保存配置"))
+                        .on_hover_text("把当前配置立即写入磁盘")
+                        .clicked()
+                    {
+                        tb_save = true;
+                    }
+                },
+            );
+            if tb_clear {
+                settings_q.clear();
+            }
+            self.settings_search = settings_q.clone();
+            if tb_save {
+                self.save_config();
+                self.set_toast("设置已保存".to_string());
+            }
+            ui.add_space(UI_SPACE_Y);
             egui::ScrollArea::vertical()
                 .id_salt("settings_scroll")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     // 平滑动画统一由「切换动效」总开关控制（原先设置页另有一个开关，已合并）
                     let use_anim = self.cfg.ui_animations;
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        ui.label("🔍");
-                        ui.add(
-                            TextEdit::singleline(&mut self.settings_search)
-                                .frame(false)
-                                .hint_text("Search...")
-                                .desired_width(260.0),
-                        );
-                        if !self.settings_search.is_empty() && ui.button("清除").clicked() {
-                            self.settings_search.clear();
-                        }
-                    });
-                    ui.label(RichText::new("设置").strong());
-                    ui.separator();
                     let q_search = self.settings_search.trim().to_lowercase();
                     if !q_search.is_empty() {
                         // ★ 同上：与 `SettingsSide` 变体一一对应
@@ -21621,7 +22263,7 @@ impl App {
                         .filter(|side| {
                             let kw: &[&str] = match side {
                                 SettingsSide::General => {
-                                    &["通用", "关闭行为", "托盘", "最小化", "自启", "注册表", "数据", "defender", "排除", "病毒"]
+                                    &["通用", "关闭行为", "托盘", "最小化", "自启", "注册表", "数据", "defender", "排除", "病毒", "高级", "术语", "翻译"]
                                 }
                                 SettingsSide::Ui => {
                                     &["界面", "语言", "中文", "english", "动效", "动画", "速度"]
@@ -21706,72 +22348,197 @@ impl App {
                             self.settings_sections = sections;
 
                             let sections = std::mem::take(&mut self.settings_sections);
-                            // 高级（审计表 §4）：与导航底部「💾 保存配置」重复，默认折叠
-                            let sections = Self::setting_section(ctx, ui, sections, "data", "数据与配置", None, false, use_anim, self.cfg.anim_speed, |ui| {
-                                ui.label(format!("配置文件: {}", self.config_path.display()));
-                                ui.horizontal(|ui| {
-                                    if ui.button("💾 保存全部设置").clicked() {
-                                        self.save_config();
-                                        self.set_toast("设置已保存".to_string());
-                                    }
-                                });
+                            // 高级（审计表 §4）：数据与配置 / 翻译术语 / Windows Defender 统一收进这里，
+                            // 默认折叠。危险与低频项集中一处，主路径只留常用分组。
+                            // 落盘放在分组之外：折叠时组内控件不绘制，前面分组的改动仍要保存。
+                            let b_data = self.config_path.display().to_string();
+                            let b_data_dir = self.data_dir().display().to_string();
+                            let mut b_save_all = false;
+                            let mut b_def_excl = false;
+                            let mut b_def_disable = false;
+                            let mut b_def_open = false;
+                            let mut b_glossary = std::mem::take(&mut self.cfg.translate_glossary);
+                            let mut b_g_query = std::mem::take(&mut self.glossary_query);
+                            let mut b_g_import = false;
+                            let mut b_g_export = false;
+                            let mut b_g_remove: Option<usize> = None;
+                            let mut b_g_add = false;
+                            let mut b_g_clear = false;
+                            let mut b_g_edited = false;
+                            let sections = Self::setting_section(ctx, ui, sections, "advanced", "高级", Some("低频 / 开发者向项"), false, use_anim, self.cfg.anim_speed, |ui| {
+                                egui::CollapsingHeader::new(RichText::new("数据与配置").strong())
+                                    .id_salt("adv_data")
+                                    .default_open(true)
+                                    .show(ui, |ui| {
+                                        ui.label(RichText::new(format!("配置文件: {b_data}")).weak().small());
+                                        if ui.button("💾 保存全部设置").clicked() {
+                                            b_save_all = true;
+                                        }
+                                    });
+                                egui::CollapsingHeader::new(RichText::new("翻译术语").strong())
+                                    .id_salt("adv_glossary")
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        ui.label(RichText::new("模组简介与更新日志翻译时按你的译法处理（长词优先匹配）").weak().small());
+                                        ui.horizontal(|ui| {
+                                            if ui.button("📥 导入…").on_hover_text("从 JSON 文件导入词条（追加合并）").clicked() {
+                                                b_g_import = true;
+                                            }
+                                            if ui.button("📤 导出…").clicked() {
+                                                b_g_export = true;
+                                            }
+                                            ui.label("搜索");
+                                            ui.add(egui::TextEdit::singleline(&mut b_g_query).hint_text("筛选词条…").desired_width(160.0));
+                                        });
+                                        let gq = b_g_query.trim().to_lowercase();
+                                        for i in 0..b_glossary.len() {
+                                            if !gq.is_empty() {
+                                                let (a, b) = &b_glossary[i];
+                                                if !a.to_lowercase().contains(&gq) && !b.to_lowercase().contains(&gq) {
+                                                    continue;
+                                                }
+                                            }
+                                            ui.horizontal(|ui| {
+                                                let (mut a, mut b) = b_glossary[i].clone();
+                                                let ra = ui.add(
+                                                    egui::TextEdit::singleline(&mut a)
+                                                        .hint_text("原文，如 Create")
+                                                        .desired_width(200.0),
+                                                );
+                                                ui.label("→");
+                                                let rb = ui.add(
+                                                    egui::TextEdit::singleline(&mut b)
+                                                        .hint_text("译法，如 机械动力")
+                                                        .desired_width(200.0),
+                                                );
+                                                if ui.button("🗑").on_hover_text("删除该词条").clicked() {
+                                                    b_g_remove = Some(i);
+                                                }
+                                                if ra.changed() || rb.changed() {
+                                                    b_glossary[i] = (a, b);
+                                                    b_g_edited = true;
+                                                }
+                                            });
+                                        }
+                                        if let Some(i) = b_g_remove {
+                                            if i < b_glossary.len() {
+                                                b_glossary.remove(i);
+                                                b_g_edited = true;
+                                            }
+                                        }
+                                        ui.horizontal(|ui| {
+                                            if ui.button("➕ 添加词条").clicked() {
+                                                b_g_add = true;
+                                            }
+                                            if !b_glossary.is_empty() && ui.button("清空").clicked() {
+                                                b_g_clear = true;
+                                            }
+                                        });
+                                    });
+                                egui::CollapsingHeader::new(RichText::new("Windows Defender").strong())
+                                    .id_salt("adv_defender")
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        ui.label(RichText::new(format!(
+                                            "XMST 数据目录: {b_data_dir}（备份日志可能被 Defender 误报，可加入排除项）"
+                                        )).weak().small());
+                                        ui.horizontal(|ui| {
+                                            if ui.button("🛡 仅排除 XMST 数据目录（推荐）").clicked() {
+                                                b_def_excl = true;
+                                            }
+                                            if ui
+                                                .button(RichText::new("⚠ 完全禁用 Defender 实时保护（风险）").color(self.fg(Color32::from_rgb(230, 120, 120))))
+                                                .clicked()
+                                            {
+                                                b_def_disable = true;
+                                            }
+                                            if ui.button("打开 Windows 安全中心").clicked() {
+                                                b_def_open = true;
+                                            }
+                                        });
+                                        ui.label(RichText::new("会关闭系统实时病毒防护，仅建议在离线或封闭内网使用").small().color(self.fg(Color32::from_rgb(230, 120, 120))));
+                                    });
                             });
                             self.settings_sections = sections;
-
-                            let sections = std::mem::take(&mut self.settings_sections);
-                            // 危险系统级操作（审计表 §4）：默认折叠，展开后才可能点到禁用按钮
-                            let sections = Self::setting_section(ctx, ui, sections, "defender", "Windows Defender", None, false, use_anim, self.cfg.anim_speed, |ui| {
-                                ui.label(format!(
-                                    "XMST 数据目录: {}（备份日志可能被 Defender 误报，可加入排除项）",
-                                    self.data_dir().display()
-                                ));
-                                ui.horizontal(|ui| {
-                                    if ui.button("🛡 仅排除 XMST 数据目录（推荐）").clicked() {
-                                        let data = self.data_dir();
-                                        let script = format!(
-                                            "Add-MpPreference -ExclusionPath '{}'",
-                                            data.to_string_lossy().replace('\'', "''")
-                                        );
-                                        match run_powershell(&script) {
-                                            Ok(_) => self.set_toast("已添加 Defender 排除项（推荐方案）".to_string()),
-                                            Err(e) => self.set_toast(format!(
-                                                "添加排除项失败: {e}\n请在弹出的 UAC 授权窗口点击「是」后重试；若仍失败，请以管理员身份运行 XMST，或在管理员 PowerShell 中手动执行\n{}",
-                                                script
-                                            )),
+                            self.cfg.translate_glossary = std::mem::take(&mut b_glossary);
+                            self.glossary_query = std::mem::take(&mut b_g_query);
+                            if b_save_all {
+                                self.save_config();
+                                self.set_toast("设置已保存".to_string());
+                            }
+                            if b_def_excl {
+                                let script = format!(
+                                    "Add-MpPreference -ExclusionPath '{}'",
+                                    b_data_dir.replace('\'', "''")
+                                );
+                                match run_powershell(&script) {
+                                    Ok(_) => self.set_toast("已添加 Defender 排除项（推荐方案）".to_string()),
+                                    Err(e) => self.set_toast(format!(
+                                        "添加排除项失败: {e}\n请在弹出的 UAC 授权窗口点击「是」后重试；若仍失败，请以管理员身份运行 XMST，或在管理员 PowerShell 中手动执行\n{}",
+                                        script
+                                    )),
+                                }
+                            }
+                            if b_def_disable {
+                                self.confirm_defender_disable = true;
+                            }
+                            if b_def_open {
+                                // explorer.exe 打开 URI 比 cmd start windowsdefender: 更稳（避免弹错误框）
+                                let opened = std::process::Command::new("explorer.exe")
+                                    .arg("windowsdefender:")
+                                    .current_dir(sane_cwd()).spawn()
+                                    .map(|_| true)
+                                    .unwrap_or(false);
+                                if !opened {
+                                    use std::os::windows::process::CommandExt;
+                                    let _ = std::process::Command::new("cmd")
+                                        .args(["/C", "start", "", "ms-settings:windowsdefender"])
+                                        .current_dir(sane_cwd()).creation_flags(0x0800_0000).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+                                        .spawn();
+                                }
+                            }
+                            if b_g_import {
+                                if let Some(p) = rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file() {
+                                    if let Ok(s) = std::fs::read_to_string(&p) {
+                                        match serde_json::from_str::<Vec<(String, String)>>(&s) {
+                                            Ok(v) => {
+                                                let mut add = 0;
+                                                for (a, b) in v {
+                                                    if !a.trim().is_empty() && !self.cfg.translate_glossary.iter().any(|(x, _)| x == &a) {
+                                                        self.cfg.translate_glossary.push((a, b));
+                                                        add += 1;
+                                                    }
+                                                }
+                                                self.save_config();
+                                                self.set_toast(format!("已导入 {add} 条词条"));
+                                            }
+                                            Err(e) => self.set_toast(format!("导入失败：JSON 应为 [[\"原文\",\"译法\"], …]（{e}）")),
                                         }
                                     }
-                                    // 高风险操作：与其它按钮同一行、同一高度对齐；
-                                    // 只用红色文字表达风险，不再套一个突兀的红框（反馈）。
-                                    let risk_red = self.fg(Color32::from_rgb(230, 120, 120));
-                                    // 三个按钮统一用默认按钮尺寸（此前两个大按钮 add_sized 显得"一小两大"）
-                                    if ui
-                                        .button(
-                                            RichText::new("⚠ 完全禁用 Defender 实时保护（风险）")
-                                                .color(risk_red),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.confirm_defender_disable = true;
+                                }
+                            }
+                            if b_g_export {
+                                if let Some(p) = rfd::FileDialog::new().set_file_name("xmst_glossary.json").save_file() {
+                                    match serde_json::to_string_pretty(&self.cfg.translate_glossary) {
+                                        Ok(s) => match std::fs::write(&p, s) {
+                                            Ok(_) => self.set_toast(format!("已导出到 {}", p.display())),
+                                            Err(e) => self.set_toast(format!("导出失败：{e}")),
+                                        },
+                                        Err(e) => self.set_toast(format!("序列化失败：{e}")),
                                     }
-                                    if ui.button("打开 Windows 安全中心").clicked() {
-                                        // explorer.exe 打开 URI 比 cmd start windowsdefender: 更稳（修复弹错误框）
-                                        let opened = std::process::Command::new("explorer.exe")
-                                            .arg("windowsdefender:")
-                                            .current_dir(sane_cwd()).spawn()
-                                            .map(|_| true)
-                                            .unwrap_or(false);
-                                        if !opened {
-                                            use std::os::windows::process::CommandExt;
-                                            let _ = std::process::Command::new("cmd")
-                                                .args(["/C", "start", "", "ms-settings:windowsdefender"])
-                                                .current_dir(sane_cwd()).creation_flags(0x0800_0000).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-                                                .spawn();
-                                        }
-                                    }
-                                });
-                                ui.label(RichText::new("会关闭系统实时病毒防护，仅建议在离线或封闭内网使用").small().color(self.fg(Color32::from_rgb(230, 120, 120))));
-                            });
-                            self.settings_sections = sections;
+                                }
+                            }
+                            if b_g_add {
+                                self.cfg.translate_glossary.push((String::new(), String::new()));
+                                b_g_edited = true;
+                            }
+                            if b_g_clear {
+                                self.cfg.translate_glossary.clear();
+                                b_g_edited = true;
+                            }
+                            if b_g_edited {
+                                self.save_config();
+                            }
                         }
                         SettingsSide::Ui => {
                             let sections = std::mem::take(&mut self.settings_sections);
@@ -22802,59 +23569,59 @@ const MATERIAL_OWNER_FALLBACK: &str = "xmst-frosted-glass-demo";
                 );
                 _inner.set_width(_w);
                 let ui = &mut _inner;
+                // 统一工具条：左侧插件目录与背景状态，右侧主操作（重新扫描 / 导入）
+                let tb_bg_txt = if bg_now == plugins::BgStyle::Default {
+                    "背景效果：默认".to_string()
+                } else {
+                    format!(
+                        "背景效果：{}（{:.0}%）",
+                        bg_now.label(),
+                        bg_now_opacity * 100.0
+                    )
+                };
+                let mut tb_scan = false;
+                let mut tb_import = false;
+                page_toolbar(ui, "🧩 插件").show(
+                    |tbf| {
+                        tbf.label(RichText::new("插件目录").weak().small());
+                        tbf.label(RichText::new(plugins_dir.as_str()).monospace().small());
+                        tbf.label(RichText::new("｜").weak());
+                        tbf.label(RichText::new(&tb_bg_txt).weak().small());
+                    },
+                    |tba| {
+                        if tba
+                            .add_sized([128.0, UI_CTL_H], egui::Button::new("📥 导入插件"))
+                            .on_hover_text("选择插件 zip 导入到插件目录")
+                            .clicked()
+                        {
+                            tb_import = true;
+                        }
+                        if tba
+                            .add_sized([128.0, UI_CTL_H], egui::Button::new("🔄 重新扫描"))
+                            .on_hover_text("重新加载插件目录下的全部插件")
+                            .clicked()
+                        {
+                            tb_scan = true;
+                        }
+                    },
+                );
+                if tb_scan {
+                    if let Some(pm) = self.plugins.as_mut() {
+                        let _ = pm.reload_all();
+                    }
+                }
+                if tb_import {
+                    if let Some(p) = rfd::FileDialog::new()
+                        .add_filter("zip", &["zip"])
+                        .pick_file()
+                    {
+                        self.import_plugin_zip(&p);
+                    }
+                }
+                ui.add_space(UI_SPACE_Y);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            ui.heading("插件系统");
-                        });
-                        ui.label(
-                            RichText::new("插件目录：")
-                                .color(self.fg(Color32::from_rgb(150, 150, 150)))
-                                .monospace(),
-                        );
-                        ui.label(
-                            RichText::new(plugins_dir.as_str())
-                                .monospace()
-                                .color(self.fg(Color32::from_rgb(180, 180, 180))),
-                        );
-                        ui.separator();
-                        // 工具栏：重新扫描 / 当前背景状态
-                        ui.horizontal(|ui| {
-                            if ui.button("重新扫描插件目录").clicked() {
-                                if let Some(pm) = self.plugins.as_mut() {
-                                    let _ = pm.reload_all();
-                                }
-                            }
-                            if ui.button("📥 导入插件").clicked() {
-                                if let Some(p) = rfd::FileDialog::new()
-                                    .add_filter("zip", &["zip"])
-                                    .pick_file()
-                                {
-                                    self.import_plugin_zip(&p);
-                                }
-                            }
-                            let bg_txt = if bg_now == plugins::BgStyle::Default {
-                                "背景效果：默认".to_string()
-                            } else {
-                                format!(
-                                    "背景效果：{}（不透明度 {:.0}%）",
-                                    bg_now.label(),
-                                    bg_now_opacity * 100.0
-                                )
-                            };
-                            ui.label(
-                                RichText::new(bg_txt).color(if bg_now == plugins::BgStyle::Default {
-                                    self.fg(Color32::from_rgb(150, 150, 150))
-                                } else {
-                                    self.fg(Color32::from_rgb(120, 200, 160))
-                                }),
-                            );
-                            // 背景效果配置入口位于每张插件卡片的「配置」区（单插件配置），
-                            // 不再放这里的总设置工具栏。
-                        });
-                        ui.separator();
                         // 插件列表（卡片式：名称 + 状态徽章 + 描述 + 操作右对齐）
                         let mut toggle: Option<(String, bool)> = None;
                         let mut unload_name: Option<String> = None;
@@ -23503,7 +24270,8 @@ impl App {
             format!("下载开始：{file_name}（{kind_label} {version}）"),
         );
         std::thread::spawn(move || {
-            let client = download::new_client();
+            // 大文件专用客户端（连接 + 空闲超时，无总时长上限）
+            let client = download::new_download_client();
             let res = download::download_file_parallel(&client, &url, &dest, 0, &mut |d, t, ph| {
                 if let Ok(mut g) = shared.lock() {
                     g.downloaded = d;
@@ -23591,6 +24359,8 @@ impl App {
         self.runtimes.push(ServerRuntime::default());
         self.selected_server = Some(self.cfg.servers.len() - 1);
         self.save_config();
+        // 成就统计：服务器数量峰值（判定与通知走统一入口）
+        self.stats_event_server_count();
         toollog::tool_log(
             toollog::ToolLevel::Info,
             "下载",
@@ -23777,10 +24547,12 @@ impl App {
         }
         let mut wake = false;
         let mut toasts: Vec<String> = Vec::new();
+        // 本帧的成就统计事件（dl 借用期间不能回调 self，循环结束后统一投递）
+        let mut stat_events: Vec<(stats::StatKind, u64)> = Vec::new();
         // 图标解码结果（块内只解码不碰 self.egui_ctx，避免与 dl 借用冲突）
         let mut icon_ready: Vec<(String, egui::ColorImage)> = Vec::new();
         {
-            let dl = self.dl.as_mut().unwrap();
+            let Some(dl) = self.dl.as_mut() else { return };
             // custom download callback（图1 自定义下载标签页）
             if let Some(shared) = dl.custom_shared.take() {
                 let snap = shared.lock().map(|g| g.clone()).unwrap_or_default();
@@ -23810,15 +24582,19 @@ impl App {
                                 format!("下载失败：{}（{e}）", dl.custom_file_name)
                             },
                         ),
-                        None => toollog::tool_log(
-                            toollog::ToolLevel::Info,
-                            "下载",
-                            format!(
-                                "下载完成：{}（{}）",
-                                dl.custom_file_name,
-                                fmt_size(dl.custom_progress.downloaded)
-                            ),
-                        ),
+                        None => {
+                            // 成就统计：自定义下载成功
+                            stat_events.push((stats::StatKind::Downloads, 1));
+                            toollog::tool_log(
+                                toollog::ToolLevel::Info,
+                                "下载",
+                                format!(
+                                    "下载完成：{}（{}）",
+                                    dl.custom_file_name,
+                                    fmt_size(dl.custom_progress.downloaded)
+                                ),
+                            )
+                        }
                     }
                 } else {
                     dl.custom_shared = Some(shared);
@@ -23848,15 +24624,20 @@ impl App {
                                 format!("下载失败：{}（{e}）", dl.mod_download_name)
                             },
                         ),
-                        None => toollog::tool_log(
-                            toollog::ToolLevel::Info,
-                            "下载",
-                            format!(
-                                "下载完成：{}（{}）",
-                                dl.mod_download_name,
-                                fmt_size(dl.mod_dl_progress.downloaded)
-                            ),
-                        ),
+                        None => {
+                            // 成就统计：下载成功 + 安装一个模组（模组 / 插件 / 数据包走同一入口）
+                            stat_events.push((stats::StatKind::Downloads, 1));
+                            stat_events.push((stats::StatKind::Mods, 1));
+                            toollog::tool_log(
+                                toollog::ToolLevel::Info,
+                                "下载",
+                                format!(
+                                    "下载完成：{}（{}）",
+                                    dl.mod_download_name,
+                                    fmt_size(dl.mod_dl_progress.downloaded)
+                                ),
+                            )
+                        }
                     }
                 } else {
                     dl.mod_dl_shared = Some(shared);
@@ -24082,11 +24863,17 @@ impl App {
             let tex = self
                 .egui_ctx
                 .load_texture(&name, img, egui::TextureOptions::LINEAR);
-            self.dl.as_mut().unwrap().mod_icon_tex.insert(id, tex);
+            if let Some(dl) = self.dl.as_mut() {
+                dl.mod_icon_tex.insert(id, tex);
+            }
             wake = true;
         }
         for t in toasts {
             self.set_toast(t);
+        }
+        // 统一投递本帧收集的成就统计事件
+        for (kind, n) in stat_events {
+            self.stats_event(kind, n);
         }
         if wake {
             // 下载完成唤醒一次 repaint（托盘态不轮询进度，仅此一次）
@@ -24097,7 +24884,7 @@ impl App {
     /// 启动自定义下载线程（图1 自定义下载标签页：任意 URL → 保存目录）
     fn dl_start_custom_download(&mut self) {
         let (url, dest_dir, file_name, threads) = {
-            let dl = self.dl.as_mut().unwrap();
+            let Some(dl) = self.dl.as_mut() else { return };
             (
                 dl.custom_url.trim().to_string(),
                 dl.custom_dest_dir.trim().to_string(),
@@ -24111,7 +24898,7 @@ impl App {
         let threads = threads.trim().parse::<u64>().unwrap_or(0);
         let shared = std::sync::Arc::new(std::sync::Mutex::new(download::DlProgress::default()));
         {
-            let dl = self.dl.as_mut().unwrap();
+            let Some(dl) = self.dl.as_mut() else { return };
             dl.custom_busy = true;
             dl.custom_progress = download::DlProgress::default();
             dl.custom_shared = Some(std::sync::Arc::clone(&shared));
@@ -24125,7 +24912,8 @@ impl App {
             "下载",
             format!("下载开始：{file_name}（线程数 {}）", threads),
         );
-        let client = download::new_client();
+        // 大文件专用客户端：只设连接 + 空闲超时，下载总时长不受限
+        let client = download::new_download_client();
         let dest = std::path::PathBuf::from(&dest_dir).join(&file_name);
         std::thread::spawn(move || {
             let result = download::download_file_parallel(&client, &url, &dest, threads, &mut |d, t, p| {
@@ -24150,9 +24938,13 @@ impl App {
 
     /// 启动模组下载线程（jar 落服务器 mods/ 目录）
     fn dl_start_mod_download(&mut self) {
-        let (url, dest_path) = {
-            let dl = self.dl.as_mut().unwrap();
-            (dl.mod_download_target.clone(), dl.mod_download_name.clone())
+        let (url, dest_path, exp_size) = {
+            let Some(dl) = self.dl.as_mut() else { return };
+            (
+                dl.mod_download_target.clone(),
+                dl.mod_download_name.clone(),
+                dl.mod_download_size,
+            )
         };
         if url.is_empty() || dest_path.is_empty() {
             return;
@@ -24160,7 +24952,7 @@ impl App {
         let dest = std::path::PathBuf::from(&dest_path);
         let shared = std::sync::Arc::new(std::sync::Mutex::new(download::DlProgress::default()));
         {
-            let dl = self.dl.as_mut().unwrap();
+            let Some(dl) = self.dl.as_mut() else { return };
             dl.mod_dl_busy = true;
             dl.mod_dl_progress = download::DlProgress::default();
             dl.mod_dl_shared = Some(std::sync::Arc::clone(&shared));
@@ -24175,9 +24967,18 @@ impl App {
                 format!("下载开始：模组 {name}"),
             );
         }
-        let client = download::new_client();
+        // 大文件专用客户端（连接 + 空闲超时，无总时长上限）；
+        // 走 verified 入口：Modrinth 给出的期望字节数在这里核对，仍先写 .part 再校验改名
+        let client = download::new_download_client();
         std::thread::spawn(move || {
-            let result = download::download_file_parallel(&client, &url, &dest, 0, &mut |d, t, p| {
+            let result = download::download_file_parallel_verified(
+                &client,
+                &url,
+                &dest,
+                0,
+                exp_size,
+                None,
+                &mut |d, t, p| {
                 if let Ok(mut g) = shared.lock() {
                     g.downloaded = d;
                     g.total = t;
@@ -24226,12 +25027,53 @@ impl App {
                 );
                 _inner.set_width(_w);
                 let ui = &mut _inner;
+                // 统一工具条：左侧模组社区关键字（回车或「搜索」触发），右侧主操作
+                let mut tb_q = self.dl.as_ref().map(|d| d.mod_query.clone()).unwrap_or_default();
+                let tb_busy = self
+                    .dl
+                    .as_ref()
+                    .map(|d| d.mod_search_busy)
+                    .unwrap_or(false);
+                let mut tb_go = std::cell::Cell::new(false);
+                page_toolbar(ui, "⬇️ 下载").show(
+                    |tbf| {
+                        tbf.label("🔍");
+                        let resp = tbf.add(
+                            TextEdit::singleline(&mut tb_q)
+                                .frame(false)
+                                .hint_text("搜索 Modrinth 模组 / 插件 / 数据包")
+                                .desired_width(300.0),
+                        );
+                        if resp.lost_focus() && tbf.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            tb_go.set(true);
+                        }
+                        if tb_busy {
+                            tbf.spinner();
+                        }
+                    },
+                    |tba| {
+                        if tba
+                            .add_sized([84.0, UI_CTL_H], egui::Button::new("🔍 搜索"))
+                            .on_hover_text("按关键词搜索社区项目")
+                            .clicked()
+                        {
+                            tb_go.set(true);
+                        }
+                    },
+                );
+                if let Some(d) = self.dl.as_mut() {
+                    d.mod_query = tb_q;
+                }
+                if tb_go.get() {
+                    if let Some(d) = self.dl.as_mut() {
+                        d.mod_page = 0;
+                    }
+                    self.dl_mod_search_start();
+                }
+                ui.add_space(UI_SPACE_Y);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.add_space(8.0);
-                        ui.heading("下载");
-                        ui.separator();
                         self.ui_dl_custom(ui);
                         ui.separator();
                         self.ui_dl_modrinth(ui);
@@ -24252,8 +25094,9 @@ impl App {
     /// 图1「自定义下载」标签页：URL + 文件名 + 保存目录 + 线程数 + 开始下载
     fn ui_dl_custom_tab(&mut self, ui: &mut egui::Ui) {
         let is_light = self.theme_is_light();
-                    let fg = |c: egui::Color32| if is_light { theme::light_adapt(c) } else { c };
-        let dl = self.dl.as_mut().unwrap();
+        // 明暗适配统一走 uifg（与工具条共用同一套换算）
+        let fg = |c: egui::Color32| uifg(is_light, c);
+        let Some(dl) = self.dl.as_mut() else { return };
         // 两列网格表单（行1：下载地址|文件名；行2：保存目录|线程数）
         egui::Grid::new("dl_custom_form_grid")
             .num_columns(4)
@@ -24359,11 +25202,14 @@ impl App {
                     ("插件", ModCommunityNav::Plugin),
                     ("数据包", ModCommunityNav::Datapack),
                 ];
-                let cur = self.dl.as_ref().unwrap().mod_nav;
+                let cur = match self.dl.as_ref() {
+                    Some(d) => d.mod_nav,
+                    None => ModCommunityNav::Mod,
+                };
                 for (label, val) in nav_items {
                     let sel = cur == *val;
                     if ui.selectable_label(sel, *label).clicked() {
-                        let d = self.dl.as_mut().unwrap();
+                        let Some(d) = self.dl.as_mut() else { return };
                         d.mod_nav = *val;
                         d.mod_project_type = val.project_type().to_string();
                         d.mod_results.clear();
@@ -24392,15 +25238,15 @@ impl App {
                 ui.add_space(8.0);
                 let sel = cur == ModCommunityNav::Favorites;
                 if ui.selectable_label(sel, "收藏栏").clicked() {
-                    let d = self.dl.as_mut().unwrap();
+                    let Some(d) = self.dl.as_mut() else { return };
                     d.mod_nav = ModCommunityNav::Favorites;
                     d.mod_project_type = "".to_string();
                     d.mod_results.clear();
                 }
             });
         ui.separator();
-        match self.dl.as_ref().unwrap().mod_nav {
-            ModCommunityNav::Favorites => {
+        match self.dl.as_ref().map(|d| d.mod_nav) {
+            Some(ModCommunityNav::Favorites) => {
                 self.ui_dl_favorites(ui);
             }
             _ => {
@@ -24413,20 +25259,25 @@ impl App {
     /// 收藏夹页（图2：收藏的模组卡片列表）
     fn ui_dl_favorites(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
+        // 一次性取出收藏相关的四个状态，渲染期间不再逐个 as_ref().unwrap()
+        let (fav_busy, fav_err, fav_detail_open) = match self.dl.as_ref() {
+            Some(d) => (d.mod_fav_busy, d.mod_fav_error.clone(), d.mod_detail_id.is_some()),
+            None => (false, None, false),
+        };
         ui.horizontal(|ui| {
             ui.label(RichText::new("收藏夹").strong().size(18.0));
             if ui.button("刷新").clicked() {
                 self.dl_fav_load_start();
             }
-            if self.dl.as_ref().unwrap().mod_fav_busy {
+            if fav_busy {
                 ui.spinner();
             }
         });
-        if let Some(e) = &self.dl.as_ref().unwrap().mod_fav_error {
+        if let Some(e) = &fav_err {
             ui.colored_label(self.fg(Color32::from_rgb(220, 80, 80)), format!("加载失败: {e}"));
         }
         let favs = self.cfg.mod_favorites.clone();
-        if favs.is_empty() && !self.dl.as_ref().unwrap().mod_fav_busy {
+        if favs.is_empty() && !fav_busy {
             ui.add_space(8.0);
             ui.label(
                 RichText::new("暂无收藏。在模组 / 插件 / 数据包社区卡片上点 ☆ 即可收藏。")
@@ -24442,14 +25293,18 @@ impl App {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 // 详情展开面板（版本选择）
-                if self.dl.as_ref().unwrap().mod_detail_id.is_some() {
+                if fav_detail_open {
                     self.ui_mod_detail_header(ui);
                     ui.separator();
                     self.ui_mod_detail_body(ui);
                     ui.separator();
                 }
-                let hits = self.dl.as_ref().unwrap().mod_fav_hits.clone();
-                if hits.is_empty() && !self.dl.as_ref().unwrap().mod_fav_busy {
+                let hits = self
+                    .dl
+                    .as_ref()
+                    .map(|d| d.mod_fav_hits.clone())
+                    .unwrap_or_default();
+                if hits.is_empty() && !fav_busy {
                     self.dl_fav_load_start();
                 }
                 for r in &hits {
@@ -24471,7 +25326,7 @@ impl App {
         if let Some(pid) = unfav {
             self.cfg.mod_favorites.retain(|x| x != &pid);
             self.save_config();
-            self.dl.as_mut().unwrap().mod_fav_hits.retain(|h| h.id != pid);
+            self.dl.as_mut().map(|d| d.mod_fav_hits.retain(|h| h.id != pid));
             self.set_toast("已取消收藏".to_string());
         }
     }
@@ -24479,7 +25334,8 @@ impl App {
     /// 启动收藏夹详情加载线程（逐个 project_id 拉详情）
     fn dl_fav_load_start(&mut self) {
         let ids: Vec<String> = self.cfg.mod_favorites.clone();
-        let dl = self.dl.as_mut().unwrap();
+        // 入口处一次取出，避免散落的 as_mut().unwrap()
+        let Some(dl) = self.dl.as_mut() else { return };
         if dl.mod_fav_busy {
             return;
         }
@@ -24513,7 +25369,7 @@ impl App {
 
     /// 启动一次模组社区搜索（busy 时置 pending，完成后用最新参数自动重搜；空关键词也可浏览）
     fn dl_mod_search_start(&mut self) {
-        let dl = self.dl.as_mut().unwrap();
+        let Some(dl) = self.dl.as_mut() else { return };
         if dl.mod_search_busy {
             dl.mod_search_pending = true;
             return;
@@ -24542,7 +25398,7 @@ impl App {
 
     /// 启动详情页版本列表加载（记录当前展开项目；busy 时忽略）
     fn dl_mod_ver_load_start(&mut self, pid: &str, hit: &modrinth::ModrinthHit) {
-        let dl = self.dl.as_mut().unwrap();
+        let Some(dl) = self.dl.as_mut() else { return };
         dl.mod_detail_id = Some(pid.to_string());
         dl.mod_detail_hit = Some(hit.clone());
         // 反馈③：记录打开详情时的搜索 MC 版本，用于版本列表置顶高亮
@@ -24588,28 +25444,32 @@ impl App {
         ui.style_mut().spacing.item_spacing.y = 8.0;
         ui.style_mut().spacing.item_spacing.x = 8.0;
         // 搜索栏（图2 顶部）：放大镜 + Search... + 回车搜索（高 26px）
+        // 一次取出 dl：搜索栏与下面两行筛选只借这一处，不再逐个 as_mut().unwrap()
         let mut do_search = false;
-        ui.horizontal(|ui| {
-            ui.label("🔍");
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut self.dl.as_mut().unwrap().mod_query)
-                    .hint_text("Search...")
-                    .min_size(egui::vec2(300.0, 26.0)),
-            );
-            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                do_search = true;
-                resp.request_focus();
-            }
-            if ui
-                .add_sized([64.0, 26.0], egui::Button::new("搜索"))
-                .clicked()
-            {
-                do_search = true;
-            }
-            if self.dl.as_ref().unwrap().mod_search_busy {
-                ui.spinner();
-            }
-        });
+        {
+            let Some(dl) = self.dl.as_mut() else { return };
+            let busy = dl.mod_search_busy;
+            ui.horizontal(|ui| {
+                ui.label("🔍");
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut dl.mod_query)
+                        .hint_text("Search...")
+                        .min_size(egui::vec2(300.0, 26.0)),
+                );
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    do_search = true;
+                    resp.request_focus();
+                }
+                if ui
+                    .add_sized([64.0, 26.0], egui::Button::new("搜索"))
+                    .clicked()
+                {
+                    do_search = true;
+                }
+                if busy {
+                    ui.spinner();
+                }
+            });
         // 过滤区独立成框（来源/标签/排序/MC版本/加载器；目标位置移入详情页下载区）
         egui::Frame::group(ui.style())
             .rounding(egui::Rounding::same(6.0))
@@ -24627,7 +25487,7 @@ impl App {
                     ui.selectable_label(true, "Modrinth");
                 });
             ui.label("标签");
-            let tags = self.dl.as_ref().unwrap().mod_tags.clone();
+            let tags = dl.mod_tags.clone();
             egui::ComboBox::from_id_salt("dl_comm_tags")
                 .selected_text(if tags.is_empty() {
                     "选择标签"
@@ -24639,18 +25499,18 @@ impl App {
                 .show_ui(ui, |ui| {
                     for t in modrinth::category_options() {
                         if ui.selectable_label(tags == t, t.clone()).clicked() {
-                            self.dl.as_mut().unwrap().mod_tags = t.to_string();
+                            dl.mod_tags = t.to_string();
                             do_search = true;
                         }
                     }
                     ui.separator();
                     if ui.selectable_label(tags.is_empty(), "清除标签").clicked() {
-                        self.dl.as_mut().unwrap().mod_tags.clear();
+                        dl.mod_tags.clear();
                         do_search = true;
                     }
                 });
             ui.label("排序");
-            let sort = self.dl.as_ref().unwrap().mod_sort.clone();
+            let sort = dl.mod_sort.clone();
             egui::ComboBox::from_id_salt("dl_comm_sort")
                 .selected_text(match sort.as_str() {
                     "downloads" => "下载量",
@@ -24670,7 +25530,7 @@ impl App {
                     ] {
                         if ui
                             .selectable_value(
-                                &mut self.dl.as_mut().unwrap().mod_sort,
+                                &mut dl.mod_sort,
                                 val.to_string(),
                                 label,
                             )
@@ -24685,12 +25545,12 @@ impl App {
         ui.horizontal(|ui| {
             ui.label("MC 版本");
             ui.add(
-                egui::TextEdit::singleline(&mut self.dl.as_mut().unwrap().mod_mc_version)
+                egui::TextEdit::singleline(&mut dl.mod_mc_version)
                     .hint_text("任意")
                     .min_size(egui::vec2(110.0, 26.0)),
             );
             ui.label("加载器");
-            let loader = self.dl.as_ref().unwrap().mod_loader.clone();
+            let loader = dl.mod_loader.clone();
             egui::ComboBox::from_id_salt("dl_comm_loader")
                 .selected_text(loader.clone())
                 .height(26.0)
@@ -24698,7 +25558,7 @@ impl App {
                     for l in modrinth::loader_options() {
                         if ui
                             .selectable_value(
-                                &mut self.dl.as_mut().unwrap().mod_loader,
+                                &mut dl.mod_loader,
                                 l.to_string(),
                                 l,
                             )
@@ -24713,7 +25573,7 @@ impl App {
                 if ui
                     .add_sized(
                         [64.0, 26.0],
-                        egui::DragValue::new(&mut self.dl.as_mut().unwrap().mod_page_size)
+                        egui::DragValue::new(&mut dl.mod_page_size)
                             .range(1..=20),
                     )
                     .changed()
@@ -24722,27 +25582,45 @@ impl App {
                 }
             });
             });
+        }
+        // do_search 与 pending 的写回放在借用之外：搜索启动内部要用 &mut self
         if do_search {
-            self.dl.as_mut().unwrap().mod_page = 0;
+            if let Some(dl) = self.dl.as_mut() {
+                dl.mod_page = 0;
+            }
             self.dl_mod_search_start();
         }
         // 上一次搜索进行中参数再次变化（如拖拽"显示模组数量"）时：等其完成后立即用最新参数重搜
-        if self.dl.as_ref().unwrap().mod_search_pending
-            && !self.dl.as_ref().unwrap().mod_search_busy
-        {
-            self.dl.as_mut().unwrap().mod_search_pending = false;
+        let (pending, busy) = self
+            .dl
+            .as_ref()
+            .map(|d| (d.mod_search_pending, d.mod_search_busy))
+            .unwrap_or((false, false));
+        if pending && !busy {
+            if let Some(dl) = self.dl.as_mut() {
+                dl.mod_search_pending = false;
+            }
             self.dl_mod_search_start();
         }
-        if let Some(e) = &self.dl.as_ref().unwrap().mod_search_error {
+        if let Some(e) = self.dl.as_ref().and_then(|d| d.mod_search_error.clone()) {
             ui.colored_label(self.fg(Color32::from_rgb(220, 80, 80)), format!("搜索失败: {e}"));
         }
         // 结果区：详情展开时头固定 + body 滚动（左版本列表/右预览）；否则卡片网格
-        let results = self.dl.as_ref().unwrap().mod_results.clone();
+        let (results, detail_open, scroll_top_req, res_busy, total_hits0) = match self.dl.as_ref() {
+            Some(d) => (
+                d.mod_results.clone(),
+                d.mod_detail_id.is_some(),
+                d.mod_scroll_top,
+                d.mod_search_busy,
+                d.mod_total_hits,
+            ),
+            None => return,
+        };
         let mut install: Option<String> = None;
         let mut favtoggle: Option<String> = None;
         let mut detail: Option<modrinth::ModrinthHit> = None;
         let mut scroll_top = false;
-        if self.dl.as_ref().unwrap().mod_detail_id.is_some() {
+        if detail_open {
             // 固定头：详情头 + 简介 + 翻译 + 加载器筛选（常驻顶部，可随时收起）
             self.ui_mod_detail_header(ui);
             ui.separator();
@@ -24754,17 +25632,18 @@ impl App {
                     self.ui_mod_detail_body(ui);
                 });
         } else {
+            let mut consumed_scroll = false;
             egui::ScrollArea::vertical()
                 .id_salt("dl_comm_results")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     // 顶部锚点（“返回顶部”按钮消费）
-                    if self.dl.as_ref().unwrap().mod_scroll_top {
+                    if scroll_top_req {
                         ui.scroll_to_cursor(Some(egui::Align::Min));
-                        self.dl.as_mut().unwrap().mod_scroll_top = false;
+                        consumed_scroll = true;
                     }
                     if results.is_empty() {
-                        if self.dl.as_ref().unwrap().mod_search_busy {
+                        if res_busy {
                             ui.add_space(12.0);
                             ui.horizontal(|ui| {
                                 ui.spinner();
@@ -24779,9 +25658,8 @@ impl App {
                         }
                         return;
                     }
-                    let total_hits = self.dl.as_ref().unwrap().mod_total_hits;
-                    let shown = if total_hits > 0 {
-                        total_hits
+                    let shown = if total_hits0 > 0 {
+                        total_hits0
                     } else {
                         results.len() as i64
                     };
@@ -24799,42 +25677,65 @@ impl App {
                         }
                     }
                 });
+            if consumed_scroll {
+                if let Some(dl) = self.dl.as_mut() {
+                    dl.mod_scroll_top = false;
+                }
+            }
+            // 分页状态先取出（下面两个按钮要改 mod_page 并重新搜索）
+            let (page, page_size, total_hits) = self
+                .dl
+                .as_ref()
+                .map(|d| (d.mod_page, d.mod_page_size as i64, d.mod_total_hits))
+                .unwrap_or((0, 1, 0));
+            let page_size = page_size.max(1);
+            let est_total = if total_hits > 0 {
+                total_hits
+            } else {
+                results.len() as i64
+            };
+            let total_pages = ((est_total + page_size - 1) / page_size).max(1);
+            let mut go_prev = false;
+            let mut go_next = false;
             ui.horizontal(|ui| {
                 if ui.button("返回顶部").clicked() {
                     scroll_top = true;
                 }
                 ui.separator();
                 // 分页：上一页 / 页码 / 下一页（切换时回顶部并重新搜索）
-                let page = self.dl.as_ref().unwrap().mod_page;
-                let page_size = self.dl.as_ref().unwrap().mod_page_size as i64;
-                let total_hits = self.dl.as_ref().unwrap().mod_total_hits;
-                let est_total = if total_hits > 0 {
-                    total_hits
-                } else {
-                    results.len() as i64
-                };
-                let total_pages = ((est_total + page_size - 1) / page_size).max(1);
                 if ui
                     .add_enabled(page > 0, egui::Button::new("上一页"))
                     .clicked()
                 {
-                    self.dl.as_mut().unwrap().mod_page -= 1;
-                    self.dl.as_mut().unwrap().mod_scroll_top = true;
-                    self.dl_mod_search_start();
+                    go_prev = true;
                 }
                 ui.label(format!("第 {} / {total_pages} 页", page + 1));
                 if ui
                     .add_enabled(page + 1 < total_pages, egui::Button::new("下一页"))
                     .clicked()
                 {
-                    self.dl.as_mut().unwrap().mod_page += 1;
-                    self.dl.as_mut().unwrap().mod_scroll_top = true;
-                    self.dl_mod_search_start();
+                    go_next = true;
                 }
             });
+            if go_prev {
+                if let Some(dl) = self.dl.as_mut() {
+                    dl.mod_page = dl.mod_page.saturating_sub(1);
+                    dl.mod_scroll_top = true;
+                }
+                self.dl_mod_search_start();
+            }
+            if go_next {
+                if let Some(dl) = self.dl.as_mut() {
+                    dl.mod_page += 1;
+                    dl.mod_scroll_top = true;
+                }
+                self.dl_mod_search_start();
+            }
         }
         if scroll_top {
-            self.dl.as_mut().unwrap().mod_scroll_top = true;
+            if let Some(dl) = self.dl.as_mut() {
+                dl.mod_scroll_top = true;
+            }
         }
         if let Some(pid) = install {
             self.mod_install_project(&pid);
@@ -24850,10 +25751,15 @@ impl App {
 
     /// 目标位置明细：选服务器自动归类 或 自选目录
     fn ui_dl_mod_target(&mut self, ui: &mut egui::Ui) {
-        let use_server = self.dl.as_ref().unwrap().mod_target_use_server;
+        let Some(dl) = self.dl.as_ref() else { return };
+        let use_server = dl.mod_target_use_server;
         if use_server {
             let servers = self.cfg.servers.clone();
-            let cur = self.dl.as_ref().unwrap().mod_target_dir.clone();
+            let cur = self
+                .dl
+                .as_ref()
+                .map(|d| d.mod_target_dir.clone())
+                .unwrap_or_default();
             let names: Vec<String> = servers
                 .iter()
                 .map(|s| {
@@ -24885,10 +25791,14 @@ impl App {
                     .show_ui(ui, |ui| {
                         for (i, n) in names.iter().enumerate() {
                             if ui.selectable_label(false, n).clicked() {
-                                self.dl.as_mut().unwrap().mod_target_dir =
-                                    servers[i].dir.display().to_string();
+                                // 先取出目录字符串再改 dl，避免同时借用 self 的其它字段
+                                let chosen = servers[i].dir.display().to_string();
+                                let chosen_dir = servers[i].dir.clone();
+                                if let Some(d) = self.dl.as_mut() {
+                                    d.mod_target_dir = chosen;
+                                }
                                 // 功能优化：选定服务器即**自动套用它识别出的加载器与 MC 版本**
-                                self.apply_platform_from_dir(&servers[i].dir);
+                                self.apply_platform_from_dir(&chosen_dir);
                             }
                         }
                     });
@@ -24931,15 +25841,21 @@ impl App {
                 });
             }
         } else {
+            let mut dir_txt = self
+                .dl
+                .as_ref()
+                .map(|d| d.mod_target_dir.clone())
+                .unwrap_or_default();
+            let mut browse: Option<String> = None;
             ui.horizontal(|ui| {
                 ui.label("安装到");
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.dl.as_mut().unwrap().mod_target_dir)
+                    egui::TextEdit::singleline(&mut dir_txt)
                         .desired_width(280.0),
                 );
                 if ui.button("浏览…").clicked() {
                     if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                        self.dl.as_mut().unwrap().mod_target_dir = p.display().to_string();
+                        browse = Some(p.display().to_string());
                     }
                 }
                 ui.label(
@@ -24947,6 +25863,19 @@ impl App {
                         .color(self.fg(Color32::from_rgb(150, 150, 150))),
                 );
             });
+            if let Some(p) = browse {
+                dir_txt = p;
+            }
+            let changed = self
+                .dl
+                .as_ref()
+                .map(|d| d.mod_target_dir != dir_txt)
+                .unwrap_or(false);
+            if changed {
+                if let Some(d) = self.dl.as_mut() {
+                    d.mod_target_dir = dir_txt;
+                }
+            }
         }
     }
 
@@ -25108,6 +26037,8 @@ impl App {
                         if let Some(s) = self.cfg.servers.get(idx) {
                             if let Some(f) = crashscan::analyze(&s.dir) {
                                 self.crash_report = Some((idx, name.clone(), f));
+                                // 成就统计：崩溃分析得出有效结论
+                                self.stats_event(stats::StatKind::CrashScanOk, 1);
                             } else {
                                 self.set_toast("未在日志中发现可识别的崩溃原因".to_string());
                             }
@@ -25224,17 +26155,73 @@ impl App {
                         .id_salt("logs_page"),
                 );
                 let ui = &mut inner;
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.heading("日志");
-                    ui.label(RichText::new("XMST 工具自身的运行日志").weak().small());
-                });
+                ui.add_space(UI_PAGE_TOP);
+                // 统一工具条：左侧过滤（关键字 / 级别 / 类别 / 跟随），右侧主操作（刷新 / 清空 / 打开文件）
+                let mut tb_refresh = false;
+                page_toolbar(ui, "📋 日志").show(
+                    |tbf| {
+                        tbf.label("🔍");
+                        tbf.add(
+                            egui::TextEdit::singleline(&mut query)
+                                .hint_text("搜索关键字（消息或类别）")
+                                .desired_width(200.0),
+                        );
+                        tbf.label("级别");
+                        egui::ComboBox::from_id_salt("tool_log_level")
+                            .selected_text(level.clone())
+                            .width(80.0)
+                            .show_ui(tbf, |ui| {
+                                for l in ["全部", "信息", "警告", "错误"] {
+                                    ui.selectable_value(&mut level, l.to_string(), l);
+                                }
+                            });
+                        tbf.label("类别");
+                        egui::ComboBox::from_id_salt("tool_log_cat")
+                            .selected_text(cat.clone())
+                            .width(110.0)
+                            .show_ui(tbf, |ui| {
+                                ui.selectable_value(&mut cat, "全部".to_string(), "全部");
+                                for c in &cats {
+                                    ui.selectable_value(&mut cat, c.clone(), c);
+                                }
+                            });
+                        tbf.checkbox(&mut follow, "自动跟随最新");
+                    },
+                    |tba| {
+                        if tba
+                            .add_sized([104.0, UI_CTL_H], egui::Button::new("📂 日志文件"))
+                            .on_hover_text("打开 data\\tool.log 所在目录并选中该文件")
+                            .clicked()
+                        {
+                            do_open_file = true;
+                        }
+                        if tba
+                            .add_sized([92.0, UI_CTL_H], egui::Button::new("🗑 清空"))
+                            .on_hover_text("清空本页显示缓冲（会先弹出二次确认；不删除 data\\tool.log 文件）")
+                            .clicked()
+                        {
+                            ask_clear_view = true;
+                        }
+                        if tba
+                            .add_sized([84.0, UI_CTL_H], egui::Button::new("🔄 刷新"))
+                            .on_hover_text("立即重算过滤缓存")
+                            .clicked()
+                        {
+                            tb_refresh = true;
+                        }
+                    },
+                );
+                if tb_refresh {
+                    // 强制重算过滤缓存：rev 归零后下一帧必然重新过滤
+                    self.tool_log_rev = 0;
+                    self.tool_log_filter_key = (String::new(), String::new(), String::new());
+                }
                 ui.label(
-                    RichText::new("服务器控制台日志在 服务器 → 日志；穿透日志在 隧道页")
+                    RichText::new("服务器控制台日志在 服务器 → 控制台；穿透日志在 内网穿透 → 隧道日志")
                         .weak()
                         .small(),
                 );
-                ui.separator();
+                ui.add_space(UI_SPACE_Y);
                 // ---- 统计卡 ----
                 ui.horizontal_wrapped(|ui| {
                     for (t, v) in [
@@ -25262,52 +26249,8 @@ impl App {
                     }
                 });
                 ui.add_space(6.0);
-                // ---- 过滤栏 ----
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("🔍");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut query)
-                            .hint_text("搜索关键字（消息或类别）")
-                            .desired_width(220.0),
-                    );
-                    ui.label("级别");
-                    egui::ComboBox::from_id_salt("tool_log_level")
-                        .selected_text(level.clone())
-                        .width(80.0)
-                        .show_ui(ui, |ui| {
-                            for l in ["全部", "信息", "警告", "错误"] {
-                                ui.selectable_value(&mut level, l.to_string(), l);
-                            }
-                        });
-                    ui.label("类别");
-                    egui::ComboBox::from_id_salt("tool_log_cat")
-                        .selected_text(cat.clone())
-                        .width(120.0)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut cat, "全部".to_string(), "全部");
-                            for c in &cats {
-                                ui.selectable_value(&mut cat, c.clone(), c);
-                            }
-                        });
-                    ui.checkbox(&mut follow, "自动跟随最新");
-                    if ui
-                        .button("🗑 清空视图")
-                        .on_hover_text("清空本页显示缓冲（会先弹出二次确认；不删除 data\\tool.log 文件）")
-                        .clicked()
-                    {
-                        ask_clear_view = true;
-                    }
-                    if ui
-                        .button("📂 打开日志文件")
-                        .on_hover_text("打开 data\\tool.log 所在目录并选中该文件")
-                        .clicked()
-                    {
-                        do_open_file = true;
-                    }
-                });
-                ui.separator();
-                // ---- 列表（等宽、级别着色、长消息截断 + hover 看全文、点击复制）----
-                // 底部留白同其它页（CONTENT_EDGE_PAD），并按下方设置行的高度扣减，避免最后一行被裁
+                // ---- 过滤栏已收进页面顶部工具条 ----
+                // ---- 列表（等宽、级别着色、长消息截断 + hover 看全文、点击复制）----                // 底部留白同其它页（CONTENT_EDGE_PAD），并按下方设置行的高度扣减，避免最后一行被裁
                 let logs_max_h = (ui.available_height() - 40.0 - CONTENT_EDGE_PAD).max(80.0);
                 let show_cap = max_show.clamp(100, toollog::RING_CAP).min(rows.len());
                 if rows.is_empty() {
@@ -25449,21 +26392,21 @@ impl App {
 
     /// 安装模组：取最新版下载地址 -> 归类到目标目录 -> 启动下载
     fn mod_install_project(&mut self, pid: &str) {
-        let dir = self.dl.as_ref().unwrap().mod_target_dir.trim().to_string();
+        let (dir, mc2, l2, pt2) = match self.dl.as_ref() {
+            Some(d) => (
+                d.mod_target_dir.trim().to_string(),
+                d.mod_mc_version.trim().to_string(),
+                d.mod_loader.clone(),
+                d.mod_project_type.clone(),
+            ),
+            None => (String::new(), String::new(), String::new(), String::new()),
+        };
         if dir.is_empty() {
             self.set_toast("请先选择目标服务器或填写目标目录".to_string());
             return;
         }
-        let (mc2, l2, pt2) = {
-            let d = self.dl.as_ref().unwrap();
-            (
-                d.mod_mc_version.trim().to_string(),
-                d.mod_loader.clone(),
-                d.mod_project_type.clone(),
-            )
-        };
         match modrinth::latest_file(pid, &mc2, &l2) {
-            Ok((url, fname, _size)) => {
+            Ok((url, fname, size)) => {
                 let sub = match pt2.as_str() {
                     "plugin" => "plugins",
                     // 反馈②：数据包下载到 <服务器>/world/datapacks（Minecraft 标准数据包目录）
@@ -25474,9 +26417,11 @@ impl App {
                 if let Err(e) = std::fs::create_dir_all(&target) {
                     self.set_toast(format!("创建 {sub} 目录失败: {e}"));
                 } else {
-                    let d = self.dl.as_mut().unwrap();
+                    let Some(d) = self.dl.as_mut() else { return };
                     d.mod_download_target = url;
                     d.mod_download_name = target.join(fname).display().to_string();
+                    // Modrinth 给出的字节数：下载后在 .part 上核对，再改名
+                    d.mod_download_size = (size > 0).then_some(size);
                     self.dl_start_mod_download();
                 }
             }
@@ -25524,7 +26469,7 @@ impl App {
         if r.icon_url.trim().is_empty() {
             return;
         }
-        let dl = self.dl.as_mut().unwrap();
+        let Some(dl) = self.dl.as_mut() else { return };
         if dl.mod_icon_tex.contains_key(&id)
             || dl.mod_icon_pending.contains(&id)
             || dl.mod_icon_failed.contains(&id)
@@ -25550,7 +26495,11 @@ impl App {
     /// 绘制模组图标：有缓存纹理显示网站图片，否则首字母色块占位
     fn mod_icon_ui(&mut self, ui: &mut egui::Ui, r: &modrinth::ModrinthHit, size: f32) {
         self.mod_icon_ensure(r);
-        if let Some(tex) = self.dl.as_ref().unwrap().mod_icon_tex.get(&r.id).cloned() {
+        let icon_tex = self
+            .dl
+            .as_ref()
+            .and_then(|d| d.mod_icon_tex.get(&r.id).cloned());
+        if let Some(tex) = icon_tex {
             ui.add(egui::Image::new(&tex).fit_to_exact_size(egui::vec2(size, size)));
             return;
         }
@@ -25598,7 +26547,7 @@ impl App {
         if Self::is_cjk_title(&r.title) {
             return;
         }
-        let dl = self.dl.as_mut().unwrap();
+        let Some(dl) = self.dl.as_mut() else { return };
         if dl.mod_cn_name.contains_key(&r.title)
             || dl.mod_mcmod_url.contains_key(&r.title)
             || dl.mod_cn_pending.contains(&r.title)
@@ -25639,7 +26588,7 @@ impl App {
 
     /// 手动在线翻译（"译"按钮触发）：仅 MC 百科未收录时调用，走 Google + MyMemory 兜底
     fn mod_cn_translate_now(&mut self, title: &str) {
-        let dl = self.dl.as_mut().unwrap();
+        let Some(dl) = self.dl.as_mut() else { return };
         if dl.mod_cn_name.contains_key(title) || dl.mod_cn_pending.contains(title) {
             return;
         }
@@ -25657,7 +26606,10 @@ impl App {
 
     /// 标题显示信息：返回 (显示名, 是否已有中文名, 是否翻译中, 是否自动翻译失败)
     fn mod_cn_info(&self, title: &str) -> (String, bool, bool, bool) {
-        let dl = self.dl.as_ref().unwrap();
+        // 下载功能未启用时按"无中文名、未翻译"返回，避免为该查询取引用而解包
+        let Some(dl) = self.dl.as_ref() else {
+            return (title.to_string(), false, false, false);
+        };
         if let Some(cn) = dl.mod_cn_name.get(title) {
             (cn.clone(), true, false, false)
         } else if dl.mod_cn_pending.contains(title) || dl.mod_mcmod_pending.contains(title) {
@@ -25711,7 +26663,9 @@ impl App {
                             let retry_resp = ui.button("译");
                             retry_rect = retry_resp.rect;
                             if retry_resp.clicked() {
-                                self.dl.as_mut().unwrap().mod_cn_failed.remove(&r.title);
+                                if let Some(d) = self.dl.as_mut() {
+                                    d.mod_cn_failed.remove(&r.title);
+                                }
                                 self.mod_cn_translate_now(&r.title);
                             }
                         }
@@ -25848,7 +26802,9 @@ impl App {
                             let retry_resp = ui.button("译");
                             retry_rect = retry_resp.rect;
                             if retry_resp.clicked() {
-                                self.dl.as_mut().unwrap().mod_cn_failed.remove(&r.title);
+                                if let Some(d) = self.dl.as_mut() {
+                                    d.mod_cn_failed.remove(&r.title);
+                                }
                                 self.mod_cn_translate_now(&r.title);
                             }
                         }
@@ -25937,9 +26893,22 @@ impl App {
     /// 版本列表按 MC 版本分组（PCL 式），加载器筛选；点文件项直接安装该版本。
     /// 详情固定头（常驻顶部，可随时收起）：标题/作者/下载量 + 打开页面 + 简介 + 翻译 + 加载器筛选
     fn ui_mod_detail_header(&mut self, ui: &mut egui::Ui) {
-        let Some(hit) = self.dl.as_ref().unwrap().mod_detail_hit.clone() else {
+        // 一次取出 dl：下面所有读取都走它，写入用最小作用域块（写回时不能再持有 self 的其它借用）
+        let Some(dl) = self.dl.as_ref() else { return };
+        let Some(hit) = dl.mod_detail_hit.clone() else {
             return;
         };
+        let translate_result = dl.mod_translate_result.clone();
+        let translate_hidden = dl.mod_translate_hidden;
+        let translate_busy = dl.mod_translate_busy;
+        let translate_error = dl.mod_translate_error.clone();
+        let mcmod_url = dl.mod_mcmod_url.get(&hit.title).cloned();
+        let versions = dl.mod_versions.clone();
+        let mut ver_loader = dl.mod_ver_loader.clone();
+        let ver_busy = dl.mod_ver_busy;
+        let ver_error = dl.mod_ver_error.clone();
+        let show_snap = dl.mod_show_snapshot;
+        drop(dl);
         // 详情头：图标 + 标题/作者/下载量 + 简介（图标样式与列表一致）
         self.mod_cn_ensure(&hit);
         let (disp, has_cn, _, _) = self.mod_cn_info(&hit.title);
@@ -25977,8 +26946,8 @@ impl App {
             });
         });
         // 译文（简介下方、按钮上方；绿色无“译文:”前缀；隐藏后不渲染但保留缓存）
-        if let Some(t) = &self.dl.as_ref().unwrap().mod_translate_result {
-            if !self.dl.as_ref().unwrap().mod_translate_hidden {
+        if let Some(t) = &translate_result {
+            if !translate_hidden {
                 ui.add(
                     egui::Label::new(
                         RichText::new(t.as_str())
@@ -25992,7 +26961,7 @@ impl App {
         // 操作行：收起 / 打开仓库 / 翻译简介（收起、打开仓库与翻译同排）
         ui.horizontal(|ui| {
             if ui.button("收起").clicked() {
-                let d = self.dl.as_mut().unwrap();
+                let Some(d) = self.dl.as_mut() else { return };
                 d.mod_detail_id = None;
                 d.mod_detail_hit = None;
                 d.mod_versions.clear();
@@ -26009,25 +26978,24 @@ impl App {
                 self.dl_mod_open_page(&hit);
             }
             // 跳转 MC 百科：仅百科已命中中文名时显示（百科页含完整资料与正确译名）
-            let mcmod_url = self.dl.as_ref().unwrap().mod_mcmod_url.get(&hit.title).cloned();
             if let Some(u) = mcmod_url {
                 if ui.button("MC百科").clicked() {
                     open_url(&u);
                 }
             }
-            if self.dl.as_ref().unwrap().mod_translate_busy {
+            if translate_busy {
                 ui.spinner();
                 ui.label(
                     RichText::new("翻译中…").color(self.fg(Color32::from_rgb(150, 150, 150))),
                 );
-            } else if self.dl.as_ref().unwrap().mod_translate_result.is_some() {
+            } else if translate_result.is_some() {
                 // 已有缓存（含隐藏后）：仅切换显示/隐藏，直接复用缓存不再调接口
-                let hidden = self.dl.as_ref().unwrap().mod_translate_hidden;
+                let hidden = translate_hidden;
                 if ui
                     .button(if hidden { "翻译简介" } else { "隐藏翻译" })
                     .clicked()
                 {
-                    let d = self.dl.as_mut().unwrap();
+                    let Some(d) = self.dl.as_mut() else { return };
                     d.mod_translate_hidden = !d.mod_translate_hidden;
                     d.mod_translate_error = None;
                 }
@@ -26042,7 +27010,7 @@ impl App {
                         let r = modrinth::translate_best(&text);
                         *shared2.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
                     });
-                    let d = self.dl.as_mut().unwrap();
+                    let Some(d) = self.dl.as_mut() else { return };
                     d.mod_translate_shared = Some(shared);
                     d.mod_translate_busy = true;
                     d.mod_translate_error = None;
@@ -26050,7 +27018,7 @@ impl App {
                 }
             }
         });
-        if let Some(e) = &self.dl.as_ref().unwrap().mod_translate_error {
+        if let Some(e) = &translate_error {
             ui.colored_label(
                 self.fg(Color32::from_rgb(220, 120, 80)),
                 format!("翻译失败: {e}"),
@@ -26060,7 +27028,6 @@ impl App {
         // 加载器筛选行（仅显示该模组版本实际存在的加载器；无对应版本的加载器不出现）
         ui.horizontal(|ui| {
             ui.label("加载器");
-            let versions = self.dl.as_ref().unwrap().mod_versions.clone();
             let avail_loaders = {
                 let mut seen: Vec<String> = Vec::new();
                 for v in &versions {
@@ -26083,48 +27050,66 @@ impl App {
                 }
                 ordered
             };
-            let loader = self.dl.as_ref().unwrap().mod_ver_loader.clone();
             // 当前选中加载器不在实际集合（版本刷新/切换项目后）时重置为全部
-            if loader != "全部" && !avail_loaders.iter().any(|l| l == &loader) {
-                self.dl.as_mut().unwrap().mod_ver_loader = "全部".to_string();
+            if ver_loader != "全部" && !avail_loaders.iter().any(|l| l == &ver_loader) {
+                ver_loader = "全部".to_string();
+                if let Some(d) = self.dl.as_mut() {
+                    d.mod_ver_loader = "全部".to_string();
+                }
             }
-            let loader = self.dl.as_ref().unwrap().mod_ver_loader.clone();
+            let mut loader_pick: Option<String> = None;
             egui::ComboBox::from_id_salt("dl_detail_loader")
-                .selected_text(loader.clone())
+                .selected_text(ver_loader.clone())
                 .show_ui(ui, |ui| {
                     for l in std::iter::once("全部".to_string()).chain(avail_loaders) {
                         if ui
-                            .selectable_label(loader == l, l.clone())
+                            .selectable_label(ver_loader == l, l.clone())
                             .clicked()
                         {
-                            self.dl.as_mut().unwrap().mod_ver_loader = l;
+                            loader_pick = Some(l);
                         }
                     }
                 });
-            if self.dl.as_ref().unwrap().mod_ver_busy {
+            if let Some(l) = loader_pick {
+                if let Some(d) = self.dl.as_mut() {
+                    d.mod_ver_loader = l;
+                }
+            }
+            if ver_busy {
                 ui.spinner();
                 ui.label(RichText::new("加载版本…").color(self.fg(Color32::from_rgb(150, 150, 150))));
             }
-            if let Some(e) = &self.dl.as_ref().unwrap().mod_ver_error {
+            if let Some(e) = &ver_error {
                 ui.colored_label(self.fg(Color32::from_rgb(220, 80, 80)), format!("版本加载失败: {e}"));
             }
             // 阶段16②：显示快照版本开关（默认关=隐藏 snapshot- 开头版本；点击切换）
-            let show_snap = self.dl.as_ref().unwrap().mod_show_snapshot;
             if ui
                 .selectable_label(show_snap, if show_snap { "✓ 显示快照版本" } else { "显示快照版本" })
                 .on_hover_text("默认隐藏以 snapshot- 开头的快照版本，点击切换显示/隐藏")
                 .clicked()
             {
-                self.dl.as_mut().unwrap().mod_show_snapshot = !show_snap;
+                if let Some(d) = self.dl.as_mut() {
+                    d.mod_show_snapshot = !show_snap;
+                }
             }
         });
     }
 
     /// 详情滚动 body：左版本列表（MC 版本组可折叠）/ 右预览（点击版本行显示更新日志）
     fn ui_mod_detail_body(&mut self, ui: &mut egui::Ui) {
-        let all_versions = self.dl.as_ref().unwrap().mod_versions.clone();
+        // 一次取出 dl：版本列表 / 加载器 / 快照开关 / 预览 / 目标位置都只读这一处
+        let Some(dl) = self.dl.as_ref() else { return };
+        let all_versions = dl.mod_versions.clone();
         // 阶段16②：默认隐藏 snapshot- 开头快照版本（开关开启后显示全部）
-        let show_snap = self.dl.as_ref().unwrap().mod_show_snapshot;
+        let show_snap = dl.mod_show_snapshot;
+        let ver_busy = dl.mod_ver_busy;
+        let ver_error_none = dl.mod_ver_error.is_none();
+        let ver_loader = dl.mod_ver_loader.clone();
+        let mc_ref = dl.mod_detail_mc.clone();
+        let preview_id = dl.mod_ver_preview.as_ref().map(|p| p.id.clone());
+        let target_use_server = dl.mod_target_use_server;
+        let detail_hit = dl.mod_detail_hit.clone();
+        drop(dl);
         let versions: Vec<_> = if show_snap {
             all_versions.clone()
         } else {
@@ -26150,9 +27135,7 @@ impl App {
                 );
                 return;
             }
-            if !self.dl.as_ref().unwrap().mod_ver_busy
-                && self.dl.as_ref().unwrap().mod_ver_error.is_none()
-            {
+            if !ver_busy && ver_error_none {
                 ui.label(
                     RichText::new("暂无版本信息")
                         .color(self.fg(Color32::from_rgb(150, 150, 150))),
@@ -26160,10 +27143,8 @@ impl App {
             }
             return;
         }
-        let loader = self.dl.as_ref().unwrap().mod_ver_loader.clone();
-        let mut groups = group_mod_versions(&versions, &loader);
+        let mut groups = group_mod_versions(&versions, &ver_loader);
         // 反馈③：搜索指定 MC 版本时，将该版本组置顶（稳定排序保持其余组原顺序）
-        let mc_ref = self.dl.as_ref().unwrap().mod_detail_mc.clone();
         if !mc_ref.is_empty() {
             groups.sort_by_key(|(k, _)| if k.as_str() == mc_ref.as_str() { 0 } else { 1 });
         }
@@ -26176,7 +27157,7 @@ impl App {
         }
         let total = ui.available_width();
         let left_w = (total - 16.0) * 0.60;
-        let mut install: Option<(String, String)> = None;
+        let mut install: Option<(String, String, u64)> = None;
         ui.horizontal(|ui| {
             ui.allocate_ui_with_layout(
                 egui::vec2(left_w, ui.available_height()),
@@ -26209,14 +27190,7 @@ impl App {
                                 .map(|f| f.filename.clone())
                                 .unwrap_or_else(|| v.version_number.clone());
                             let fname_show = Self::truncate_str(&fname, 40);
-                            let preview_open = self
-                                .dl
-                                .as_ref()
-                                .unwrap()
-                                .mod_ver_preview
-                                .as_ref()
-                                .map(|p| p.id == v.id)
-                                .unwrap_or(false);
+                            let preview_open = preview_id.as_deref() == Some(v.id.as_str());
                             // 反馈③：搜索命中的 MC 版本组内版本行橙色高亮
                             let row_text: egui::WidgetText = if is_match {
                                 RichText::new(&fname_show)
@@ -26247,7 +27221,9 @@ impl App {
                                 );
                                 // 点击文件名 -> 右侧预览
                                 if ui.selectable_label(preview_open, row_text.clone()).clicked() {
-                                    self.dl.as_mut().unwrap().mod_ver_preview = Some((*v).clone());
+                                    if let Some(d) = self.dl.as_mut() {
+                                        d.mod_ver_preview = Some((*v).clone());
+                                    }
                                 }
                             });
                         }
@@ -26256,17 +27232,20 @@ impl App {
             });
             ui.vertical(|ui| {
                 // 右：版本详情预览（点击左侧版本行显示）
+                let preview_now = self.dl.as_ref().and_then(|d| d.mod_ver_preview.clone());
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("版本详情").strong().size(14.0));
-                    if self.dl.as_ref().unwrap().mod_ver_preview.is_some() {
+                    if preview_now.is_some() {
                         if ui.button("关闭预览").clicked() {
-                            self.dl.as_mut().unwrap().mod_ver_preview = None;
+                            if let Some(d) = self.dl.as_mut() {
+                                d.mod_ver_preview = None;
+                            }
                         }
                     }
                 });
                 ui.separator();
-                let Some(pv) = self.dl.as_ref().unwrap().mod_ver_preview.clone() else {
+                let Some(pv) = preview_now else {
                     ui.label(
                         RichText::new("点击左侧版本查看更新日志")
                             .color(self.fg(Color32::from_rgb(150, 150, 150))),
@@ -26387,12 +27366,18 @@ impl App {
                 ui.add_space(8.0);
                 // 目标位置（下载前选择：自选目录 / 选服务器自动归类）
                 ui.horizontal(|ui| {
-                    let use_server = self.dl.as_ref().unwrap().mod_target_use_server;
+                    let use_server = target_use_server;
+                    let mut want: Option<bool> = None;
                     if ui.selectable_label(!use_server, "自选目录").clicked() {
-                        self.dl.as_mut().unwrap().mod_target_use_server = false;
+                        want = Some(false);
                     }
                     if ui.selectable_label(use_server, "选服务器自动归类").clicked() {
-                        self.dl.as_mut().unwrap().mod_target_use_server = true;
+                        want = Some(true);
+                    }
+                    if let Some(v) = want {
+                        if let Some(d) = self.dl.as_mut() {
+                            d.mod_target_use_server = v;
+                        }
                     }
                 });
                 self.ui_dl_mod_target(ui);
@@ -26400,18 +27385,18 @@ impl App {
                 ui.horizontal(|ui| {
                     if ui.button("下载").clicked() {
                         if let Some(f) = pv.files.first() {
-                            install = Some((f.url.clone(), f.filename.clone()));
+                            install = Some((f.url.clone(), f.filename.clone(), f.size));
                         }
                     }
                     if ui.button("打开页面").clicked() {
-                        if let Some(hit2) = self.dl.as_ref().unwrap().mod_detail_hit.clone() {
+                        if let Some(hit2) = detail_hit.clone() {
                             self.dl_mod_open_page(&hit2);
                         }
                     }
                 });
                 // 反馈①：下载进度条从页面最底部移至下载区下方
                 // 阶段16③：进度条总宽缩短约 30%（按可用宽度比例，避免撑满右栏）
-                let dl = self.dl.as_ref().unwrap();
+                let Some(dl) = self.dl.as_ref() else { return };
                 if dl.mod_dl_busy {
                     let pb_w = (ui.available_width() * 0.70).max(160.0);
                     ui.add(
@@ -26429,8 +27414,8 @@ impl App {
                 }
             });
         });
-        if let Some((url, fname)) = install {
-            self.mod_install_file(&url, &fname);
+        if let Some((url, fname, size)) = install {
+            self.mod_install_file(&url, &fname, size);
         }
     }
 
@@ -26473,7 +27458,7 @@ impl App {
             };
             *shared2.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
         });
-        let d = self.dl.as_mut().unwrap();
+        let Some(d) = self.dl.as_mut() else { return };
         d.mod_open_shared = Some(shared);
         // 兜底：source_url 拉取失败时打开 Modrinth 页（异步结果 Err 时由 tick 处理）
         let fallback = format!("https://modrinth.com/mod/{slug}");
@@ -26481,13 +27466,19 @@ impl App {
     }
 
     /// 直接安装指定版本文件（详情页点文件项）：归类到目标目录后启动下载
-    fn mod_install_file(&mut self, url: &str, fname: &str) {
-        let dir = self.dl.as_ref().unwrap().mod_target_dir.trim().to_string();
+    fn mod_install_file(&mut self, url: &str, fname: &str, size: u64) {
+        // 一次取出：目标目录与项目类型（下载功能未启用时按空目录处理，直接提示）
+        let (dir, pt2) = match self.dl.as_ref() {
+            Some(d) => (
+                d.mod_target_dir.trim().to_string(),
+                d.mod_project_type.clone(),
+            ),
+            None => (String::new(), String::new()),
+        };
         if dir.is_empty() {
             self.set_toast("请先选择目标服务器或填写目标目录".to_string());
             return;
         }
-        let pt2 = self.dl.as_ref().unwrap().mod_project_type.clone();
         let sub = match pt2.as_str() {
             "plugin" => "plugins",
             // 反馈②：数据包下载到 <服务器>/world/datapacks（Minecraft 标准数据包目录）
@@ -26499,16 +27490,18 @@ impl App {
             self.set_toast(format!("创建 {sub} 目录失败: {e}"));
             return;
         }
-        let d = self.dl.as_mut().unwrap();
+        let Some(d) = self.dl.as_mut() else { return };
         d.mod_download_target = url.to_string();
         d.mod_download_name = target.join(fname).display().to_string();
+        // Modrinth 给出的字节数：下载后在 .part 上核对，再改名
+        d.mod_download_size = (size > 0).then_some(size);
         self.dl_start_mod_download();
     }
 
     /// 下载日志
     fn ui_dl_log(&mut self, ui: &mut egui::Ui) {
         ui.label(RichText::new("下载日志").strong());
-        let log = self.dl.as_ref().unwrap().dl_log.clone();
+        let log = self.dl.as_ref().map(|d| d.dl_log.clone()).unwrap_or_default();
         if log.is_empty() {
             ui.label(RichText::new("暂无记录").color(self.fg(Color32::from_rgb(150, 150, 150))));
             return;
@@ -27644,37 +28637,131 @@ fn show_server_props_typed(
         ui.end_row();
     }
 
-    egui::Grid::new("sp_props_grid")
-        .num_columns(2)
-        .spacing([10.0, 4.0])
+    // 27 个字段按主题拆成 4 个折叠组（审计表 §6 批 3）：网络 / 规则 / 世界 / RCON。
+    // 读写仍是同一份 map（`g`），字段名与顺序不变，只是分组渲染。
+    egui::CollapsingHeader::new(RichText::new("网络").strong())
+        .id_salt("sp_group_net")
+        .default_open(true)
         .show(ui, |ui| {
-            row_text(ui, g, "服务器端口", "server-port", "25565");
-            row_text(ui, g, "服务器 IP（留空全部）", "server-ip", "");
-            row_text(ui, g, "世界名称", "level-name", "world");
-            row_text(ui, g, "世界种子", "level-seed", "");
-            row_text(ui, g, "MMOTD 展示", "motd", "A Minecraft Server");
-            row_text(ui, g, "资源包 URL（可选）", "resource-pack", "");
-            row_int(ui, g, "最大玩家数", "max-players", 20, 1..=9999);
-            row_int(ui, g, "视图距离（区块）", "view-distance", 10, 3..=32);
-            row_int(ui, g, "模拟距离（区块）", "simulation-distance", 10, 3..=32);
-            row_int(ui, g, "出生点保保护半径", "spawn-protection", 16, 0..=1000);
-            row_int(ui, g, "网络压缩阈值（-1 关闭）", "network-compression-threshold", 256, -1..=9999);
-            row_bool(ui, g, "在线模式（正版验证）", "online-mode", "true");
-            row_bool(ui, g, "白名单", "white-list", "false");
-            row_bool(ui, g, "允许 PVP", "pvp", "true");
-            row_bool(ui, g, "极限模式（锁定困难）", "hardcore", "false");
-            row_bool(ui, g, "允许飞行", "allow-flight", "false");
-            row_bool(ui, g, "允许命令方块", "enable-command-block", "false");
-            row_bool(ui, g, "强制安全档案", "enforce-secure-profile", "true");
-            row_bool(ui, g, "启用 RCON 远程控制", "enable-rcon", "false");
-            row_text(ui, g, "RCON 密码", "rcon.password", "");
-            row_int(ui, g, "RCON 端口", "rcon.port", 25575, 1..=65535);
-            row_bool(ui, g, "启用查询（GameSpy4）", "enable-query", "false");
-            row_select(ui, g, "游戏模式", "gamemode", "survival", &["survival", "creative", "adventure", "spectator"], "sp_gamemode");
-            row_select(ui, g, "难度", "difficulty", "easy", &["peaceful", "easy", "normal", "hard"], "sp_difficulty");
-            row_select(ui, g, "默认玩家权限", "op-permission-level", "4", &["1", "2", "3", "4"], "sp_opperm");
+            ui.label(RichText::new("端口、IP、MOTD、资源包与压缩阈值").weak().small());
+            egui::Grid::new("sp_props_grid_net")
+                .num_columns(2)
+                .spacing([10.0, 4.0])
+                .show(ui, |ui| {
+                    row_text(ui, g, "服务器端口", "server-port", "25565");
+                    row_text(ui, g, "服务器 IP（留空全部）", "server-ip", "");
+                    row_text(ui, g, "MOTD 展示", "motd", "A Minecraft Server");
+                    row_text(ui, g, "资源包 URL（可选）", "resource-pack", "");
+                    row_int(ui, g, "网络压缩阈值（-1 关闭）", "network-compression-threshold", 256, -1..=9999);
+                    row_int(ui, g, "最大玩家数", "max-players", 20, 1..=9999);
+                });
+        });
+    egui::CollapsingHeader::new(RichText::new("规则").strong())
+        .id_salt("sp_group_rules")
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.label(RichText::new("验证、白名单、PVP 与权限").weak().small());
+            egui::Grid::new("sp_props_grid_rules")
+                .num_columns(2)
+                .spacing([10.0, 4.0])
+                .show(ui, |ui| {
+                    row_bool(ui, g, "在线模式（正版验证）", "online-mode", "true");
+                    row_bool(ui, g, "白名单", "white-list", "false");
+                    row_bool(ui, g, "允许 PVP", "pvp", "true");
+                    row_bool(ui, g, "允许飞行", "allow-flight", "false");
+                    row_bool(ui, g, "允许命令方块", "enable-command-block", "false");
+                    row_bool(ui, g, "强制安全档案", "enforce-secure-profile", "true");
+                    row_select(ui, g, "游戏模式", "gamemode", "survival", &["survival", "creative", "adventure", "spectator"], "sp_gamemode");
+                    row_select(ui, g, "难度", "difficulty", "easy", &["peaceful", "easy", "normal", "hard"], "sp_difficulty");
+                    row_select(ui, g, "默认玩家权限", "op-permission-level", "4", &["1", "2", "3", "4"], "sp_opperm");
+                });
+        });
+    egui::CollapsingHeader::new(RichText::new("世界").strong())
+        .id_salt("sp_group_world")
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.label(RichText::new("世界名、种子、视距与出生点保护").weak().small());
+            egui::Grid::new("sp_props_grid_world")
+                .num_columns(2)
+                .spacing([10.0, 4.0])
+                .show(ui, |ui| {
+                    row_text(ui, g, "世界名称", "level-name", "world");
+                    row_text(ui, g, "世界种子", "level-seed", "");
+                    row_int(ui, g, "视图距离（区块）", "view-distance", 10, 3..=32);
+                    row_int(ui, g, "模拟距离（区块）", "simulation-distance", 10, 3..=32);
+                    row_int(ui, g, "出生点保护半径", "spawn-protection", 16, 0..=1000);
+                    row_bool(ui, g, "极限模式（锁定困难）", "hardcore", "false");
+                });
+        });
+    egui::CollapsingHeader::new(RichText::new("RCON").strong())
+        .id_salt("sp_group_rcon")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.label(RichText::new("远程控制台与查询协议，需要服务器重新加载配置后生效").weak().small());
+            egui::Grid::new("sp_props_grid_rcon")
+                .num_columns(2)
+                .spacing([10.0, 4.0])
+                .show(ui, |ui| {
+                    row_bool(ui, g, "启用 RCON 远程控制", "enable-rcon", "false");
+                    row_text(ui, g, "RCON 密码", "rcon.password", "");
+                    row_int(ui, g, "RCON 端口", "rcon.port", 25575, 1..=65535);
+                    row_bool(ui, g, "启用查询（GameSpy4）", "enable-query", "false");
+                });
         });
     m
+}
+
+/// 统一确认弹窗的返回值
+#[derive(PartialEq, Clone, Copy)]
+enum ConfirmAction {
+    /// 本帧没有任何点击：保持弹窗打开
+    None,
+    /// 点了「取消」
+    Cancel,
+    /// 点了红色「确认」
+    Confirm,
+}
+
+/// 全站统一的危险操作确认弹窗：标题 + 一句话影响说明 + 「取消 / 确认（红）」。
+///
+/// 所有不可撤销或需要二次确认的动作（删除 / 清空 / 强停 / 覆盖）都走这一个函数，
+/// 按钮顺序、危险色、文案层级保持一致；`confirm_label` 传具体动作（如「确认删除」）。
+fn confirm_dialog(
+    ctx: &egui::Context,
+    title: &str,
+    message: &str,
+    impact: &str,
+    confirm_label: &str,
+) -> ConfirmAction {
+    let mut act = ConfirmAction::None;
+    egui::Window::new(title)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            if !message.is_empty() {
+                ui.label(RichText::new(message).strong());
+            }
+            if !impact.is_empty() {
+                ui.label(RichText::new(impact).weak().small());
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("取消").clicked() {
+                    act = ConfirmAction::Cancel;
+                }
+                if ui
+                    .button(
+                        RichText::new(confirm_label)
+                            .color(Color32::from_rgb(230, 110, 110)),
+                    )
+                    .clicked()
+                {
+                    act = ConfirmAction::Confirm;
+                }
+            });
+        });
+    act
 }
 
 /// 读取 JSON 数组文件；不存在/损坏返回空列表

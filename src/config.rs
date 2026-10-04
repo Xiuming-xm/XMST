@@ -104,6 +104,13 @@ pub struct GlobalConfig {
     /// Corner radius scale (1.0 = default rounding)
     #[serde(default = "default_corner_scale")]
     pub corner_scale: f32,
+    /// 界面控件间距（4.0..=16.0，默认 8.0）：工具条与卡片内控件之间的横向间距，
+    /// 与控件高度一起构成"全局间距/字体/圆角"里的间距一项（圆角走 corner_scale，字号走 ui_font_scale）
+    #[serde(default = "default_ui_item_spacing")]
+    pub ui_item_spacing: f32,
+    /// 界面控件高度（20.0..=34.0，默认 26.0）：按钮与输入框的统一高度（工具条上两者同高）
+    #[serde(default = "default_ui_ctl_h")]
+    pub ui_ctl_h: f32,
     /// Window corner radius scale, independent from widget corners
     #[serde(default = "default_window_corner_scale")]
     pub window_corner_scale: f32,
@@ -219,6 +226,14 @@ fn default_corner_scale() -> f32 {
     1.0
 }
 
+fn default_ui_item_spacing() -> f32 {
+    8.0
+}
+
+fn default_ui_ctl_h() -> f32 {
+    26.0
+}
+
 fn default_window_corner_scale() -> f32 {
     1.0
 }
@@ -314,6 +329,8 @@ impl Default for GlobalConfig {
             round_corners: true,
             window_round_corners: true,
             corner_scale: 1.0,
+            ui_item_spacing: 8.0,
+            ui_ctl_h: 26.0,
             window_corner_scale: 1.0,
             toast_style: "slide".to_string(),
             toast_duration_secs: 5.0,
