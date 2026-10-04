@@ -166,6 +166,32 @@ fn detect_core_jar(dir: &std::path::Path) -> String {
     best.or(vanilla).unwrap_or_else(|| "server.jar".to_string())
 }
 
+/// 准备服务器专属临时目录（`<服务器目录>\<private_tmp_name>`，默认 `tmp`）。
+/// 用于把子进程的 TEMP/TMP 与 JVM 的 java.io.tmpdir 从全局临时目录挪开：
+/// JNA、sqlite-jdbc 这类库启动时要把原生 DLL/so 解压到 java.io.tmpdir，
+/// 全局临时目录里残留同名旧目录时解压会失败（UnsatisfiedLinkError: Failed to create temporary file / _open_utf8）。
+/// 未开启时返回 Ok(None)；目录创建失败返回 Err（调用方记日志后照常启动，不因临时目录拒绝启动）。
+fn prepare_private_tmp(dir: &Path, sc: &ServerConfig) -> Result<Option<PathBuf>, String> {
+    if !sc.use_private_tmp {
+        return Ok(None);
+    }
+    let name = sc.private_tmp_name.trim();
+    let name = if name.is_empty() { "tmp" } else { name };
+    let p = dir.join(name);
+    // 服务器目录为相对路径时补上当前工作目录，保证传给 JVM 的是绝对路径
+    let p = if p.is_absolute() {
+        p
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(&p),
+            Err(_) => p,
+        }
+    };
+    std::fs::create_dir_all(&p)
+        .map_err(|e| format!("创建独立临时目录 {} 失败: {e}", p.display()))?;
+    Ok(Some(p))
+}
+
 /// ===== 服务端核心检测：目录/JAR/ZIP 整合包（拖入自动识别） =====
 /// 从源路径（JAR / ZIP / 文件夹）检测服务端核心候选列表。
 /// 检测策略：文件名前缀 > JAR 内 MANIFEST.MF > version.json，三层兜底。
@@ -2304,10 +2330,30 @@ impl App {
             rt.last_msg = "目录不存在".to_string();
             return;
         }
+        // 独立临时目录：把子进程的 TEMP/TMP 与 JVM 的 java.io.tmpdir 从全局临时目录
+        // 挪到 <服务器目录>\<private_tmp_name>。JNA / sqlite-jdbc 需要把原生 DLL 解压到
+        // java.io.tmpdir，全局临时目录有残留目录时会加载失败（UnsatisfiedLinkError）。
+        // 目录建不出来只提示，照常启动（临时目录不是启动的必要条件）。
+        let (priv_tmp, tmp_warn) = match prepare_private_tmp(&dir, &sc) {
+            Ok(p) => (p, None),
+            Err(e) => {
+                eprintln!("[启动] {e}");
+                (None, Some(e))
+            }
+        };
+        let tmp_env: Vec<(String, String)> = match &priv_tmp {
+            Some(p) => {
+                let s = p.display().to_string();
+                vec![("TEMP".to_string(), s.clone()), ("TMP".to_string(), s)]
+            }
+            None => Vec::new(),
+        };
         // 策略：优先运�?run.bat（经典方式），其次用 launch_cmd 模板
         let run_bat = dir.join("run.bat");
         let spawn_res = if run_bat.exists() {
-            process::spawn_hidden("cmd", &["/c", "run.bat"], &dir, true)
+            // run.bat 自建命令行，这里只注入 TEMP/TMP（java.io.tmpdir 默认取自这两者）；
+            // 脚本里若自带 -Djava.io.tmpdir 则以脚本为准。
+            process::spawn_hidden_env("cmd", &["/c", "run.bat"], &dir, true, &tmp_env)
         } else {
             // �?run.bat 时按解析链取 Java�?
             // 服务器指定列表项 -> 服务器自定义路径 -> run.bat 提取 -> 按版本自动匹�?-> 全局兜底 -> PATH
@@ -2328,8 +2374,16 @@ impl App {
                 .replace("-jar server.jar", &format!("-jar {core}"));
             let mut parts = cmd.split_whitespace();
             let prog = parts.next().unwrap_or("java").to_string();
-            let args: Vec<&str> = parts.collect();
-            process::spawn_hidden(&prog, &args, &dir, true)
+            let mut args: Vec<String> = parts.map(|s| s.to_string()).collect();
+            // 追加 -Djava.io.tmpdir：用户已在 jvm 参数里填过就不重复追加（整个命令行恰好一次）。
+            // 作为独立参数传入，不参与字符串拼接，路径含空格也不会被拆开。
+            if let Some(p) = &priv_tmp {
+                if !args.iter().any(|a| a.contains("-Djava.io.tmpdir")) {
+                    args.insert(0, format!("-Djava.io.tmpdir={}", p.display()));
+                }
+            }
+            let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            process::spawn_hidden_env(&prog, &arg_refs, &dir, true, &tmp_env)
         };
         match spawn_res {
             Ok(mp) => {
@@ -2348,7 +2402,18 @@ impl App {
                 if let Some(t) = &mut rt.log_tail {
                     t.seek_end();
                 }
-                rt.last_msg = "正在启动…（等待服务端就绪，日志出现 Done 后提示完成）".to_string();
+                rt.last_msg = match (&priv_tmp, &tmp_warn) {
+                    (Some(p), _) => format!(
+                        "正在启动…（TEMP/TMP/java.io.tmpdir = {}；等待服务端就绪，日志出现 Done 后提示完成）",
+                        p.display()
+                    ),
+                    (None, Some(w)) => {
+                        format!("正在启动…（{w}，已改用系统临时目录；等待服务端就绪）")
+                    }
+                    (None, None) => {
+                        "正在启动…（等待服务端就绪，日志出现 Done 后提示完成）".to_string()
+                    }
+                };
                 // 自动重启计时起点：每次成功启动都记录，interval 模式从此刻起�?
                 if let Some(sc) = self.cfg.servers.get_mut(idx) {
                     if sc.auto_restart.enabled {
@@ -10538,6 +10603,53 @@ impl App {
         if launch_cmd != self.cfg.servers[idx].launch_cmd {
             self.cfg.servers[idx].launch_cmd = launch_cmd;
             self.save_config();
+        }
+        ui.separator();
+
+        // 独立临时目录：修复 JNA / sqlite-jdbc 等原生库解压到全局临时目录后加载失败
+        let tmp_name_hint = {
+            let n = self.cfg.servers[idx].private_tmp_name.trim().to_string();
+            if n.is_empty() { "tmp".to_string() } else { n }
+        };
+        let mut upt = self.cfg.servers[idx].use_private_tmp;
+        if ui
+            .checkbox(&mut upt, "独立临时目录（修复 JNA/SQLite 原生库加载失败）")
+            .on_hover_text(format!(
+                "把服务器的 TEMP/TMP 与 java.io.tmpdir 指向 {}；某些模组（Spark/JNA/OSHW、使用 SQLite 的插件）在全局临时目录有残留时会加载失败。",
+                dir.join(&tmp_name_hint).display()
+            ))
+            .changed()
+        {
+            self.cfg.servers[idx].use_private_tmp = upt;
+            self.save_config();
+            self.set_toast(if upt {
+                "已启用独立临时目录（下次启动生效）".to_string()
+            } else {
+                "已关闭独立临时目录，改用系统临时目录（下次启动生效）".to_string()
+            });
+        }
+        if self.cfg.servers[idx].use_private_tmp {
+            let tmp_name = self.cfg.servers[idx].private_tmp_name.clone();
+            let tmp_name = if tmp_name.trim().is_empty() { "tmp".to_string() } else { tmp_name };
+            ui.horizontal(|ui| {
+                ui.label("目录名");
+                let mut name = self.cfg.servers[idx].private_tmp_name.clone();
+                if ui
+                    .add(TextEdit::singleline(&mut name).desired_width(120.0))
+                    .changed()
+                {
+                    self.cfg.servers[idx].private_tmp_name = name;
+                    self.save_config();
+                }
+                ui.label(
+                    RichText::new(format!(
+                        "实际路径：{}（启动时自动创建）",
+                        dir.join(&tmp_name).display()
+                    ))
+                    .weak()
+                    .small(),
+                );
+            });
         }
         ui.separator();
 

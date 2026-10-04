@@ -69,6 +69,18 @@ pub fn spawn_hidden(
     cwd: &Path,
     allow_stdin: bool,
 ) -> std::io::Result<ManagedProcess> {
+    spawn_hidden_env(cmd, args, cwd, allow_stdin, &[])
+}
+
+/// 同 spawn_hidden，但额外为子进程注入环境变量（如把 TEMP/TMP 指向服务器目录下的独立临时目录）。
+/// envs 中的变量覆盖继承来的同名值，且只作用于这一个子进程，不影响本工具自身。
+pub fn spawn_hidden_env(
+    cmd: &str,
+    args: &[&str],
+    cwd: &Path,
+    allow_stdin: bool,
+    envs: &[(String, String)],
+) -> std::io::Result<ManagedProcess> {
     use std::os::windows::process::CommandExt;
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -80,6 +92,9 @@ pub fn spawn_hidden(
         .creation_flags(CREATE_NO_WINDOW)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for (k, v) in envs {
+        command.env(k, v);
+    }
     if allow_stdin {
         command.stdin(Stdio::piped());
     } else {

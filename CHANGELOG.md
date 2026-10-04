@@ -2,6 +2,9 @@
 
 ## 0.1.1-alpha（未发布）
 
+### 启动环境
+- 新增每服务器「独立临时目录」开关（默认开启，可在服务器设置页的启动脚本分区关闭）：启动时自动创建 `<服务器目录>\tmp`，把子进程的 `TEMP`/`TMP` 与该 JVM 的 `java.io.tmpdir` 都指向它，修复 JNA / sqlite-jdbc 之类需要把原生 DLL 解压到临时目录的库因全局 `%TEMP%` 存在残留目录而 `UnsatisfiedLinkError` 崩溃的问题；用户已在 JVM 参数里自填 `-Djava.io.tmpdir` 时不重复追加，目录创建失败也只提示不阻止启动
+
 ### 备份系统改造
 - 快照格式改为**硬链接快照**：`<服务器目录>\.mcsrv_backups\snapshots\<时间戳>\`，与上一份相比未变的文件用硬链接指过去（不占新空间），变化/新增的才实际复制；每份快照在文件层面仍是完整全量，可独立回退。每份带 `meta.json`（触发原因/耗时/文件数/新增字节）与 `manifest.json`（逐文件大小 + 100ns 精度 mtime + link/copy），写盘后做完整性校验，失败则删除该份并保留上一份
 - 变化判定精确到 **100ns 精度 mtime**（`filetime::FileTime`），大于 16MB 的文件额外记录头尾各 64KB 采样哈希；新增**排除表**（`logs`/`crash-reports`/`session.lock`/`*.lock`/`cache`/`debug`/`.mcsrv_backups`/`.mcsrv_trash`，支持自定义），排除项既不备份也不参与对比

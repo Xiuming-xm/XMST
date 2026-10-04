@@ -248,6 +248,17 @@ fn default_true() -> bool {
     true
 }
 
+/// 独立临时目录默认开启：把服务器的 TEMP/TMP 与 java.io.tmpdir 指向服务器目录下的子目录，
+/// 避免 JNA / sqlite-jdbc 之类需要把原生 DLL 解压到 java.io.tmpdir 的库，
+/// 在全局临时目录存在残留（jna-*/sqlite-* 旧目录）时加载失败。
+fn default_use_private_tmp() -> bool {
+    true
+}
+
+fn default_private_tmp_name() -> String {
+    "tmp".to_string()
+}
+
 /// 内容衬底默认 0.5：材质之上再压一层半透明底色，保证内容区文字/控件稳定可读
 /// （Fluent 的 in-app acrylic 同样是「材质之上再压衬底」的思路）。
 /// 0.25 为历史默认，实测桌面细节仍直穿 UI（用户「半透明不够清晰」反馈的根因之一），
@@ -388,6 +399,12 @@ pub struct ServerConfig {
     pub jvm_args: Option<String>,
     /// 自定义启动命令模板，{java} {jvm} 会被替换
     pub launch_cmd: String,
+    /// 启动时使用服务器目录下的独立临时目录（TEMP/TMP + java.io.tmpdir）
+    #[serde(default = "default_use_private_tmp")]
+    pub use_private_tmp: bool,
+    /// 独立临时目录名（相对服务器目录，默认 tmp）
+    #[serde(default = "default_private_tmp_name")]
+    pub private_tmp_name: String,
     /// 是否被用户收藏（收藏的服务器在列表中置顶）
     #[serde(default)]
     pub favorited: bool,
@@ -426,6 +443,8 @@ impl Default for ServerConfig {
             mc_version: None,
             jvm_args: None,
             launch_cmd: "{java} {jvm} -jar server.jar nogui".to_string(),
+            use_private_tmp: default_use_private_tmp(),
+            private_tmp_name: default_private_tmp_name(),
             favorited: false,
             autostart_enabled: false,
             autostart_cpu_idle: true,
