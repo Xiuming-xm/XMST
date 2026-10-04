@@ -347,56 +347,15 @@ pub fn detect(dir: &Path) -> PlatformInfo {
         if let Ok(s) = std::fs::read_to_string(&log) {
             for line in s.lines().take(600) {
                 if mc_version.is_none() {
-                    if let Some(idx) = line.find("Starting minecraft server version") {
-                        let v: String = line[idx + 32..]
-                            .trim()
-                            .chars()
-                            .take_while(|c| c.is_ascii_digit() || *c == '.')
-                            .collect();
-                        if !v.is_empty() {
-                            evidence.push(format!("latest.log → MC {v}"));
-                            mc_version = Some(v);
-                        }
-                    }
-                }
-                if line.contains("Loading Minecraft ") {
-                    // "Loading Minecraft 1.21.11 with Fabric Loader 0.19.5"
-                    let after = line.split("Loading Minecraft ").nth(1).unwrap_or("");
-                    let ver: String = after
-                        .chars()
-                        .take_while(|c| c.is_ascii_digit() || *c == '.')
-                        .collect();
-                    if !ver.is_empty() {
-                        if mc_version.is_none() {
-                            evidence.push(format!("latest.log → MC {ver}"));
-                            mc_version = Some(ver);
-                        }
-                        if loader_version.is_none() {
-                            for key in ["Fabric Loader ", "NeoForge ", "Quilt Loader "] {
-                                if let Some(i) = after.find(key) {
-                                    let lv: String = after[i + key.len()..]
-                                        .chars()
-                                        .take_while(|c| c.is_ascii_digit() || *c == '.')
-                                        .collect();
-                                    if !lv.is_empty() {
-                                        evidence.push(format!("latest.log → {key}{lv}"));
-                                        loader_version = Some(lv);
-                                    }
-                                }
-                            }
-                        }
+                    if let Some(v) = mc_version_from_log_line(line) {
+                        evidence.push(format!("latest.log → MC {v}"));
+                        mc_version = Some(v);
                     }
                 }
                 if loader_version.is_none() {
-                    if let Some(i) = line.find("Forge Mod Loader version ") {
-                        let lv: String = line[i + 24..]
-                            .chars()
-                            .take_while(|c| c.is_ascii_digit() || *c == '.')
-                            .collect();
-                        if !lv.is_empty() {
-                            evidence.push(format!("latest.log → Forge {lv}"));
-                            loader_version = Some(lv);
-                        }
+                    if let Some(lv) = loader_version_from_log_line(line) {
+                        evidence.push(format!("latest.log → {lv}"));
+                        loader_version = Some(lv);
                     }
                 }
                 if mc_version.is_some() && loader_version.is_some() {
@@ -473,6 +432,62 @@ pub fn detect(dir: &Path) -> PlatformInfo {
         mod_count,
         plugin_count,
     }
+}
+
+/// 版本号提取：从 start 起取连续的 ASCII 数字与 `.`。
+fn digits_dotted(s: &str, start: usize) -> String {
+    s.get(start..)
+        .unwrap_or("")
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect()
+}
+
+/// 从一行服务端日志里取 MC 版本（原版/Paper 与 Fabric/NeoForge 两种格式）。
+///
+/// 查找结果的字节下标只用于 `get(..)`，needle 长度取自 `len()`，行被截断也不越界。
+fn mc_version_from_log_line(line: &str) -> Option<String> {
+    const VANILLA: &str = "Starting minecraft server version";
+    const LOADING: &str = "Loading Minecraft ";
+    if let Some(idx) = line.find(VANILLA) {
+        let v = digits_dotted(line, idx + VANILLA.len());
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    if let Some(idx) = line.find(LOADING) {
+        let v = digits_dotted(line, idx + LOADING.len());
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// 从一行服务端日志里取加载器版本（Fabric/Quilt/NeoForge/Forge 四种前缀）。
+///
+/// 前三种只出现在 "Loading Minecraft " 行内；Forge 的独立行也可能出现。
+fn loader_version_from_log_line(line: &str) -> Option<String> {
+    const LOADING: &str = "Loading Minecraft ";
+    const FORGE_OLD: &str = "Forge Mod Loader version ";
+    if let Some(idx) = line.find(LOADING) {
+        let after = line.get(idx + LOADING.len()..).unwrap_or("");
+        for key in ["Fabric Loader ", "NeoForge ", "Quilt Loader "] {
+            if let Some(i) = after.find(key) {
+                let lv = digits_dotted(after, i + key.len());
+                if !lv.is_empty() {
+                    return Some(format!("{key}{lv}"));
+                }
+            }
+        }
+    }
+    if let Some(i) = line.find(FORGE_OLD) {
+        let lv = digits_dotted(line, i + FORGE_OLD.len());
+        if !lv.is_empty() {
+            return Some(format!("{FORGE_OLD}{lv}"));
+        }
+    }
+    None
 }
 
 // ---------- 缓存层（渲染路径每帧调用 detect() 会反复读盘，这里做记忆化） ----------
@@ -841,5 +856,72 @@ mod tests {
         assert_eq!(PlatformKind::Vanilla.modrinth_loader(), None);
         assert!(!PlatformKind::Vanilla.is_modded());
         assert!(PlatformKind::Hybrid.is_modded() && PlatformKind::Hybrid.is_plugin_capable());
+    }
+
+    /// 日志行截断在 needle 处：不得越界（needle 长度必须取自 len()）
+    #[test]
+    fn log_line_truncated_at_needle() {
+        // needle 紧贴行尾
+        assert_eq!(
+            mc_version_from_log_line("Starting minecraft server version"),
+            None
+        );
+        assert_eq!(loader_version_from_log_line("Forge Mod Loader version "), None);
+        assert_eq!(mc_version_from_log_line("Loading Minecraft "), None);
+        assert_eq!(loader_version_from_log_line("Fabric Loader "), None);
+        // needle 后只剩空白/半个版本号
+        assert_eq!(
+            mc_version_from_log_line("[12:00:00] [Server thread/INFO]: Starting minecraft server version   "),
+            None
+        );
+        assert_eq!(
+            loader_version_from_log_line("Loading Minecraft 1.21.1 with NeoForge "),
+            None
+        );
+    }
+
+    /// 正常行与紧贴行尾的完整版本号都能取到
+    #[test]
+    fn log_line_version_extract() {
+        let probe = "Starting minecraft server version 1.21.1";
+        assert_eq!(
+            probe.find("Starting minecraft server version"),
+            Some(0),
+            "needle={:?} probe={:?}",
+            "Starting minecraft server version",
+            probe
+        );
+        assert_eq!(
+            digits_dotted(probe, 33),
+            "1.21.1",
+            "digits raw, probe.len()={}",
+            probe.len()
+        );
+        assert_eq!(
+            mc_version_from_log_line("Starting minecraft server version 1.21.1").as_deref(),
+            Some("1.21.1")
+        );
+        assert_eq!(
+            mc_version_from_log_line("Starting minecraft server version 1.20.1\n").as_deref(),
+            Some("1.20.1")
+        );
+        assert_eq!(
+            loader_version_from_log_line("Loading Minecraft 1.21.11 with Fabric Loader 0.19.5")
+                .as_deref(),
+            Some("Fabric Loader 0.19.5")
+        );
+        assert_eq!(
+            loader_version_from_log_line("Forge Mod Loader version 47.2.0 for Minecraft 1.20.1")
+                .as_deref(),
+            Some("Forge Mod Loader version 47.2.0")
+        );
+        assert_eq!(
+            loader_version_from_log_line("Loading Minecraft 1.21.1 with NeoForge 21.1.72")
+                .as_deref(),
+            Some("NeoForge 21.1.72")
+        );
+        // 非 ASCII 前缀不得 panic（按字符边界取）
+        assert_eq!(mc_version_from_log_line("中文前缀 Starting minecraft server version 1.21.4").as_deref(), Some("1.21.4"));
+        assert_eq!(mc_version_from_log_line("无关中文日志行"), None);
     }
 }

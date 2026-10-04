@@ -72,6 +72,9 @@ impl LogDb {
     }
 
     /// 查询最近 N 条；可选按来源过滤（src 精确匹配）。
+    ///
+    /// 逐行容错：某行的列缺失/类型不符（NULL、旧库结构、内容损坏）时只跳过该行，
+    /// 不影响其余日志 —— 原实现用 `collect::<Result<Vec<_>>>()`，一行出错就整批丢弃。
     pub fn recent(&self, limit: i64, src_filter: Option<&str>) -> Vec<LogRow> {
         let limit = if limit <= 0 { 100 } else { limit };
         let mut out = Vec::new();
@@ -91,11 +94,11 @@ impl LogDb {
                     Ok(s) => s,
                     Err(_) => return out,
                 };
-                let mut rows = match stmt.query_map(params![src, limit], map_row) {
+                let rows = match stmt.query_map(params![src, limit], map_row) {
                     Ok(r) => r,
                     Err(_) => return out,
                 };
-                rows.collect::<rusqlite::Result<Vec<_>>>().unwrap_or_default()
+                rows.filter_map(|r| r.ok()).collect()
             }
             None => {
                 let mut stmt = match self
@@ -105,15 +108,15 @@ impl LogDb {
                     Ok(s) => s,
                     Err(_) => return out,
                 };
-                let mut rows = match stmt.query_map(params![limit], map_row) {
+                let rows = match stmt.query_map(params![limit], map_row) {
                     Ok(r) => r,
                     Err(_) => return out,
                 };
-                rows.collect::<rusqlite::Result<Vec<_>>>().unwrap_or_default()
+                rows.filter_map(|r| r.ok()).collect()
             }
         };
         out.extend(collected);
-                out.reverse(); // 时间正序（旧→新）
+        out.reverse(); // 时间正序（旧→新）
         out
     }
 

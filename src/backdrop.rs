@@ -88,13 +88,31 @@ struct Done {
 
 impl Drop for BackdropCapture {
     fn drop(&mut self) {
-        if let Ok(mut s) = self.shared.lock() {
-            s.stop = true;
-        }
+        // 锁中毒也要写入停止标志，否则工作线程永不退出、join 会一直等
+        self.shared.lock().unwrap_or_else(|e| e.into_inner()).stop = true;
         if let Some(h) = self.worker.take() {
-            let _ = h.join();
+            wait_worker(h);
         }
     }
+}
+
+/// 有界等待工作线程退出：线程已结束立即返回，超时后放弃等待（句柄分离）。
+///
+/// 抓屏走 GDI/DWM，极少数情况下可能卡在系统调用里；托盘态/退出流程不能被它无界拖住。
+fn wait_worker(h: std::thread::JoinHandle<()>) {
+    /// 最长等待时间
+    const WAIT_MAX: std::time::Duration = std::time::Duration::from_millis(1500);
+    /// 轮询间隔
+    const POLL: std::time::Duration = std::time::Duration::from_millis(2);
+    let deadline = Instant::now() + WAIT_MAX;
+    while !h.is_finished() {
+        if Instant::now() >= deadline {
+            // 超时：不再 join（detach），避免无界等待
+            return;
+        }
+        std::thread::sleep(POLL);
+    }
+    let _ = h.join();
 }
 
 impl Default for BackdropCapture {
@@ -229,19 +247,21 @@ impl BackdropCapture {
                 self.last = Some(Instant::now());
                 self.last_rect = rect_px;
                 self.pending = true;
-                if let Ok(mut s) = self.shared.lock() {
-                    s.job = Some(Job {
-                        seq: self.seq,
-                        rect: (x, y, w, h),
-                        ds: downscale.clamp(1, 32),
-                        blur: blur_px,
-                    });
-                }
+                let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+                s.job = Some(Job {
+                    seq: self.seq,
+                    rect: (x, y, w, h),
+                    ds: downscale.clamp(1, 32),
+                    blur: blur_px,
+                });
             }
         }
 
         // 2) 收取结果并上传纹理
-        let done = { self.shared.lock().ok().and_then(|mut s| s.done.take()) };
+        let done = {
+            let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+            s.done.take()
+        };
         let Some(d) = done else {
             return false;
         };
@@ -286,10 +306,7 @@ impl BackdropCapture {
             let mut gdi = GdiBuf::default();
             loop {
                 let job = {
-                    let mut s = match shared.lock() {
-                        Ok(s) => s,
-                        Err(_) => return,
-                    };
+                    let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
                     if s.stop {
                         return;
                     }
@@ -334,18 +351,17 @@ impl BackdropCapture {
                     }
                 }
                 let ms = t0.elapsed().as_secs_f32() * 1000.0;
-                if let Ok(mut s) = shared.lock() {
-                    s.done = Some(Done {
-                        seq: j.seq,
-                        rect: j.rect,
-                        ds: j.ds,
-                        size: (tw, th),
-                        px,
-                        mean,
-                        samples,
-                        ms,
-                    });
-                }
+                let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
+                s.done = Some(Done {
+                    seq: j.seq,
+                    rect: j.rect,
+                    ds: j.ds,
+                    size: (tw, th),
+                    px,
+                    mean,
+                    samples,
+                    ms,
+                });
             }
         }));
     }

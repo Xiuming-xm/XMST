@@ -2475,6 +2475,13 @@ struct App {
     shot_path: Option<std::path::PathBuf>,
     shot_frames: u32,
     shot_done: bool,
+    // ---------- 自动化入口：XMST_OPEN_PAGE ----------
+    /// `XMST_OPEN_PAGE=<页面>`：启动后自动切到该页面（供命令行复现页面崩溃）
+    open_page: Option<String>,
+    /// 还需渲染的帧数（`XMST_OPEN_PAGE_FRAMES`，默认 300），归零后自动退出
+    open_page_left: u32,
+    /// 已发出关闭命令后的等待帧数（关闭被二次确认拦住时的兜底强退计数）
+    open_page_wait: u32,
     // ---------- 外部实例接管 / 诊断包 / 一次性后台任务 ----------
     /// 外部实例扫描节流时刻（每次扫描要枚举进程 + 读命令行，不能每帧做）
     external_scan_at: Option<std::time::Instant>,
@@ -3313,6 +3320,9 @@ impl App {
             shot_path: std::env::var("XMST_SHOT").ok().map(std::path::PathBuf::from),
             shot_frames: 0,
             shot_done: false,
+            open_page: None,
+            open_page_left: 0,
+            open_page_wait: 0,
             external_scan_at: None,
             confirm_kill_external: None,
             confirm_start_external: None,
@@ -3436,6 +3446,8 @@ impl App {
         // 启动时扫描"上次未正常退出仍在运行"的服务器：异常退出不再连带杀死服务器，
         // 所以这里很可能真的扫到东西；扫到就弹一次可关闭的提示（全部接管 / 忽略）。
         app.detect_startup_leftovers();
+        // 自动化入口：XMST_OPEN_PAGE=<页面> → 启动即切到该页（在首帧渲染前完成）
+        app.apply_open_page_env();
         app
     }
 
@@ -3444,6 +3456,106 @@ impl App {
         let logs_dir = self.data_dir().join("logs");
         let _ = std::fs::create_dir_all(&logs_dir);
         logdb::LogDb::open(&logs_dir.join("xmst_logs.db"), logdb::DEFAULT_MAX_ROWS)
+    }
+
+    /// 自动化入口：`XMST_OPEN_PAGE=<页面>`，配合 `XMST_OPEN_PAGE_FRAMES=<帧数>`（默认 300）。
+    ///
+    /// 启动后直接切到指定页面，渲染指定帧数后自动退出，让「点某个页面就崩溃」这类问题
+    /// 能在命令行里复现并拿到退出码/崩溃日志，不需要人工点击。
+    /// 页面名：`dashboard` / `servers` / `tunnel` / `logs` / `settings` / `download` / `plugins`；
+    /// 服务器页内的子页：`files` / `backup` / `players` / `special`。
+    fn apply_open_page_env(&mut self) {
+        let page = match std::env::var("XMST_OPEN_PAGE") {
+            Ok(p) => p.trim().to_ascii_lowercase(),
+            Err(_) => return,
+        };
+        if page.is_empty() {
+            return;
+        }
+        let frames = std::env::var("XMST_OPEN_PAGE_FRAMES")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(300)
+            .clamp(1, 100_000);
+        // 服务器子页必须选中一台服务器才会渲染详情
+        let mut need_server = false;
+        match page.as_str() {
+            "dashboard" => self.nav = Nav::Dashboard,
+            "servers" => self.nav = Nav::Servers,
+            "tunnel" => self.nav = Nav::Tunnel,
+            "logs" => self.nav = Nav::Logs,
+            "settings" => self.nav = Nav::Settings,
+            "download" => self.nav = Nav::Download,
+            "plugins" => self.nav = Nav::Plugins,
+            "files" => {
+                self.nav = Nav::Servers;
+                self.server_tab = ServerTab::Files;
+                need_server = true;
+            }
+            "backup" => {
+                self.nav = Nav::Servers;
+                self.server_tab = ServerTab::Backup;
+                need_server = true;
+            }
+            "players" => {
+                self.nav = Nav::Servers;
+                self.server_tab = ServerTab::Players;
+                need_server = true;
+            }
+            "special" => {
+                self.nav = Nav::Servers;
+                self.server_tab = ServerTab::Special;
+                need_server = true;
+            }
+            other => {
+                eprintln!("XMST_OPEN_PAGE: 未知页面名 {other}（未切换页面）");
+                return;
+            }
+        }
+        if need_server && self.selected_server.is_none() && !self.cfg.servers.is_empty() {
+            self.selected_server = Some(0);
+        }
+        // 门控关闭时页签会被 ui_server_detail 回落到概览：提前说明，避免误判"没进去"
+        if page == "special" && !features::is_enabled(&self.cfg.features, features::BETA_SPECIAL) {
+            eprintln!("XMST_OPEN_PAGE: 特殊功能总开关未启用，页签会回落到概览");
+        }
+        if page == "players" && !features::is_enabled(&self.cfg.features, features::BETA_PLAYERS) {
+            eprintln!("XMST_OPEN_PAGE: 玩家管理总开关未启用，页签会回落到概览");
+        }
+        if need_server && self.selected_server.is_none() {
+            eprintln!("XMST_OPEN_PAGE: 配置里没有服务器，{page} 只渲染到服务器列表");
+        }
+        self.open_page = Some(page.clone());
+        self.open_page_left = frames;
+        self.open_page_wait = 0;
+        eprintln!("XMST_OPEN_PAGE: {page}（渲染 {frames} 帧后自动退出）");
+    }
+
+    /// `XMST_OPEN_PAGE` 的帧计数与退出（见 `apply_open_page_env`）。
+    ///
+    /// 计数期间主动请求重绘：没有输入也要持续出帧，帧数才可预期地走完。
+    fn tick_open_page(&mut self, ctx: &egui::Context) {
+        if self.open_page.is_none() {
+            return;
+        }
+        if self.open_page_left > 0 {
+            self.open_page_left = self.open_page_left.saturating_sub(1);
+            ctx.request_repaint();
+            return;
+        }
+        if self.open_page_wait == 0 {
+            let page = self.open_page.clone().unwrap_or_default();
+            // 退出路径会跳过配置去抖，这里先落盘，避免诊断运行把改动丢掉
+            self.flush_config();
+            eprintln!("XMST_OPEN_PAGE done: {page}（未崩溃）");
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        self.open_page_wait = self.open_page_wait.saturating_add(1);
+        ctx.request_repaint();
+        // 兜底：有服务器在运行时关闭会被二次确认拦住，最多再等 300 帧直接退出
+        if self.open_page_wait > 300 {
+            std::process::exit(0);
+        }
     }
 
     /// 阶段C：frpc 热重载（reload -c 配置文件），不重启进程；仅 frp 隧道支持（rathole 无等价能力）。
@@ -9071,20 +9183,32 @@ fn gen_rh_key_hex() -> String {
 }
 
 /// Recursively find rathole.exe under dir (release zip may nest in a subfolder).
+///
+/// 显式栈 + 不跟随 junction/符号链接：目录层级深时不会爆栈，也不会被自指链接挂住。
 fn find_exe_recursive(dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    for entry in std::fs::read_dir(dir).ok()? {
-        let entry = entry.ok()?;
-        let p = entry.path();
-        if p.is_dir() {
-            if let Some(f) = find_exe_recursive(&p) {
-                return Some(f);
+    /// 目录（非符号链接/junction）才继续展开
+    fn pushable_dir(p: &std::path::Path) -> bool {
+        match std::fs::symlink_metadata(p) {
+            Ok(m) => m.is_dir() && !m.file_type().is_symlink(),
+            Err(_) => false,
+        }
+    }
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if pushable_dir(&p) {
+                stack.push(p);
+            } else if p
+                .file_name()
+                .map(|n| n.to_string_lossy().eq_ignore_ascii_case("rathole.exe"))
+                .unwrap_or(false)
+            {
+                return Some(p);
             }
-        } else if p
-            .file_name()
-            .map(|n| n.to_string_lossy().eq_ignore_ascii_case("rathole.exe"))
-            .unwrap_or(false)
-        {
-            return Some(p);
         }
     }
     None
@@ -11116,15 +11240,26 @@ fn dir_size_mb_uncached(p: &Path) -> String {
         return "—".to_string();
     }
     let mut total: u64 = 0;
+    let mut visited: HashSet<std::path::PathBuf> = HashSet::new();
     let mut stack = vec![p.to_path_buf()];
     while let Some(d) = stack.pop() {
+        // canonicalize 失败（权限/已删除）就跳过该项
+        let Ok(key) = std::fs::canonicalize(&d) else {
+            continue;
+        };
+        if !visited.insert(key) {
+            continue;
+        }
         let Ok(rd) = std::fs::read_dir(&d) else { continue };
         for e in rd.flatten() {
+            let path = e.path();
+            if is_real_dir(&path) {
+                stack.push(path);
+                continue;
+            }
             let Ok(md) = e.metadata() else { continue };
-            if md.is_dir() {
-                stack.push(e.path());
-            } else {
-                total += md.len();
+            if !md.is_dir() {
+                total = total.saturating_add(md.len());
             }
         }
     }
@@ -11254,19 +11389,34 @@ fn main() -> eframe::Result {
         }
         std::process::exit(0);
     }
-    // 崩溃日志钩子：panic 时把信息+堆栈写入 data\crash.log 并弹窗提示（便于定位崩溃�?
+    // 崩溃日志钩子：panic 时把「消息 + 位置 + 堆栈」写入 <exe目录>\data\crash.log，
+    // 同时尽力打到 stderr，并弹窗提示。安装位置必须在 eframe/App::new 之前，
+    // 否则 UI 初始化阶段的 panic 抓不到。
+    // 注意：栈溢出（进程被系统直接终止）不会走 panic 钩子，此时 crash.log 里不会有记录。
     {
         let crash_path = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|p| p.join("data").join("crash.log")))
             .unwrap_or_else(|| PathBuf::from("crash.log"));
         std::panic::set_hook(Box::new(move |info| {
-            let msg = info.to_string();
+            // 钩子内再 panic 会直接终止进程，因此这里的输出一律忽略错误
+            let msg = match info.payload().downcast_ref::<&str>() {
+                Some(s) => (*s).to_string(),
+                None => match info.payload().downcast_ref::<String>() {
+                    Some(s) => s.clone(),
+                    None => "（无法读取 panic 内容）".to_string(),
+                },
+            };
+            let loc = info
+                .location()
+                .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+                .unwrap_or_else(|| "位置未知".to_string());
             let bt = std::backtrace::Backtrace::force_capture();
             let text = format!(
-                "[{}] PANIC: {}\n\nBacktrace:\n{}\n{}\n",
+                "[{}] PANIC: {}\n位置: {}\n\nBacktrace:\n{}\n{}\n",
                 chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
                 msg,
+                loc,
                 bt,
                 "=".repeat(70)
             );
@@ -11280,30 +11430,51 @@ fn main() -> eframe::Result {
                     let _ = std::fs::rename(&crash_path, crash_path.with_extension("log.1"));
                 }
             }
+            let mut filed = false;
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&crash_path)
             {
                 use std::io::Write;
-                let _ = f.write_all(text.as_bytes());
+                filed = f.write_all(text.as_bytes()).is_ok();
+                let _ = f.flush();
             }
-            unsafe {
-                use winapi::um::winuser::{MessageBoxW, MB_ICONERROR, MB_OK};
-                let m: Vec<u16> = format!(
-                    "XMST 发生异常即将退出，崩溃日志已写入\n{}",
-                    crash_path.display()
-                )
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .collect();
-                let t: Vec<u16> = "XMST 崩溃".encode_utf16().chain(std::iter::once(0)).collect();
-                MessageBoxW(
-                    std::ptr::null_mut(),
-                    m.as_ptr(),
-                    t.as_ptr(),
-                    MB_OK | MB_ICONERROR,
-                );
+            // 落盘失败（目录只读 / 磁盘满 / 权限不足）也要把现场打到 stderr，别让记录彻底丢失
+            {
+                use std::io::Write;
+                let mut err = std::io::stderr();
+                let _ = err.write_all(text.as_bytes());
+                if !filed {
+                    let _ = err.write_all(
+                        format!("（crash.log 写入失败：{}）\n", crash_path.display()).as_bytes(),
+                    );
+                }
+            }
+            // 自动化诊断（XMST_OPEN_PAGE / XMST_SHOT / XMST_OPEN_TEST / XMST_CRASHSCAN）下不弹窗：
+            // 无人值守时模态框会把进程卡住，日志已经写好，命令行直接能拿到现场。
+            let automated = ["XMST_OPEN_PAGE", "XMST_SHOT", "XMST_OPEN_TEST", "XMST_CRASHSCAN"]
+                .iter()
+                .any(|k| std::env::var_os(k).is_some());
+            if !automated {
+                unsafe {
+                    use winapi::um::winuser::{MessageBoxW, MB_ICONERROR, MB_OK};
+                    let m: Vec<u16> = format!(
+                        "XMST 发生异常即将退出，崩溃日志已写入\n{}",
+                        crash_path.display()
+                    )
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect();
+                    let t: Vec<u16> =
+                        "XMST 崩溃".encode_utf16().chain(std::iter::once(0)).collect();
+                    MessageBoxW(
+                        std::ptr::null_mut(),
+                        m.as_ptr(),
+                        t.as_ptr(),
+                        MB_OK | MB_ICONERROR,
+                    );
+                }
             }
         }));
     }
@@ -11958,6 +12129,8 @@ impl eframe::App for App {
         self.handle_edge_resize(ctx);
         // 无边框窗口自绘缩放：边缘按住拖动逐帧 SetWindowPos（与系统窗口一致的自由缩放）
         self.poll_resize_drag(ctx);
+        // 自动化入口（XMST_OPEN_PAGE）：切到指定页面渲染 N 帧后自动退出
+        self.tick_open_page(ctx);
         // F12：把当前窗口画面存成 BMP（背景效果开启时窗口会被系统排除在截屏之外，
         // 外部截屏/录屏都拍不到本窗口，因此提供内置截图作为唯一可靠手段）。
         if !self.shot_done
@@ -13681,16 +13854,20 @@ impl App {
 
     /// 从日志行中 " joined/left the game" 事件位置向前提取玩家名（去掉可能的后缀 [/IP:port] 等）。
     fn extract_player_name(line: &str, event_pos: usize) -> Option<String> {
-        let before = &line[..event_pos];
+        // 事件位置由调用方的 find() 得到，这里再按字符边界夹取一次
+        let before = safe_from(line, event_pos.min(line.len()));
         let sep = before
             .rfind("]: ")
             .map(|i| i + 3)
             .or_else(|| before.rfind(": ").map(|i| i + 2))?;
-        let mut name = before[sep..].trim().to_string();
-        if let Some(b) = name.find('[') {
-            name.truncate(b);
-        }
-        let name = name.trim().to_string();
+        let name = safe_from(before, sep);
+        // 取 '[' 之前的部分（不能用字节 truncate）
+        let name = name
+            .find('[')
+            .map(|b| safe_from(name, b))
+            .unwrap_or(name)
+            .trim()
+            .to_string();
         if name.is_empty() { None } else { Some(name) }
     }
 
@@ -23494,19 +23671,25 @@ impl App {
     /// 因此不按服务器拆页签，筛选靠「来源」下拉完成。原「设置 → 日志」整段已并入本页。
     /// 日志库查询（500ms 节流缓存）：此前在日志页渲染路径里每帧执行
     /// SELECT COUNT(*) + 取 800 行。
+    ///
+    /// ★ 崩溃修复：本函数原先在"缓存过期"分支里写成了 `self.log_rows_cached()`（自我递归），
+    /// 而时间戳是在递归返回后才写入的，于是每一层递归都判定缓存过期 → 无限递归 →
+    /// 主线程栈溢出被系统直接终止（`0xC00000FD`）。栈溢出不走 panic 钩子，所以 crash.log
+    /// 里没有任何记录。这里按抽取缓存前的原语义查询：总条数 + 最近 800 行。
     fn log_rows_cached(&mut self) -> (i64, Vec<logdb::LogRow>) {
         let stale = self
             .log_cache_at
             .map(|t| t.elapsed() > std::time::Duration::from_millis(500))
             .unwrap_or(true);
         if stale {
-            let (c, r) = match &self.logdb {
-                Some(db) => self.log_rows_cached(),
+            let (c, r) = match self.logdb.as_ref() {
+                Some(db) => (db.count(), db.recent(800, None)),
                 None => (0, Vec::new()),
             };
+            // 先落时间戳再填数据：任何提前返回都不会让"缓存过期"重复成立
+            self.log_cache_at = Some(std::time::Instant::now());
             self.log_cache_count = c;
             self.log_cache_rows = r;
-            self.log_cache_at = Some(std::time::Instant::now());
         }
         (self.log_cache_count, self.log_cache_rows.clone())
     }
@@ -23525,7 +23708,8 @@ impl App {
             .show(ctx, |ui| {
                 let avail = ui.available_rect_before_wrap();
                 let pad = 14.0f32;
-                let w = (avail.width() - pad).min(1100.0);
+                // 宽度钳到非负：极窄面板下 (width - pad) 会变成负数，避免构造出反向矩形
+                let w = (avail.width() - pad).clamp(0.0, 1100.0);
                 let mut inner = ui.new_child(
                     egui::UiBuilder::new()
                         .max_rect(egui::Rect::from_min_size(
@@ -23547,9 +23731,10 @@ impl App {
                 });
                 ui.separator();
                 // ---- 统计卡 ----
-                let (count, rows) = match &self.logdb {
-                    Some(db) => self.log_rows_cached(),
-                    None => (0, Vec::new()),
+                let (count, rows) = if self.logdb.is_some() {
+                    self.log_rows_cached()
+                } else {
+                    (0, Vec::new())
                 };
                 let sources: Vec<String> = {
                     let mut v: Vec<String> = rows.iter().map(|r| r.src.clone()).collect();
@@ -23563,7 +23748,8 @@ impl App {
                         ("库上限（轮转）", "50000".to_string()),
                         (
                             "最近写入",
-                            rows.first().map(|r| r.ts.clone()).unwrap_or_else(|| "暂无".into()),
+                            // recent() 返回的是时间正序（旧→新），最新一条在末尾
+                            rows.last().map(|r| r.ts.clone()).unwrap_or_else(|| "暂无".into()),
                         ),
                     ] {
                         egui::Frame::none()
@@ -25170,12 +25356,20 @@ fn download_frpc(
 }
 
 fn find_file_recursive(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    let mut visited: HashSet<std::path::PathBuf> = HashSet::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
+        // canonicalize 失败（权限/已删除）就跳过该项
+        let Ok(key) = std::fs::canonicalize(&d) else {
+            continue;
+        };
+        if !visited.insert(key) {
+            continue;
+        }
         if let Ok(entries) = std::fs::read_dir(&d) {
             for e in entries.flatten() {
                 let p = e.path();
-                if p.is_dir() {
+                if is_real_dir(&p) {
                     stack.push(p);
                 } else if p.file_name().map(|n| n == name).unwrap_or(false) {
                     return Some(p);
@@ -25318,19 +25512,40 @@ fn parse_frp_server_port(cfg: &str) -> Option<u16> {
     None
 }
 
-/// 递归统计目录占用字节数（后台线程调用，避免大 world 卡 UI）
+/// 是否为「真实目录」：不跟随 junction / 符号链接（`is_dir()` 会跟随，可能成环）。
+fn is_real_dir(p: &std::path::Path) -> bool {
+    match std::fs::symlink_metadata(p) {
+        Ok(m) => m.is_dir() && !m.file_type().is_symlink(),
+        Err(_) => false,
+    }
+}
+
+/// 递归统计目录占用字节数（后台线程调用，避免大 world 卡 UI）。
+///
+/// 显式栈 + canonicalize 去重：junction/符号链接自指或互指都不会成环。
 fn dir_size_bytes(path: &std::path::Path) -> u64 {
     let mut total = 0u64;
-    if let Ok(rd) = std::fs::read_dir(path) {
+    let mut visited: HashSet<std::path::PathBuf> = HashSet::new();
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        // canonicalize 失败（权限/已删除）就跳过该项
+        let Ok(key) = std::fs::canonicalize(&dir) else {
+            continue;
+        };
+        if !visited.insert(key) {
+            continue;
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for e in rd.flatten() {
             let p = e.path();
-            let meta = match e.metadata() {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if meta.is_dir() {
-                total = total.saturating_add(dir_size_bytes(&p));
-            } else {
+            if is_real_dir(&p) {
+                stack.push(p);
+                continue;
+            }
+            let Ok(meta) = e.metadata() else { continue };
+            if !meta.is_dir() {
                 total = total.saturating_add(meta.len());
             }
         }
@@ -28198,6 +28413,35 @@ mod finishing_batch_selfcheck {
         assert_eq!(normalize_launch_mode("Java"), "java");
         assert_eq!(normalize_launch_mode(""), "auto");
         assert_eq!(normalize_launch_mode("不认识的值"), "auto");
+    }
+
+    /// 玩家名提取：多字节前缀 + `[` 后缀都不得 panic，且能取到正确名字
+    #[test]
+    fn player_name_extraction() {
+        let line = "[12:00:00] [Server thread/INFO]: Steve joined the game";
+        let pos = line.find(" joined the game").unwrap_or(0);
+        assert_eq!(App::extract_player_name(line, pos).as_deref(), Some("Steve"));
+
+        // 中文/emoji 前缀：按字节切 '[' 会 panic，必须安全
+        let line = "[12:00:00] [Server thread/INFO]: 玩家名字很长 joined the game";
+        let pos = line.find(" joined the game").unwrap_or(0);
+        assert_eq!(
+            App::extract_player_name(line, pos).as_deref(),
+            Some("玩家名字很长")
+        );
+
+        let line = "[12:00:00] [Server thread/INFO]: 🙂玩家[/127.0.0.1:5000] joined the game";
+        let pos = line.find(" joined the game").unwrap_or(0);
+        assert_eq!(App::extract_player_name(line, pos).as_deref(), Some("🙂玩家"));
+
+        // 事件位置落在多字节字符中间（外部调用可能给错）→ 不 panic
+        let line = "[12:00:00] [Server thread/INFO]: 玩家名字 joined the game";
+        let pos = line.find(" joined the game").unwrap_or(0) + 1;
+        let _ = App::extract_player_name(line, pos);
+
+        // 事件位置越界 → 不 panic
+        let _ = App::extract_player_name("中文日志", 99);
+        assert_eq!(App::extract_player_name("中文日志", 0), None);
     }
 }
 

@@ -997,7 +997,13 @@ pub fn trim_lines(buf: &mut String, max_lines: usize) {
         idx += 1;
     }
     if idx > 0 && idx < buf.len() {
-        *buf = buf[idx..].to_string();
+        // 双重保险：idx 正常情况下紧跟在 '\n' 之后（必然是字符边界），但缓冲区是跨帧
+        // 拼接的，这里仍显式校准到字符边界，杜绝按字节切中汉字（release 下 panic=abort）
+        let mut at = idx;
+        while at < buf.len() && !buf.is_char_boundary(at) {
+            at += 1;
+        }
+        *buf = buf[at..].to_string();
     }
 }
 
