@@ -4,18 +4,282 @@ use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use winapi::shared::minwindef::{BOOL, DWORD, LPVOID};
+use winapi::um::errhandlingapi::GetLastError;
 use winapi::um::handleapi::CloseHandle;
+use winapi::um::jobapi::IsProcessInJob;
 use winapi::um::jobapi2::{AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject};
+use winapi::um::processthreadsapi::{GetCurrentProcess, GetExitCodeProcess};
 use winapi::um::winnt::{
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
 };
 
 /// stderr 末尾保留行数（崩溃诊断要展示"最后 30 行"，这里多留一些便于后续扩展）
 const STDERR_TAIL_LINES: usize = 200;
+
+// ==================== 启动诊断日志（data\launch.log） ====================
+//
+// 目的：定位"工具启动 bat 失败、但同样的命令在 PowerShell 里能成功"这一类问题。
+// 每次启动尝试都写一组键值对记录：实际 program/args/cwd、传给子进程的环境变量、
+// 本进程完整性级别与是否在 Job 内、CreateProcess 与 Job 分配结果、子进程 PID、
+// 前 3 秒内捕获到的 stdout/stderr 首行、退出码（含 0xC0000142 这类 Windows 级错误码）。
+//
+// 约定：全部 best-effort —— 写日志的任何失败都直接忽略，绝不影响启动流程；
+// 文件超过 1 MB 时只保留末尾 500 行（与 integrity_check.log 的裁剪思路一致）。
+
+/// 启动日志超过该大小即裁剪
+const LAUNCH_LOG_MAX_BYTES: u64 = 1024 * 1024;
+/// 裁剪时保留的末尾行数
+const LAUNCH_LOG_KEEP_LINES: usize = 500;
+/// 单条记录里环境变量值最多截取的字符数（PATH 可能上千字符，全写进去反而看不清）
+const ENV_SNIPPET_CHARS: usize = 200;
+
+/// 启动尝试编号：每调用一次 `LaunchCtx::new` 递增，同一次启动的所有记录共用。
+static LAUNCH_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// `data\launch.log` 的路径（与配置/日志同级的 exe 目录下 data）。
+pub fn launch_log_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("data")
+        .join("launch.log")
+}
+
+/// 追加一行启动诊断记录（best-effort：任何一步失败都忽略）。
+/// 文件超过 1 MB 时先裁到末尾 500 行再追加。
+pub fn launch_log_line(text: &str) {
+    use std::io::Write;
+    let path = launch_log_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > LAUNCH_LOG_MAX_BYTES {
+            if let Ok(txt) = std::fs::read_to_string(&path) {
+                let all: Vec<&str> = txt.lines().collect();
+                let keep: Vec<&str> = all
+                    .iter()
+                    .skip(all.len().saturating_sub(LAUNCH_LOG_KEEP_LINES))
+                    .copied()
+                    .collect();
+                let _ = std::fs::write(&path, keep.join("\n") + "\n");
+            }
+        }
+    }
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    let _ = writeln!(
+        f,
+        "[{}] {}",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+        text
+    );
+}
+
+/// 写一行"分节标题"（每次启动尝试之前的醒目分隔，便于直接在日志里定位一组记录）。
+pub fn launch_log_sep(title: &str) {
+    launch_log_line(&format!("==================== {title} ===================="));
+}
+
+/// 确保启动日志文件存在（「打开启动日志」按钮用：文件不存在时 explorer 选中会退化打开父目录）。
+pub fn ensure_launch_log() {
+    let path = launch_log_path();
+    if path.exists() {
+        return;
+    }
+    launch_log_line("启动日志已创建：此后每次启动的完整记录都会追加到这里");
+}
+
+/// 一次启动尝试的上下文：带同一编号的每一行记录都能直接看出"是谁、在什么条件下启动的"。
+#[derive(Clone, Debug)]
+pub struct LaunchCtx {
+    /// 尝试编号（`启动#N`）
+    pub id: u64,
+    /// 服务器名
+    pub server: String,
+    /// 服务器目录
+    pub dir: String,
+    /// 启动方式说明（run.bat / launch_cmd 模板 / 诊断组合①…）
+    pub kind: String,
+}
+
+impl LaunchCtx {
+    /// 新建一次启动尝试上下文（自动分配编号）。
+    pub fn new(server: &str, dir: &Path, kind: &str) -> Self {
+        Self {
+            id: LAUNCH_SEQ.fetch_add(1, Ordering::Relaxed),
+            server: server.to_string(),
+            dir: dir.display().to_string(),
+            kind: kind.to_string(),
+        }
+    }
+
+    /// 记录前缀：`启动#3 server="Fabric1.21.11" dir=D:\... 方式=run.bat`
+    fn prefix(&self) -> String {
+        format!(
+            "启动#{} server=\"{}\" dir={} 方式={}",
+            self.id, self.server, self.dir, self.kind
+        )
+    }
+}
+
+/// 带上下文写一行记录。
+pub fn launch_log_ctx(ctx: &LaunchCtx, msg: &str) {
+    launch_log_line(&format!("{} {}", ctx.prefix(), msg));
+}
+
+/// 读取环境变量值并截断（取不到写 `<未设置>`）。
+fn env_snippet(name: &str) -> String {
+    match std::env::var(name) {
+        Ok(v) => truncate_chars(&v, ENV_SNIPPET_CHARS),
+        Err(_) => "<未设置>".to_string(),
+    }
+}
+
+/// 按字符（不是字节）截断，避免把多字节字符切坏。
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut t: String = s.chars().take(max).collect();
+    t.push('…');
+    t
+}
+
+/// 注入环境变量列表 → `[TEMP=..; TMP=..]`（供 main.rs 在"准备"记录里复用同一格式）
+pub fn env_pairs_text(envs: &[(String, String)]) -> String {
+    if envs.is_empty() {
+        return "[]".to_string();
+    }
+    let items: Vec<String> = envs.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    format!("[{}]", items.join("; "))
+}
+
+/// 本进程完整性级别（复用既有的 current_integrity_rid；Low=0x1000 / Medium=0x2000）。
+fn integrity_rid_text() -> String {
+    match crate::current_integrity_rid() {
+        Some(r) => format!("{r:#x}"),
+        None => "未知".to_string(),
+    }
+}
+
+/// 本进程是否已被归入某个 Job 对象（hJob=NULL 表示"是否在任何 Job 内"；None=查询失败）。
+pub fn is_self_in_job() -> Option<bool> {
+    unsafe {
+        let mut in_job: BOOL = 0;
+        let ok = IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut in_job);
+        if ok == 0 {
+            None
+        } else {
+            Some(in_job != 0)
+        }
+    }
+}
+
+/// 本进程是否在 Job 内 → 文本（供 launch.log 使用）。
+fn self_in_job_text() -> String {
+    match is_self_in_job() {
+        Some(true) => "true".to_string(),
+        Some(false) => "false".to_string(),
+        None => "未知".to_string(),
+    }
+}
+
+/// GetExitCodeProcess 的原始 DWORD（能看出 0xC0000142 这类 Windows 级错误码）。
+/// 只在 `try_wait` 报告已退出后调用，避免读到 STILL_ACTIVE。
+fn raw_exit_code(child: &Child) -> Option<u32> {
+    let mut code: DWORD = 0;
+    let ok = unsafe { GetExitCodeProcess(child.as_raw_handle() as _, &mut code) };
+    if ok == 0 {
+        None
+    } else {
+        Some(code)
+    }
+}
+
+/// 只在该槽位为空时写入（即记录首行）；纯诊断用途，失败忽略。
+fn record_first_line(slot: &Arc<Mutex<Option<String>>>, line: &str) {
+    let mut s = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if s.is_none() {
+        *s = Some(line.to_string());
+    }
+}
+
+/// 槽位取值（空 → `<empty>`，明确写出来而不是留空白）。
+fn first_line_text(slot: &Arc<Mutex<Option<String>>>) -> String {
+    let s = slot.lock().unwrap_or_else(|e| e.into_inner());
+    s.clone().unwrap_or_else(|| "<empty>".to_string())
+}
+
+/// 十六进制退出码文本（`0xC0000142`）。
+fn hex_code(code: u32) -> String {
+    format!("0x{code:08X}")
+}
+
+/// 启动后跟踪线程：
+/// ① 满 3 秒时把"前 3 秒内"到达的 stdout/stderr 首行写进 launch.log（空则写 `<empty>`）；
+/// ② 之后继续轮询等待进程退出，记录退出码与十六进制值（Java 从未启动时通常是 1 或 0xC0000142）。
+/// 轮询间隔 1 秒、最长跟踪 12 小时，避免线程无限长眠。
+fn spawn_launch_watcher(
+    ctx: LaunchCtx,
+    child: Arc<Mutex<Child>>,
+    first_out: Arc<Mutex<Option<String>>>,
+    first_err: Arc<Mutex<Option<String>>>,
+) {
+    const WINDOW: Duration = Duration::from_secs(3);
+    const MAX_TRACK: Duration = Duration::from_secs(12 * 3600);
+    thread::spawn(move || {
+        let started = Instant::now();
+        while started.elapsed() < WINDOW {
+            thread::sleep(Duration::from_millis(100));
+        }
+        launch_log_ctx(
+            &ctx,
+            &format!(
+                "阶段=前3秒输出 stdout首行=\"{}\" stderr首行=\"{}\"",
+                first_line_text(&first_out),
+                first_line_text(&first_err)
+            ),
+        );
+        loop {
+            let exited = {
+                let mut c = child.lock().unwrap_or_else(|e| e.into_inner());
+                match c.try_wait() {
+                    Ok(Some(st)) => Some((st.code(), raw_exit_code(&c))),
+                    _ => None,
+                }
+            };
+            if let Some((code, raw)) = exited {
+                let code_text = code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                let raw_text = raw.map(hex_code).unwrap_or_else(|| "?".to_string());
+                launch_log_ctx(
+                    &ctx,
+                    &format!("阶段=退出 退出码={code_text} 退出码(hex)={raw_text}"),
+                );
+                break;
+            }
+            if started.elapsed() > MAX_TRACK {
+                launch_log_ctx(&ctx, "阶段=退出 结果=跟踪超时（12 小时仍未退出，停止跟踪）");
+                break;
+            }
+            thread::sleep(Duration::from_millis(1000));
+        }
+    });
+}
 
 /// 进程包装：持有子进程 + 日志通道
 pub struct ManagedProcess {
@@ -98,9 +362,49 @@ pub fn spawn_hidden_env(
     allow_stdin: bool,
     envs: &[(String, String)],
 ) -> std::io::Result<ManagedProcess> {
+    let ctx = LaunchCtx::new("", cwd, "spawn_hidden_env");
+    spawn_hidden_env_ctx(cmd, args, cwd, allow_stdin, envs, &ctx)
+}
+
+/// 与 `spawn_hidden_env` 完全相同，但带上本次启动的上下文（服务器名/目录/启动方式），
+/// 让写进 `data\launch.log` 的每一行都能直接对上是哪一次启动。
+pub fn spawn_hidden_env_ctx(
+    cmd: &str,
+    args: &[&str],
+    cwd: &Path,
+    allow_stdin: bool,
+    envs: &[(String, String)],
+    ctx: &LaunchCtx,
+) -> std::io::Result<ManagedProcess> {
     use std::os::windows::process::CommandExt;
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    // ---- 诊断记录（一）：把实际要传给 CreateProcess 的一切先落盘 ----
+    let args_text = format!("[{}]", args.join(", "));
+    let stdin_text = if allow_stdin { "piped" } else { "null" };
+    let self_cwd = std::env::current_dir()
+        .map(|d| d.display().to_string())
+        .unwrap_or_else(|_| "?".to_string());
+    launch_log_ctx(
+        ctx,
+        &format!(
+            "阶段=spawn program={} args={} cwd={} cwd存在={} stdin={} stdout=piped stderr=piped 标志=CREATE_NO_WINDOW(0x08000000) \
+             继承环境_TEMP={} 继承环境_TMP={} 继承环境_PATH={} 注入环境={} 本进程完整性rid={} 本进程在Job内={} 本进程cwd={}",
+            cmd,
+            args_text,
+            cwd.display(),
+            cwd.exists(),
+            stdin_text,
+            env_snippet("TEMP"),
+            env_snippet("TMP"),
+            env_snippet("PATH"),
+            env_pairs_text(envs),
+            integrity_rid_text(),
+            self_in_job_text(),
+            self_cwd
+        ),
+    );
 
     let mut command = Command::new(cmd);
     command
@@ -118,19 +422,59 @@ pub fn spawn_hidden_env(
         command.stdin(Stdio::null());
     }
 
-    let mut child = command.spawn()?;
+    // ---- 诊断记录（二）：CreateProcess 是否成功 + 子进程 PID ----
+    let mut child = match command.spawn() {
+        Ok(c) => {
+            launch_log_ctx(ctx, &format!("阶段=CreateProcess 结果=成功 pid={}", c.id()));
+            c
+        }
+        Err(e) => {
+            let raw = e.raw_os_error();
+            let raw_text = raw
+                .map(|c| format!("{} ({})", c, hex_code(c as u32)))
+                .unwrap_or_else(|| "无".to_string());
+            launch_log_ctx(
+                ctx,
+                &format!("阶段=CreateProcess 结果=失败 错误=\"{e}\" raw_os_error={raw_text}"),
+            );
+            return Err(e);
+        }
+    };
 
     // 把子进程挂入一个不带任何限制的作业（分组用，不再 kill-on-close）。
     // 挂载失败（如子进程已被其它 Job 托管）时静默降级为无作业托管，不影响启动。
+    // ---- 诊断记录（三）：Job 分配是否成功及其返回值 ----
     let mut job = create_process_job();
-    if let Some(j) = job {
-        let hproc = child.as_raw_handle();
-        unsafe {
-            let ok: BOOL = AssignProcessToJobObject(j as _, hproc as _);
+    match job {
+        Some(j) => {
+            let hproc = child.as_raw_handle();
+            let ok: BOOL = unsafe { AssignProcessToJobObject(j as _, hproc as _) };
             if ok == 0 {
-                CloseHandle(j as _);
+                let err = unsafe { GetLastError() };
+                launch_log_ctx(
+                    ctx,
+                    &format!(
+                        "阶段=Job分配 结果=失败 返回值=0 GetLastError={} ({})（已降级为无 Job 托管）",
+                        err,
+                        hex_code(err)
+                    ),
+                );
+                unsafe {
+                    CloseHandle(j as _);
+                }
                 job = None; // 已关闭句柄，避免 drop 时二次关闭
+            } else {
+                launch_log_ctx(
+                    ctx,
+                    &format!("阶段=Job分配 结果=成功 返回值={} ({})", ok, hex_code(ok as u32)),
+                );
             }
+        }
+        None => {
+            launch_log_ctx(
+                ctx,
+                "阶段=Job分配 结果=失败（CreateJobObjectW/SetInformationJobObject 返回 0）",
+            );
         }
     }
 
@@ -149,13 +493,19 @@ pub fn spawn_hidden_env(
         format!("{} {}", cmd, args.join(" "))
     };
 
+    // 前 3 秒内的 stdout/stderr 首行（写 launch.log 用；不改变既有日志通道行为）
+    let first_out: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let first_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
     // stdout 读取线程
     let tx_out = tx.clone();
+    let first_out_t = first_out.clone();
     thread::spawn(move || {
         let reader = BufReader::new(stdout);
         for line in reader.lines() {
             match line {
                 Ok(l) => {
+                    record_first_line(&first_out_t, &l);
                     if tx_out.send(l).is_err() {
                         break;
                     }
@@ -167,11 +517,13 @@ pub fn spawn_hidden_env(
 
     // stderr 读取线程：既并入日志通道（保持既有显示），又单独留末尾若干行供崩溃弹窗展示
     let tail_shared = stderr_tail.clone();
+    let first_err_t = first_err.clone();
     thread::spawn(move || {
         let reader = BufReader::new(stderr);
         for line in reader.lines() {
             match line {
                 Ok(l) => {
+                    record_first_line(&first_err_t, &l);
                     {
                         let mut tail = tail_shared.lock().unwrap_or_else(|e| e.into_inner());
                         tail.push_back(l.clone());
@@ -188,8 +540,12 @@ pub fn spawn_hidden_env(
         }
     });
 
+    let child_arc = Arc::new(Mutex::new(child));
+    // ---- 诊断记录（四/五）：3 秒输出首行 + 进程退出码（后台线程，best-effort） ----
+    spawn_launch_watcher(ctx.clone(), child_arc.clone(), first_out, first_err);
+
     Ok(ManagedProcess {
-        child: Arc::new(Mutex::new(child)),
+        child: child_arc,
         log_rx: rx,
         allow_stdin,
         stderr_tail,
@@ -808,6 +1164,289 @@ pub fn kill_pid_tree(pid: u32) -> bool {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     false
+}
+
+// ==================== 启动诊断：三种标志组合对比 ====================
+//
+// 「🧪 启动诊断」依次用同一套 program/args/cwd/环境 启动三次，唯一变量是标志组合：
+//   ① 生产组合（CREATE_NO_WINDOW + Job + stdin 管道）—— 复现工具启动失败的那套；
+//   ② 去掉 Job；
+//   ③ 去掉 CREATE_NO_WINDOW（同时不分配 Job、stdin=null，即 spawn_diagnostic 的行为）。
+// 每种都只观察 3 秒就强制结束进程树，结果写进 `data\launch.log` 并回传界面。
+// 一次点击即可确定是"哪个标志/Job 导致失败"，还是"三种都成功（那问题在 main.rs 的启动编排）"。
+
+/// 诊断启动的标志组合。
+#[derive(Clone, Copy, Debug)]
+pub enum DiagMode {
+    /// ① 当前生产组合：CREATE_NO_WINDOW + stdout/stderr 管道 + stdin 管道 + 分配 Job
+    Production,
+    /// ② 去掉 Job：其余与生产组合一致
+    NoJob,
+    /// ③ 去掉 CREATE_NO_WINDOW：不建隐藏窗口、不分配 Job、stdin=null
+    NoNoWindow,
+}
+
+impl DiagMode {
+    /// 界面与日志里显示的组合说明。
+    pub fn label(self) -> &'static str {
+        match self {
+            DiagMode::Production => "① 当前生产组合（CREATE_NO_WINDOW + Job + stdin 管道）",
+            DiagMode::NoJob => "② 去掉 Job（CREATE_NO_WINDOW + stdin 管道）",
+            DiagMode::NoNoWindow => "③ 去掉 CREATE_NO_WINDOW（无 Job、stdin=null）",
+        }
+    }
+}
+
+/// 一次诊断启动的观测结果。
+pub struct DiagOutcome {
+    /// 子进程 PID（cmd.exe 的 PID；java 是它的子进程）
+    pub pid: u32,
+    /// 前 3 秒内捕获到的 stdout 首行（空则 `<empty>`）
+    pub stdout_first: String,
+    /// 前 3 秒内捕获到的 stderr 首行（空则 `<empty>`）
+    pub stderr_first: String,
+    /// 3 秒窗口内**自行退出**时的原始退出码（可看出 0xC0000142 这类 Windows 级错误码）
+    pub raw_exit_code: Option<u32>,
+    /// 3 秒窗口结束时是否仍在运行（其后已被诊断强制结束）
+    pub still_running: bool,
+    /// 附注（Job 分配结果、结束确认情况等）
+    pub note: String,
+}
+
+/// 诊断用直连启动：用与生产路径相同的 program/args/cwd/环境变量启动，但**不**加
+/// CREATE_NO_WINDOW、**不**分配 Job、stdin 用 `Stdio::null()`，
+/// 并返回 (子进程 PID, stdout 首行, stderr 首行, 自行退出时的退出码)。
+///
+/// 启动后最多观察 3 秒即强制结束整棵进程树（`kill_pid_tree` + 句柄兜底），
+/// 保证诊断本身不会留下孤儿进程或占用端口。
+pub fn spawn_diagnostic(
+    cmd: &str,
+    args: &[&str],
+    cwd: &Path,
+    envs: &[(String, String)],
+) -> Result<(u32, String, String, Option<u32>), String> {
+    // 调用方未提供服务器名时用目录名兜底，保证这批日志行也能自解释
+    let name = cwd
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let ctx = LaunchCtx::new(&name, cwd, DiagMode::NoNoWindow.label());
+    let o = spawn_diagnostic_mode(cmd, args, cwd, envs, DiagMode::NoNoWindow, &ctx)?;
+    Ok((o.pid, o.stdout_first, o.stderr_first, o.raw_exit_code))
+}
+
+/// 按指定标志组合做一次诊断启动（「🧪 启动诊断」用；`ctx` 决定日志里的服务器与编号）。
+pub fn spawn_diagnostic_mode(
+    cmd: &str,
+    args: &[&str],
+    cwd: &Path,
+    envs: &[(String, String)],
+    mode: DiagMode,
+    ctx: &LaunchCtx,
+) -> Result<DiagOutcome, String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let use_no_window = !matches!(mode, DiagMode::NoNoWindow);
+    let use_stdin_pipe = !matches!(mode, DiagMode::NoNoWindow);
+    let use_job = matches!(mode, DiagMode::Production);
+
+    launch_log_ctx(
+        ctx,
+        &format!(
+            "阶段=诊断启动 组合={} program={} args=[{}] cwd={} cwd存在={} stdin={} stdout=piped stderr=piped 标志={} Job={} \
+             继承环境_TEMP={} 继承环境_TMP={} 继承环境_PATH={} 注入环境={} 本进程完整性rid={} 本进程在Job内={} 本进程cwd={}",
+            mode.label(),
+            cmd,
+            args.join(", "),
+            cwd.display(),
+            cwd.exists(),
+            if use_stdin_pipe { "piped" } else { "null" },
+            if use_no_window { "CREATE_NO_WINDOW(0x08000000)" } else { "无（会短暂出现控制台窗口）" },
+            if use_job { "分配" } else { "不分配" },
+            env_snippet("TEMP"),
+            env_snippet("TMP"),
+            env_snippet("PATH"),
+            env_pairs_text(envs),
+            integrity_rid_text(),
+            self_in_job_text(),
+            std::env::current_dir()
+                .map(|d| d.display().to_string())
+                .unwrap_or_else(|_| "?".to_string())
+        ),
+    );
+
+    let mut command = Command::new(cmd);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if use_no_window {
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    for (k, v) in envs {
+        command.env(k, v);
+    }
+    if use_stdin_pipe {
+        command.stdin(Stdio::piped());
+    } else {
+        command.stdin(Stdio::null());
+    }
+
+    let mut child = match command.spawn() {
+        Ok(c) => {
+            launch_log_ctx(
+                ctx,
+                &format!("阶段=诊断CreateProcess 结果=成功 pid={}", c.id()),
+            );
+            c
+        }
+        Err(e) => {
+            let raw = e.raw_os_error();
+            let raw_text = raw
+                .map(|c| format!("{} ({})", c, hex_code(c as u32)))
+                .unwrap_or_else(|| "无".to_string());
+            launch_log_ctx(
+                ctx,
+                &format!(
+                    "阶段=诊断CreateProcess 结果=失败 错误=\"{e}\" raw_os_error={raw_text}"
+                ),
+            );
+            return Err(format!("{e}（raw_os_error={raw_text}）"));
+        }
+    };
+    let pid = child.id();
+
+    // Job 只在本组合需要时分配；句柄保持到本次诊断结束再关闭（没有 KILL_ON_JOB_CLOSE，关闭不影响进程）
+    let mut job_handle: Option<*mut winapi::ctypes::c_void> = None;
+    let mut note = String::new();
+    if use_job {
+        match create_process_job() {
+            Some(j) => {
+                let ok: BOOL =
+                    unsafe { AssignProcessToJobObject(j as _, child.as_raw_handle() as _) };
+                if ok == 0 {
+                    let err = unsafe { GetLastError() };
+                    note.push_str(&format!(
+                        "Job分配失败(GetLastError={err}/{})；",
+                        hex_code(err)
+                    ));
+                    unsafe {
+                        CloseHandle(j as _);
+                    }
+                } else {
+                    note.push_str("Job分配成功；");
+                    job_handle = Some(j);
+                }
+            }
+            None => note.push_str("Job创建失败；"),
+        }
+        launch_log_ctx(ctx, &format!("阶段=诊断Job分配 {note}"));
+    }
+
+    // stdin 为管道时必须一直持有写端：句柄一被丢弃就等于给子进程 EOF，
+    // 而这正是要对比的差异之一，不能让诊断自己把管道提前关掉。
+    let _stdin_hold = if use_stdin_pipe { child.stdin.take() } else { None };
+
+    // 只记录首行的两个槽位（读者线程把管道读干，避免子进程写满管道阻塞）
+    let first_out: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let first_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    if let Some(out) = child.stdout.take() {
+        let slot = first_out.clone();
+        thread::spawn(move || {
+            let reader = BufReader::new(out);
+            for line in reader.lines() {
+                match line {
+                    Ok(l) => record_first_line(&slot, &l),
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+    if let Some(err) = child.stderr.take() {
+        let slot = first_err.clone();
+        thread::spawn(move || {
+            let reader = BufReader::new(err);
+            for line in reader.lines() {
+                match line {
+                    Ok(l) => record_first_line(&slot, &l),
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    // 观察窗口：固定 3 秒（进程提前退出也等满，好让读者线程把已到达的输出放进槽位）
+    let started = Instant::now();
+    let mut raw_exit: Option<u32> = None;
+    while started.elapsed() < Duration::from_secs(3) {
+        if raw_exit.is_none() {
+            if let Ok(Some(_)) = child.try_wait() {
+                raw_exit = raw_exit_code(&child);
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    thread::sleep(Duration::from_millis(200));
+    let stdout_first = first_line_text(&first_out);
+    let stderr_first = first_line_text(&first_err);
+    let still_running = raw_exit.is_none();
+
+    // 每次尝试结束都必须结束子进程及其整棵树（cmd -> java），避免留下孤儿进程或占用端口
+    if still_running {
+        let killed = kill_pid_tree(pid);
+        let _ = child.kill();
+        note.push_str(&format!("已结束进程树(kill_pid_tree={killed})；"));
+    } else {
+        note.push_str("进程在观察窗口内自行退出；");
+    }
+    // 有上限地确认退出（taskkill 之后可能还要几百毫秒）
+    let mut confirmed = !still_running;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                confirmed = true;
+                break;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(_) => break,
+        }
+    }
+    if !confirmed {
+        note.push_str("⚠ 结束后仍未确认退出，请在任务管理器确认；");
+    }
+
+    if let Some(j) = job_handle {
+        unsafe {
+            CloseHandle(j as _);
+        }
+    }
+
+    launch_log_ctx(
+        ctx,
+        &format!(
+            "阶段=诊断结束 仍在运行={} 退出码={} 退出码(hex)={} stdout首行=\"{}\" stderr首行=\"{}\" 附注={}",
+            still_running,
+            raw_exit
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "无（未自行退出）".to_string()),
+            raw_exit.map(hex_code).unwrap_or_else(|| "无".to_string()),
+            stdout_first,
+            stderr_first,
+            note
+        ),
+    );
+
+    Ok(DiagOutcome {
+        pid,
+        stdout_first,
+        stderr_first,
+        raw_exit_code: raw_exit,
+        still_running,
+        note,
+    })
 }
 
 /// 读取任意进程的命令行。

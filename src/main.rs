@@ -2175,6 +2175,10 @@ struct App {
     low_il_notice: Option<String>,
     /// 上面提示里给出的修复命令（供「复制修复命令」按钮使用）
     low_il_fix_cmd: String,
+    /// 启动诊断（「🧪 启动诊断」）是否正在后台执行
+    launch_diag_busy: bool,
+    /// 启动诊断结果文本（Some 时显示可滚动小窗口）
+    launch_diag_text: Option<String>,
     /// 托盘版本号（进入/恢复托盘时递增，恢复窗口后的首次 update 消费并强制全量刷新）
     tray_version: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// 上次消费的托盘版本号（update 内比对 tray_version 判断是否刚恢复窗口）
@@ -2691,6 +2695,26 @@ enum BgMsg {
     ModUpdDone(usize, Vec<ModUpdateRow>),
     /// 「查看版本」按需加载结果：(项目标识, 版本列表或错误)
     ModVersions(String, Result<Vec<(String, String, String, bool)>, String>),
+    /// 启动诊断完成：(服务器下标, 三种组合的对比报告文本)
+    LaunchDiag(usize, String),
+}
+
+/// 一次启动的完整命令描述（生产启动与「🧪 启动诊断」共用，保证诊断跑的就是生产路径那条命令）。
+struct LaunchSpec {
+    /// 实际执行的程序（cmd / java）
+    prog: String,
+    /// 实际参数（逐项，不拼接成字符串）
+    args: Vec<String>,
+    /// 工作目录（服务器目录）
+    dir: PathBuf,
+    /// 注入给子进程的环境变量（TEMP/TMP）
+    envs: Vec<(String, String)>,
+    /// 私有临时目录（None=未使用，沿用系统临时目录）
+    priv_tmp: Option<PathBuf>,
+    /// 私有临时目录准备失败的警告文案
+    tmp_warn: Option<String>,
+    /// 启动方式说明（run.bat / launch_cmd 模板），写进 launch.log
+    kind: String,
 }
 
 impl App {
@@ -2861,6 +2885,8 @@ impl App {
             tray_tick_at: None,
             low_il_notice: None,
             low_il_fix_cmd: String::new(),
+            launch_diag_busy: false,
+            launch_diag_text: None,
             tray_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_tray_version: 0,
             egui_ctx: ctx,
@@ -3198,20 +3224,11 @@ impl App {
         self.set_toast("已移除服务器（配置已删除，文件未动）".to_string());
     }
 
-    fn start_server(&mut self, idx: usize) {
-        if idx >= self.cfg.servers.len() || idx >= self.runtimes.len() {
-            return;
-        }
-        let sc = self.cfg.servers[idx].clone();
-        let rt = &mut self.runtimes[idx];
-        if rt.proc.is_some() {
-            return;
-        }
+    /// 组装一次启动的完整命令（生产启动与「🧪 启动诊断」共用，保证诊断跑的就是生产路径那条命令）。
+    /// 返回 None 表示服务器下标越界。
+    fn build_launch_spec(&self, idx: usize) -> Option<LaunchSpec> {
+        let sc = self.cfg.servers.get(idx)?.clone();
         let dir = sc.dir.clone();
-        if !dir.exists() {
-            rt.last_msg = "目录不存在".to_string();
-            return;
-        }
         // 独立临时目录：把子进程的 TEMP/TMP 与 JVM 的 java.io.tmpdir 从全局临时目录
         // 挪到 <服务器目录>\<private_tmp_name>。JNA / sqlite-jdbc 需要把原生 DLL 解压到
         // java.io.tmpdir，全局临时目录有残留目录时会加载失败（UnsatisfiedLinkError）。
@@ -3223,61 +3240,139 @@ impl App {
                 (None, Some(e))
             }
         };
-        let tmp_env: Vec<(String, String)> = match &priv_tmp {
+        let envs: Vec<(String, String)> = match &priv_tmp {
             Some(p) => {
                 let s = p.display().to_string();
                 vec![("TEMP".to_string(), s.clone()), ("TMP".to_string(), s)]
             }
             None => Vec::new(),
         };
-        // 策略：优先运�?run.bat（经典方式），其次用 launch_cmd 模板
+        // 策略：优先运行 run.bat（经典方式），其次用 launch_cmd 模板
         let run_bat = dir.join("run.bat");
-        let spawn_res = if run_bat.exists() {
+        if run_bat.exists() {
             // run.bat 自建命令行，这里只注入 TEMP/TMP（java.io.tmpdir 默认取自这两者）；
             // 脚本里若自带 -Djava.io.tmpdir 则以脚本为准。
-            process::spawn_hidden_env("cmd", &["/c", "run.bat"], &dir, true, &tmp_env)
-        } else {
-            // �?run.bat 时按解析链取 Java�?
-            // 服务器指定列表项 -> 服务器自定义路径 -> run.bat 提取 -> 按版本自动匹�?-> 全局兜底 -> PATH
-            let cfg = self.cfg.clone();
-            let java = resolve_java_for_server(&cfg, &sc);
-            // JVM 参数优先级：服务器级 jvm_args → 全局默认 JVM 参数 → 按物理内存推荐
-            //（推荐值只在用户两处都没填时生效，不覆盖用户填的任何参数）
-            let jvm = sc
-                .jvm_args
-                .clone()
-                .filter(|s| !s.trim().is_empty())
-                .or_else(|| {
-                    let d = self.cfg.default_jvm_args.trim().to_string();
-                    if d.is_empty() { None } else { Some(d) }
-                })
-                .unwrap_or_else(|| recommended_jvm_args(physical_memory_gb()));
-            let cmd_tpl = sc.launch_cmd.clone();
-            let core = detect_core_jar(&dir);
-            // 公式化启动：{core} 占位符或 "-jar server.jar" 自动替换为实际核�?jar
-            let cmd = cmd_tpl
-                .replace("{java}", &java)
-                .replace("{jvm}", &jvm)
-                .replace("{core}", &core)
-                .replace("-jar server.jar", &format!("-jar {core}"));
-            let mut parts = cmd.split_whitespace();
-            let prog = parts.next().unwrap_or("java").to_string();
-            let mut args: Vec<String> = parts.map(|s| s.to_string()).collect();
-            // 追加 -Djava.io.tmpdir：用户已在 jvm 参数里填过就不重复追加（整个命令行恰好一次）。
-            // 作为独立参数传入，不参与字符串拼接，路径含空格也不会被拆开。
-            if let Some(p) = &priv_tmp {
-                if !args.iter().any(|a| a.contains("-Djava.io.tmpdir")) {
-                    args.insert(0, format!("-Djava.io.tmpdir={}", p.display()));
+            return Some(LaunchSpec {
+                prog: "cmd".to_string(),
+                args: vec!["/c".to_string(), "run.bat".to_string()],
+                dir,
+                envs,
+                priv_tmp,
+                tmp_warn,
+                kind: "run.bat".to_string(),
+            });
+        }
+        // 无 run.bat 时按解析链取 Java：
+        // 服务器指定列表项 -> 服务器自定义路径 -> run.bat 提取 -> 按版本自动匹配 -> 全局兜底 -> PATH
+        let cfg = self.cfg.clone();
+        let java = resolve_java_for_server(&cfg, &sc);
+        // JVM 参数优先级：服务器级 jvm_args → 全局默认 JVM 参数 → 按物理内存推荐
+        //（推荐值只在用户两处都没填时生效，不覆盖用户填的任何参数）
+        let jvm = sc
+            .jvm_args
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                let d = self.cfg.default_jvm_args.trim().to_string();
+                if d.is_empty() { None } else { Some(d) }
+            })
+            .unwrap_or_else(|| recommended_jvm_args(physical_memory_gb()));
+        let cmd_tpl = sc.launch_cmd.clone();
+        let core = detect_core_jar(&dir);
+        // 公式化启动：{core} 占位符或 "-jar server.jar" 自动替换为实际核心 jar
+        let cmd = cmd_tpl
+            .replace("{java}", &java)
+            .replace("{jvm}", &jvm)
+            .replace("{core}", &core)
+            .replace("-jar server.jar", &format!("-jar {core}"));
+        let mut parts = cmd.split_whitespace();
+        let prog = parts.next().unwrap_or("java").to_string();
+        let mut args: Vec<String> = parts.map(|s| s.to_string()).collect();
+        // 追加 -Djava.io.tmpdir：用户已在 jvm 参数里填过就不重复追加（整个命令行恰好一次）。
+        // 作为独立参数传入，不参与字符串拼接，路径含空格也不会被拆开。
+        if let Some(p) = &priv_tmp {
+            if !args.iter().any(|a| a.contains("-Djava.io.tmpdir")) {
+                args.insert(0, format!("-Djava.io.tmpdir={}", p.display()));
+            }
+        }
+        // 追加 -Dfile.encoding=UTF-8（中文日志与插件输出更稳）；
+        // 与上面的 tmpdir 一样按参数包含判断，用户自己填过就不重复追加。
+        if !args.iter().any(|a| a.contains("-Dfile.encoding")) {
+            args.insert(0, "-Dfile.encoding=UTF-8".to_string());
+        }
+        Some(LaunchSpec {
+            prog,
+            args,
+            dir,
+            envs,
+            priv_tmp,
+            tmp_warn,
+            kind: "launch_cmd 模板".to_string(),
+        })
+    }
+
+    fn start_server(&mut self, idx: usize) {
+        if idx >= self.cfg.servers.len() || idx >= self.runtimes.len() {
+            return;
+        }
+        let sc = self.cfg.servers[idx].clone();
+        if self.runtimes[idx].proc.is_some() {
+            return;
+        }
+        let dir = sc.dir.clone();
+        if !dir.exists() {
+            if let Some(rt) = self.runtimes.get_mut(idx) {
+                rt.last_msg = "目录不存在".to_string();
+            }
+            return;
+        }
+        let Some(spec) = self.build_launch_spec(idx) else {
+            return;
+        };
+        let priv_tmp = spec.priv_tmp.clone();
+        let tmp_warn = spec.tmp_warn.clone();
+        // 私有临时目录可写性探测：Low IL / ACL 异常时子进程用不了这个 TEMP 会启动失败，
+        // 这里先探一次并写进日志留证（best-effort，探测失败不影响启动）。
+        let tmp_probe = match &priv_tmp {
+            Some(p) => {
+                let probe = p.join(".xmst_tmp_probe");
+                match std::fs::write(&probe, b"probe") {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&probe);
+                        "可写".to_string()
+                    }
+                    Err(e) => format!("不可写（{e}）"),
                 }
             }
-            // 追加 -Dfile.encoding=UTF-8（中文日志与插件输出更稳）；
-            // 与上面的 tmpdir 一样按参数包含判断，用户自己填过就不重复追加。
-            if !args.iter().any(|a| a.contains("-Dfile.encoding")) {
-                args.insert(0, "-Dfile.encoding=UTF-8".to_string());
-            }
-            let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-            process::spawn_hidden_env(&prog, &arg_refs, &dir, true, &tmp_env)
+            None => "（未使用私有临时目录）".to_string(),
         };
+        // 本次启动的完整记录：命令、环境、完整性级别、CreateProcess 与 Job 结果、
+        // 前 3 秒输出首行、退出码，全部由 process.rs 追加到 data\launch.log。
+        let ctx = process::LaunchCtx::new(&sc.name, &spec.dir, &spec.kind);
+        process::launch_log_sep(&format!(
+            "启动尝试 #{}：{}（{}）",
+            ctx.id,
+            sc.name,
+            spec.kind
+        ));
+        process::launch_log_ctx(
+            &ctx,
+            &format!(
+                "阶段=准备 分支={} 注入环境={} 私有TEMP={} 私有TEMP探测={} 私有TEMP警告={}",
+                spec.kind,
+                process::env_pairs_text(&spec.envs),
+                priv_tmp
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "（无，沿用系统临时目录）".to_string()),
+                tmp_probe,
+                tmp_warn.clone().unwrap_or_else(|| "无".to_string())
+            ),
+        );
+        let arg_refs: Vec<&str> = spec.args.iter().map(|s| s.as_str()).collect();
+        let spawn_res =
+            process::spawn_hidden_env_ctx(&spec.prog, &arg_refs, &spec.dir, true, &spec.envs, &ctx);
+        let rt = &mut self.runtimes[idx];
         match spawn_res {
             Ok(mp) => {
                 // 关机/注销时窗口过程要直接向这个句柄写 stop（拿不到 App），先登记一份
@@ -3328,11 +3423,147 @@ impl App {
                     sc.start_count = sc.start_count.saturating_add(1);
                     self.save_config();
                 }
+                process::launch_log_ctx(&ctx, "阶段=启动编排 结果=已接管（界面已开始等待服务端就绪）");
             }
             Err(e) => {
+                process::launch_log_ctx(
+                    &ctx,
+                    &format!("阶段=启动编排 结果=失败（界面提示：启动失败: {e}）"),
+                );
                 rt.last_msg = format!("启动失败: {e}");
             }
         }
+    }
+
+    /// 「🧪 启动诊断」：依次用 3 种标志组合各启动一次（每次约 3 秒后强制结束进程树），
+    /// 结果写进 `data\launch.log` 并回传可滚动结果窗口。
+    ///
+    /// 价值：一次点击就能确定"是哪个标志/Job 导致启动失败"；若三种组合都成功，
+    /// 说明问题在启动编排（时机/环境/命令模板）而不是 spawn 的标志组合。
+    fn start_launch_diag(&mut self, idx: usize) {
+        if self.launch_diag_busy {
+            self.set_toast("启动诊断正在进行中，请稍候".to_string());
+            return;
+        }
+        let Some(spec) = self.build_launch_spec(idx) else {
+            self.set_toast("启动诊断失败：请先选择一台服务器".to_string());
+            return;
+        };
+        if !spec.dir.exists() {
+            self.set_toast("启动诊断失败：服务器目录不存在".to_string());
+            return;
+        }
+        let name = self
+            .cfg
+            .servers
+            .get(idx)
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+        self.launch_diag_busy = true;
+        self.launch_diag_text =
+            Some("启动诊断进行中……（三种组合各启动一次，每次约 3 秒后自动结束）".to_string());
+        self.bg_busy
+            .insert("launchdiag".to_string(), "启动诊断进行中…".to_string());
+        let tx = self.bg_tx.clone();
+        std::thread::spawn(move || {
+            let modes = [
+                process::DiagMode::Production,
+                process::DiagMode::NoJob,
+                process::DiagMode::NoNoWindow,
+            ];
+            let mut report = String::new();
+            report.push_str(&format!("服务器：{}\n", name));
+            report.push_str(&format!("目录：{}\n", spec.dir.display()));
+            report.push_str(&format!(
+                "命令：{} {}\n\n",
+                spec.prog,
+                spec.args.join(" ")
+            ));
+            report.push_str("诊断会短暂启动服务器（每次约 3 秒）后立即强制结束整棵进程树；\n");
+            report.push_str("三种组合只有启动标志不同，用来确定是哪一项导致启动失败。\n\n");
+            let arg_refs: Vec<&str> = spec.args.iter().map(|s| s.as_str()).collect();
+            let mut ok_count = 0usize;
+            for mode in modes.iter() {
+                let ctx = process::LaunchCtx::new(&name, &spec.dir, mode.label());
+                process::launch_log_sep(&format!(
+                    "诊断尝试 #{}：{}（{}）",
+                    ctx.id,
+                    name,
+                    mode.label()
+                ));
+                report.push_str(&format!("{}\n", mode.label()));
+                // ③ 走要求的直连诊断入口 spawn_diagnostic（等价标志组合），其余走带上下文的模式化接口
+                let outcome = if matches!(mode, process::DiagMode::NoNoWindow) {
+                    process::spawn_diagnostic(&spec.prog, &arg_refs, &spec.dir, &spec.envs).map(
+                        |(pid, out_first, err_first, code)| process::DiagOutcome {
+                            pid,
+                            stdout_first: out_first,
+                            stderr_first: err_first,
+                            raw_exit_code: code,
+                            still_running: code.is_none(),
+                            note: "（③ 经 spawn_diagnostic 直连启动）".to_string(),
+                        },
+                    )
+                } else {
+                    process::spawn_diagnostic_mode(
+                        &spec.prog,
+                        &arg_refs,
+                        &spec.dir,
+                        &spec.envs,
+                        *mode,
+                        &ctx,
+                    )
+                };
+                match outcome {
+                    Ok(o) => {
+                        ok_count += 1;
+                        let exit_text = match o.raw_exit_code {
+                            Some(c) => format!("0x{c:08X}（十进制 {c}）"),
+                            None => "无（3 秒时仍在运行，已由诊断结束）".to_string(),
+                        };
+                        let state = if o.still_running {
+                            "3 秒时仍在运行 → 已强制结束进程树"
+                        } else {
+                            "3 秒内自行退出"
+                        };
+                        report.push_str(&format!(
+                            "  结果：启动成功 ｜ PID {} ｜ {} ｜ 退出码 {}\n",
+                            o.pid, state, exit_text
+                        ));
+                        report.push_str(&format!("  stdout 首行：{}\n", o.stdout_first));
+                        report.push_str(&format!("  stderr 首行：{}\n", o.stderr_first));
+                        if !o.note.is_empty() {
+                            report.push_str(&format!("  附注：{}\n", o.note));
+                        }
+                    }
+                    Err(e) => {
+                        report.push_str(&format!("  结果：spawn 失败 ｜ 原因：{e}\n"));
+                        report.push_str("  stdout 首行：<未启动>\n");
+                        report.push_str("  stderr 首行：<未启动>\n");
+                    }
+                }
+                report.push('\n');
+            }
+            report.push_str(&format!("合计：{ok_count} / 3 种组合启动成功\n"));
+            if ok_count == 3 {
+                report.push_str(
+                    "结论：三种标志组合都能启动成功 —— 问题更可能在启动编排（启动时机、环境变量、\
+                     命令模板、TEMP 注入），而不是 spawn 的标志或 Job。\n",
+                );
+            } else if ok_count == 0 {
+                report.push_str(
+                    "结论：三种组合都失败 —— 与 CREATE_NO_WINDOW / Job / stdin 管道无关，\
+                     请对比 PowerShell 成功时的差异（工作目录、环境变量、完整性级别、命令本身）。\n",
+                );
+            } else {
+                report.push_str(
+                    "结论：组合之间存在差异 —— 上方失败的那一种，失败点就在它的标志上。\n",
+                );
+            }
+            // 汇总也写进 launch.log（单行，便于在日志里直接看到结论）
+            process::launch_log_line(&format!("诊断汇总 ｜ {}", report.replace('\n', " ｜ ")));
+            let _ = tx.send(BgMsg::LaunchDiag(idx, report));
+        });
     }
 
     fn stop_server(&mut self, idx: usize) {
@@ -3592,6 +3823,20 @@ impl App {
         self.integrity_log(&format!(
             "进程完整性自检：level={level} rid={rid_text} exe_dir={dir_text}"
         ));
+        // 启动日志开头也记一条工具自身的上下文：后面每次启动记录都能对照它看完整性/Job 差异
+        let self_cwd = std::env::current_dir()
+            .map(|d| d.display().to_string())
+            .unwrap_or_else(|_| "?".to_string());
+        let in_job = match process::is_self_in_job() {
+            Some(true) => "true",
+            Some(false) => "false",
+            None => "未知",
+        };
+        process::launch_log_sep("工具启动");
+        process::launch_log_line(&format!(
+            "工具启动 版本={} exe_dir={dir_text} 完整性level={level} rid={rid_text} 本进程在Job内={in_job} 本进程cwd={self_cwd}",
+            env!("CARGO_PKG_VERSION")
+        ));
         if level != "Low" {
             return;
         }
@@ -3679,6 +3924,63 @@ impl App {
             });
         if !open || dismiss {
             self.low_il_notice = None;
+        }
+    }
+
+    /// 「🧪 启动诊断」结果窗口：可滚动查看三种标志组合的成功/失败、退出码（十六进制）
+    /// 与输出首行；底部提供「📄 打开启动日志」直接定位 `data\launch.log`。
+    fn ui_launch_diag_window(&mut self, ctx: &egui::Context) {
+        let Some(text) = self.launch_diag_text.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut close_clicked = false;
+        let mut open_log = false;
+        egui::Window::new("🧪 启动诊断结果")
+            .id(egui::Id::new("launch_diag_window"))
+            .collapsible(false)
+            .resizable(true)
+            .default_size([760.0, 460.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(
+                        "诊断会短暂启动服务器后立即结束：每种组合观察约 3 秒即强制结束整棵进程树，\
+                         不会残留进程或占用端口。",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .max_height(330.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new(text.clone()).monospace()).wrap(),
+                        );
+                    });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("📄 打开启动日志")
+                        .on_hover_text("打开 data\\launch.log 所在目录并选中该文件")
+                        .clicked()
+                    {
+                        open_log = true;
+                    }
+                    if ui.button("关闭").clicked() {
+                        close_clicked = true;
+                    }
+                });
+            });
+        if open_log {
+            process::ensure_launch_log();
+            let p = process::launch_log_path();
+            self.open_file_location(&p);
+        }
+        if !open || close_clicked {
+            self.launch_diag_text = None;
         }
     }
 
@@ -4707,6 +5009,18 @@ impl App {
                             self.modupd_ver_err.insert(key, e);
                         }
                     }
+                }
+                BgMsg::LaunchDiag(idx, text) => {
+                    self.launch_diag_busy = false;
+                    let name = self
+                        .cfg
+                        .servers
+                        .get(idx)
+                        .map(|s| s.name.clone())
+                        .unwrap_or_default();
+                    self.launch_diag_text = Some(text);
+                    self.bg_busy.remove("launchdiag");
+                    self.set_toast(format!("启动诊断已完成（{name}）：结果窗口已打开"));
                 }
             }
             self.egui_ctx.request_repaint();
@@ -11830,6 +12144,8 @@ impl eframe::App for App {
         self.ui_mod_update_window(ctx);
         // 低完整性（Low IL）启动提示：只弹一次（检测在 App::new，未检测到则始终为空）
         self.ui_low_il_notice(ctx);
+        // 启动诊断结果窗口（「🧪 启动诊断」完成或有进行中提示时显示）
+        self.ui_launch_diag_window(ctx);
         // “打开目录”失败提示（错误经静态槽从 open_folder 带回）
         if let Some(e) = take_open_error() {
             self.set_toast(e);
@@ -13363,6 +13679,35 @@ impl App {
             }
             if self.bg_busy.contains_key("diag") {
                 ui.label(RichText::new("诊断包打包中…").small().weak());
+            }
+            // 启动诊断：一次点击对比三种启动标志组合，确定是哪个标志/Job 导致启动失败。
+            // 会短暂启动服务器（每次约 3 秒后强制结束），因此服务器运行中禁用。
+            if ui
+                .add_enabled(
+                    !self.launch_diag_busy && !busy,
+                    egui::Button::new("🧪 启动诊断"),
+                )
+                .on_hover_text(
+                    "依次用 3 种启动标志组合各启动一次（每次约 3 秒后强制结束进程树）：\
+                     ① 当前生产组合 ② 去掉 Job ③ 去掉 CREATE_NO_WINDOW。\
+                     会短暂启动服务器，服务器运行时不可用。结果同时写入 data\\launch.log",
+                )
+                .clicked()
+            {
+                self.start_launch_diag(idx);
+            }
+            // 打开启动日志：打开 data\launch.log 所在目录并选中该文件
+            if ui
+                .button("📄 打开启动日志")
+                .on_hover_text("打开 data\\launch.log 所在目录并选中它（每次启动的命令、环境、PID、退出码与前 3 秒输出）")
+                .clicked()
+            {
+                process::ensure_launch_log();
+                let p = process::launch_log_path();
+                self.open_file_location(&p);
+            }
+            if self.launch_diag_busy {
+                ui.label(RichText::new("启动诊断中…").small().weak());
             }
             if diag_dir.is_some() && ui.button("📂 打开诊断包目录").clicked() {
                 open_diag_dir = true;
