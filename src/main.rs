@@ -1875,8 +1875,8 @@ struct ServerRuntime {
     mod_update_msg: String,
     /// mods 内 .jar 更新回传（成功=Ok(新文件名)，失败=Err(原因)）
     mod_update_shared: Option<std::sync::Arc<std::sync::Mutex<Option<Result<String, String>>>>>,
-    /// 待执行更新：(下载URL, 新文件名, 旧文件名, 旧文件是否 .jar.disabled, 新版本号)
-    mod_update_pending: Option<(String, String, String, bool, String)>,
+    /// 待执行更新：(下载URL, 新文件名, 旧文件名, 旧文件是否 .jar.disabled, 新版本号, 期望字节数)
+    mod_update_pending: Option<(String, String, String, bool, String, Option<u64>)>,
     /// 当前检查/更新目标文件名（用于行内状态显示）
     mod_update_target: String,
     /// 当前检查/更新目标是否为 .jar.disabled
@@ -9741,13 +9741,16 @@ impl App {
                     return Ok(format!("latest:{ver}"));
                 }
                 let nver = newest.version_number;
-                let (url, fname) = newest
+                let (url, fname, fsize) = newest
                     .files
                     .iter()
                     .find(|f| f.filename.ends_with(".jar"))
-                    .map(|f| (f.url.clone(), f.filename.clone()))
+                    .map(|f| (f.url.clone(), f.filename.clone(), f.size))
                     .ok_or("最新版本无 jar 文件")?;
-                Ok(format!("new:{pid}:{nver}:{url}:{fname}:{ver}"))
+                // 字段分隔符用 U+0001：URL 自带 ':'，用 ':' 分隔会把下载地址切碎
+                Ok(format!(
+                    "new:{pid}\u{1}{nver}\u{1}{url}\u{1}{fname}\u{1}{ver}\u{1}{fsize}"
+                ))
             })();
             *shared.lock().unwrap_or_else(|e| e.into_inner()) = Some(res);
         });
@@ -9755,7 +9758,7 @@ impl App {
 
     /// 执行待更新：后台下载新 jar 并原子替换旧文件（.jar.disabled 保持禁用态）
     fn mod_update_apply(&mut self, idx: usize) {
-        let (url, new_fname, old_name, is_disabled, new_ver) = {
+        let (url, new_fname, old_name, is_disabled, new_ver, exp_size) = {
             let rt = &mut self.runtimes[idx];
             let Some(p) = rt.mod_update_pending.take() else {
                 return;
@@ -9770,32 +9773,27 @@ impl App {
         self.runtimes[idx].mod_update_shared = Some(shared.clone());
         std::thread::spawn(move || {
             let res = (|| -> Result<String, String> {
-                let client = download::new_client();
-                let resp = client
-                    .get(&url)
-                    .send()
-                    .map_err(|e| format!("下载请求失败: {e}"))?;
-                if !resp.status().is_success() {
-                    return Err(format!("HTTP {}", resp.status()));
-                }
-                let bytes = resp
-                    .bytes()
-                    .map_err(|e| format!("读取响应失败: {e}"))?;
-                let tmp = target.join(format!(".xmst_update_{}.tmp", std::process::id()));
-                std::fs::write(&tmp, &bytes).map_err(|e| format!("写入临时文件失败: {e}"))?;
                 let final_name = if is_disabled {
                     format!("{new_fname}.disabled")
                 } else {
                     new_fname.clone()
                 };
                 let new_p = target.join(&final_name);
-                if new_p.exists() {
-                    let _ = std::fs::remove_file(&new_p);
-                }
-                if old_p.exists() {
+                // 大文件专用客户端 + 统一落盘：.part → 校验字节数（Modrinth 元数据）→ rename。
+                // 校验通过后才删旧文件，下载失败时旧 jar 原样保留。
+                let client = download::new_download_client();
+                download::download_file_parallel_verified(
+                    &client,
+                    &url,
+                    &new_p,
+                    0,
+                    exp_size,
+                    None,
+                    &mut |_d, _t, _ph| {},
+                )?;
+                if old_p != new_p && old_p.exists() {
                     let _ = std::fs::remove_file(&old_p);
                 }
-                std::fs::rename(&tmp, &new_p).map_err(|e| format!("替换文件失败: {e}"))?;
                 Ok(format!("done:{new_ver}:{final_name}"))
             })();
             *shared.lock().unwrap_or_else(|e| e.into_inner()) = Some(res);
@@ -9833,19 +9831,20 @@ impl App {
                     if let Some(rest) = msg.strip_prefix("latest:") {
                         rt.mod_update_msg = format!("已是最新版本 {rest}");
                     } else if let Some(rest) = msg.strip_prefix("new:") {
-                        // new:project_id:new_ver:url:fname:local_ver
-                        let parts: Vec<&str> = rest.splitn(6, ':').collect();
+                        // new:project_id␁new_ver␁url␁fname␁local_ver␁size（U+0001 分隔）
+                        let parts: Vec<&str> = rest.split('\u{1}').collect();
                         if parts.len() == 6 {
                             rt.mod_update_pending = Some((
+                                parts[2].to_string(),
                                 parts[3].to_string(),
-                                parts[4].to_string(),
                                 rt.mod_update_target.clone(),
                                 rt.mod_update_target_disabled,
-                                parts[5].to_string(),
+                                parts[4].to_string(),
+                                parts[5].trim().parse::<u64>().ok().filter(|n| *n > 0),
                             ));
                             rt.mod_update_msg = format!(
                                 "发现新版本 {}（当前 {}），点击「更新」替换",
-                                parts[2], parts[5]
+                                parts[1], parts[4]
                             );
                         } else {
                             rt.mod_update_msg = rest.to_string();
@@ -24272,13 +24271,23 @@ impl App {
         std::thread::spawn(move || {
             // 大文件专用客户端（连接 + 空闲超时，无总时长上限）
             let client = download::new_download_client();
-            let res = download::download_file_parallel(&client, &url, &dest, 0, &mut |d, t, ph| {
-                if let Ok(mut g) = shared.lock() {
-                    g.downloaded = d;
-                    g.total = t;
-                    g.phase = ph;
-                }
-            });
+            // 统一落盘：.part → 校验字节数 → rename。server_download 只给下载地址、
+            // 不返回期望字节数，故 expected_size 传 None（下载探测阶段拿到的远端大小仍会核对）
+            let res = download::download_file_parallel_verified(
+                &client,
+                &url,
+                &dest,
+                0,
+                None,
+                None,
+                &mut |d, t, ph| {
+                    if let Ok(mut g) = shared.lock() {
+                        g.downloaded = d;
+                        g.total = t;
+                        g.phase = ph;
+                    }
+                },
+            );
             if let Ok(mut g) = shared.lock() {
                 match res {
                     Ok(()) => {
@@ -24916,16 +24925,26 @@ impl App {
         let client = download::new_download_client();
         let dest = std::path::PathBuf::from(&dest_dir).join(&file_name);
         std::thread::spawn(move || {
-            let result = download::download_file_parallel(&client, &url, &dest, threads, &mut |d, t, p| {
-                if let Ok(mut g) = shared.lock() {
-                    g.downloaded = d;
-                    g.total = t;
-                    g.phase = p;
-                    if p == "done" {
-                        g.done = true;
+            // 统一落盘：.part → 校验字节数 → rename。URL 是手填的，事先拿不到远端大小，
+            // expected_size 传 None（下载探测阶段拿到的远端大小仍会逐字节核对）
+            let result = download::download_file_parallel_verified(
+                &client,
+                &url,
+                &dest,
+                threads,
+                None,
+                None,
+                &mut |d, t, p| {
+                    if let Ok(mut g) = shared.lock() {
+                        g.downloaded = d;
+                        g.total = t;
+                        g.phase = p;
+                        if p == "done" {
+                            g.done = true;
+                        }
                     }
-                }
-            });
+                },
+            );
             if let Err(e) = result {
                 if let Ok(mut g) = shared.lock() {
                     g.phase = "error";
