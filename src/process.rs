@@ -838,6 +838,14 @@ pub fn pid(proc: &ManagedProcess) -> Option<u32> {
     proc.child.lock().ok().map(|c| c.id())
 }
 
+/// 服务端「启动完成」就绪标志判定（纯字符串，不读文件、不阻塞）。
+///
+/// 标准 MC 服务端就绪时输出 `Done (12.34s)! For help, type "help"`；取其中任一标志命中，
+/// 兼容被改过本地化或被包装端改过文案的情况。判定数据来自调用方已尾随到的日志缓冲。
+pub fn start_ready_seen(buf: &str) -> bool {
+    buf.contains("Done (") || buf.contains("For help, type \"help\"")
+}
+
 /// 尝试优雅停止：写入 stop，最多等待 timeout 秒，超时则强制终止整个进程树
 /// 注意：必须在后台线程中调用，避免阻塞 UI
 pub fn stop_gracefully(proc: &ManagedProcess, timeout_secs: u64) -> bool {

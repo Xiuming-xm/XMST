@@ -1677,6 +1677,24 @@ struct PlayersSnapshot {
 /// 玩家快照异步回传消息：(server_idx, 请求序号, 快照)
 type PlayersMsg = (usize, u64, PlayersSnapshot);
 
+/// 服务器启动阶段（本工具托管进程 / 已接管外部实例共用）：
+/// Idle = 未运行或已停止；Starting = 进程已拉起、尚未出现就绪标志；Ready = 已就绪。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StartPhase {
+    Idle,
+    Starting,
+    Ready,
+}
+
+impl Default for StartPhase {
+    fn default() -> Self {
+        StartPhase::Idle
+    }
+}
+
+/// 「启动中排队停止」超过这个时长仍未就绪 → 提示确认（不自动强杀）
+const READY_STOP_TIMEOUT_SECS: u64 = 300;
+
 struct ServerRuntime {
     proc: Option<process::ManagedProcess>,
     log_buf: String,
@@ -1736,6 +1754,12 @@ struct ServerRuntime {
     last_msg: String,
     /// 是否正在后台执行优雅停止（进程已移交后台线程，等待保存退出）
     stopping: bool,
+    /// 启动阶段（Idle / Starting / Ready）：启动中停止要排队等就绪，不硬杀
+    start_phase: StartPhase,
+    /// 启动中点了停止：已排入停止，就绪标志出现后自动发送 stop
+    stop_after_ready: bool,
+    /// 排队时刻（用于"排队超时"提示；None = 未排队）
+    stop_queued_at: Option<std::time::Instant>,
     /// 概览�?日志页的命令输入框内�?
     cmd_input: String,
     /// 已发送过的命令历史（用于上下键回看）
@@ -1986,6 +2010,9 @@ impl Default for ServerRuntime {
             backup_working: false,
             last_msg: String::new(),
             stopping: false,
+            start_phase: StartPhase::Idle,
+            stop_after_ready: false,
+            stop_queued_at: None,
             cmd_input: String::new(),
             cmd_history: Vec::new(),
             cmd_hist_pos: None,
@@ -2221,6 +2248,8 @@ struct App {
     closing_exit: bool,
     /// 退出放行标志：所有服务器已停止，下次关闭请求直接放行
     ctx_close_pending: bool,
+    /// 「启动中排队停止」超过 5 分钟仍未就绪的确认窗目标服务器（None = 未显示）
+    ready_stop_timeout: Option<usize>,
     /// 自定义标题栏拖拽起始位置（窗口外框左上角�?
     // (已改�?ViewportCommand::StartDrag 系统拖拽，此字段保留备用)
     title_drag_start: Option<egui::Pos2>,
@@ -3261,6 +3290,7 @@ impl App {
             confirm_close: None,
             closing_exit: false,
             ctx_close_pending: false,
+            ready_stop_timeout: None,
             title_drag_start: None,
             tray: None,
             tray_show_id: None,
@@ -3719,6 +3749,14 @@ impl App {
             }
         }
         self.runtimes.remove(idx);
+        // 删除服务器后下标会前移：排队停止超时确认窗的目标序号同步调整
+        if self.ready_stop_timeout == Some(idx) {
+            self.ready_stop_timeout = None;
+        } else if let Some(i) = self.ready_stop_timeout.as_mut() {
+            if *i > idx {
+                *i -= 1;
+            }
+        }
         if self.selected_server == Some(idx) {
             self.selected_server = None;
         } else if let Some(s) = self.selected_server {
@@ -4122,6 +4160,10 @@ impl App {
         let arg_refs: Vec<&str> = spec.args.iter().map(|s| s.as_str()).collect();
         let spawn_res =
             process::spawn_hidden_env_ctx(&spec.prog, &arg_refs, &spec.dir, true, &spec.envs, &ctx);
+        // 每次启动都复位排队停止状态：避免上一次的排队标记残留，导致本次刚启动就被停
+        if self.ready_stop_timeout == Some(idx) {
+            self.ready_stop_timeout = None;
+        }
         let rt = &mut self.runtimes[idx];
         match spawn_res {
             Ok(mp) => {
@@ -4134,6 +4176,10 @@ impl App {
                 rt.last_exit_code = None;
                 rt.last_stderr.clear();
                 rt.proc = Some(mp);
+                // 本次启动的启动阶段：先置「启动中」，等日志出现就绪标志再转 Ready
+                rt.start_phase = StartPhase::Starting;
+                rt.stop_after_ready = false;
+                rt.stop_queued_at = None;
                 // run.bat 启动失败的观察窗口（None = 本次不观察）与「回退启动」标记：
                 // 回退后的进程同样由这里接管，关服快照 / 崩溃检测 / 日志尾随照常生效
                 rt.fallback_watch = watch;
@@ -4397,6 +4443,63 @@ impl App {
         if self.stop_inflight.contains(&idx) {
             return;
         }
+        // 还在启动中（未出现就绪标志）：不发送命令、不强杀，排队等就绪后再优雅停止。
+        // 退出程序（closing_exit）例外：退出要静默停服，不能把等待拉长到服务器启动完成。
+        if !self.closing_exit && self.queue_stop_after_ready(idx) {
+            return;
+        }
+        self.begin_graceful_stop(idx);
+    }
+
+    /// 「启动中点了停止」→ 排入停止队列（返回是否已排队）。
+    ///
+    /// 只在本工具托管着进程、且启动阶段还是 Starting 时排队：此时发送 stop 无效
+    /// （服务器还没读控制台），直接强杀又会丢进度。就绪标志一出现，tick 会自动发起优雅停止。
+    fn queue_stop_after_ready(&mut self, idx: usize) -> bool {
+        let (queued, newly) = match self.runtimes.get_mut(idx) {
+            Some(rt) if rt.proc.is_some() && rt.start_phase == StartPhase::Starting => {
+                let newly = !rt.stop_after_ready;
+                if newly {
+                    rt.stop_after_ready = true;
+                    rt.stop_queued_at = Some(std::time::Instant::now());
+                    rt.last_msg = "启动中… 已排入停止，将在启动完成后自动停止".to_string();
+                }
+                (true, newly)
+            }
+            _ => (false, false),
+        };
+        if !queued {
+            return false;
+        }
+        if newly {
+            let name = self
+                .cfg
+                .servers
+                .get(idx)
+                .map(|s| s.name.clone())
+                .unwrap_or_default();
+            process::launch_log_line(&format!(
+                "阶段=排队停止 结果=已排入（服务器={name}，等就绪标志出现后自动发送 stop，不强杀）"
+            ));
+            self.push_toast_with_launch_log(
+                "XMST - 已排入停止",
+                &format!("{name}：服务器启动中，将在启动完成后自动停止"),
+            );
+        }
+        true
+    }
+
+    /// 开始优雅停止：发送 stop 并等服务器保存退出，超时走既有强停。
+    /// 已接管的外部实例写不进 stdin（不是我们拉起的进程），只能结束进程树。
+    fn begin_graceful_stop(&mut self, idx: usize) {
+        // 已经进入真正的停止流程，不再需要"等就绪"标记
+        if let Some(rt) = self.runtimes.get_mut(idx) {
+            rt.stop_after_ready = false;
+            rt.stop_queued_at = None;
+        }
+        if self.ready_stop_timeout == Some(idx) {
+            self.ready_stop_timeout = None;
+        }
         // 已接管的外部实例：写不进 stdin（不是我们拉起的进程），只能结束进程树。
         // 但结束前先按"正常关服"的判定基准准备：清掉 adopted 标记 + 置 stopping，
         // 让日志尾随与关服快照（reason=stop）照常工作。
@@ -4435,13 +4538,62 @@ impl App {
         }
     }
 
+    /// 启动中排队停止的 5 分钟兜底：仍未就绪则弹确认（继续等待 / 强制停止），不自动强杀。
+    fn tick_ready_stop_timeout(&mut self) {
+        // 排队已结束（就绪后自动停止 / 崩溃 / 手动强停）→ 撤掉确认窗
+        if let Some(i) = self.ready_stop_timeout {
+            let still_queued = self
+                .runtimes
+                .get(i)
+                .map(|rt| rt.stop_after_ready && rt.start_phase == StartPhase::Starting)
+                .unwrap_or(false);
+            if !still_queued {
+                self.ready_stop_timeout = None;
+            }
+        }
+        if self.ready_stop_timeout.is_some() {
+            return;
+        }
+        let due = self.runtimes.iter().position(|rt| {
+            rt.stop_after_ready
+                && rt.start_phase == StartPhase::Starting
+                && rt.proc.is_some()
+                && rt.stop_queued_at
+                    .map(|t| t.elapsed().as_secs() >= READY_STOP_TIMEOUT_SECS)
+                    .unwrap_or(false)
+        });
+        let Some(idx) = due else { return };
+        let name = self
+            .cfg
+            .servers
+            .get(idx)
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+        if let Some(rt) = self.runtimes.get_mut(idx) {
+            // 重新计时：选「继续等待」后要再等一个周期才提示，不反复弹窗
+            rt.stop_queued_at = Some(std::time::Instant::now());
+            rt.last_msg = "启动中… 已排入停止（启动超过 5 分钟仍未就绪）".to_string();
+        }
+        process::launch_log_line(&format!(
+            "阶段=排队停止 提示=启动超过 {READY_STOP_TIMEOUT_SECS} 秒仍未就绪（服务器={name}），等用户选择"
+        ));
+        self.ready_stop_timeout = Some(idx);
+    }
+
     fn kill_server(&mut self, idx: usize) {
         // 强杀同样取消未执行的自动重启
         self.auto_restart_after_stop.remove(&idx);
         self.auto_restart_pending.remove(&idx);
         self.auto_restart_scheduled.remove(&idx);
+        // 强杀即结束这台服务器：排队停止标记与超时确认窗一并清掉
+        if self.ready_stop_timeout == Some(idx) {
+            self.ready_stop_timeout = None;
+        }
         if let Some(rt) = self.runtimes.get_mut(idx) {
             rt.crash_restart_at = None;
+            rt.stop_after_ready = false;
+            rt.stop_queued_at = None;
+            rt.start_phase = StartPhase::Idle;
         }
         let srv_name = self
             .cfg
@@ -4567,6 +4719,51 @@ impl App {
         }
     }
 
+    /// 「启动中排队停止」超时（5 分钟仍未就绪）确认窗：继续等待 / 强制停止。
+    /// 这里不自动强杀；窗口本身就是一次确认，所以「强制停止」直接走强停。
+    fn ui_ready_stop_timeout(&mut self, ctx: &egui::Context) {
+        let Some(idx) = self.ready_stop_timeout else { return };
+        let name = self.cfg.servers.get(idx).map(|s| s.name.clone()).unwrap_or_default();
+        let mut wait_more = false;
+        let mut force_now = false;
+        egui::Window::new("启动中停止")
+            .id(egui::Id::new("ready_stop_timeout_window"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.label(format!("「{name}」启动超过 5 分钟仍未就绪。"));
+                ui.label(RichText::new("已排入的停止仍在等待；强停将立即结束进程树，未保存的进度可能丢失。").weak());
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("继续等待").clicked() {
+                        wait_more = true;
+                    }
+                    if ui
+                        .add(egui::Button::new(RichText::new("强制停止").color(self.fg(Color32::from_rgb(230, 120, 120)))))
+                        .clicked()
+                    {
+                        force_now = true;
+                    }
+                });
+            });
+        if wait_more {
+            self.ready_stop_timeout = None;
+            if let Some(rt) = self.runtimes.get_mut(idx) {
+                rt.stop_queued_at = Some(std::time::Instant::now());
+                rt.last_msg = "启动中… 已排入停止，将在启动完成后自动停止".to_string();
+            }
+            // 已经"重新计时"（tick 里提示时也重置过），这里只记一行日志便于排查
+            process::launch_log_line(&format!("阶段=排队停止 选择=继续等待（服务器={name}）"));
+            self.set_toast(format!("「{name}」继续等待启动完成"));
+        } else if force_now {
+            self.ready_stop_timeout = None;
+            process::launch_log_line(&format!("阶段=排队停止 选择=强制停止（服务器={name}）"));
+            self.kill_server(idx);
+        }
+    }
+
     /// 托盘隐藏态的轻量 tick（约 1s 一次）。
     ///
     /// 为什么托盘态也必须 tick：进程退出/崩溃检测、正常关服自动备份、崩溃与自动重启调度、
@@ -4606,6 +4803,7 @@ impl App {
         self.tick_auto_restart();
         self.tick_crash_restart();
         self.tick_stop();
+        self.tick_ready_stop_timeout();
         self.tick_download();
         self.tick_mod_update();
         self.tick_create_server();
@@ -5414,6 +5612,10 @@ impl App {
             self.stop_inflight.remove(&idx);
             if let Some(rt) = self.runtimes.get_mut(idx) {
                 rt.stopping = false;
+                // 停止已结束（优雅退出或被强杀）：回到 Idle，并清掉排队停止残留
+                rt.start_phase = StartPhase::Idle;
+                rt.stop_after_ready = false;
+                rt.stop_queued_at = None;
                 // 停止时刻即"外部实例判定"的基准线：此后若日志再被写入，说明又有实例在跑
                 rt.last_stopped_at = Some(std::time::SystemTime::now());
                 rt.last_msg = if ok {
@@ -5602,6 +5804,10 @@ impl App {
             rt.adopted_mem_at = Some(std::time::Instant::now());
             rt.external = None;
             rt.stopping = false;
+            // 接管的实例本来就在运行 → 直接算已就绪（不参与"启动中排队停止"）
+            rt.start_phase = StartPhase::Ready;
+            rt.stop_after_ready = false;
+            rt.stop_queued_at = None;
             rt.log_buf.clear();
             rt.log_pending = 0;
             rt.startup_notified = true;
@@ -5649,6 +5855,9 @@ impl App {
             rt.adopted_pid = None;
             rt.external = None;
             rt.stopping = false;
+            rt.start_phase = StartPhase::Idle;
+            rt.stop_after_ready = false;
+            rt.stop_queued_at = None;
             rt.last_stopped_at = Some(std::time::SystemTime::now());
             rt.last_msg = if ok {
                 "已结束外部进程（含进程树）".to_string()
@@ -6407,6 +6616,8 @@ impl App {
     // 本帧判定为「run.bat 启动失败」、需要自动回退直连 java 的服务器序号
     // （循环内不能回调 self，统一在循环结束后重启，避免与 runtimes 的可变借用冲突）
     let mut fallback_queue: Vec<usize> = Vec::new();
+    // 本帧到达"已就绪"、需要自动发起优雅停止的排队服务器（启动中点了停止）
+    let mut queued_stop_now: Vec<usize> = Vec::new();
     let plugins_active = self
         .plugins
         .as_ref()
@@ -6434,16 +6645,19 @@ impl App {
                 added += process::drain_logs(p, &mut buf, max);
             }
             // MC 服务器启动完成标志（"Done (x.xxxs)! For help, type ..."）→ 更新就绪状态 + 通知（防重复）
-            // D5：判定放宽到「Done (」+「s)」同时出现，兼容不同版本/包装端的小差异。
-            if !rt.startup_notified && buf.contains("Done (") && buf.contains("s)") {
+            // 判定走 process::start_ready_seen：`Done (` 或 `For help, type "help"` 任一命中即就绪。
+            if !rt.startup_notified && process::start_ready_seen(&buf) {
                 rt.startup_notified = true;
                 rt.last_msg = "✅ 启动完成，服务端已就绪".to_string();
                 // 成功运行：重置崩溃重启计数与熔断窗口
                 rt.crash_count = 0;
                 rt.crash_first_at = None;
                 rt.crash_restart_at = None;
-                let name = self.cfg.servers.get(idx).map(|s| s.name.clone()).unwrap_or_default();
-                notify_queue.push(("XMST - 服务器启动完成".to_string(), format!("{name} 已就绪，可以连接")));
+                // 已排入停止时不再提示"可以连接"（马上就会自动停止），避免自相矛盾
+                if !rt.stop_after_ready {
+                    let name = self.cfg.servers.get(idx).map(|s| s.name.clone()).unwrap_or_default();
+                    notify_queue.push(("XMST - 服务器启动完成".to_string(), format!("{name} 已就绪，可以连接")));
+                }
             }
             // 就绪超时提示：长时间未出现 Done（非标准 MC 服务端或启动异常），给出可见状态
             if !rt.startup_notified
@@ -6451,7 +6665,11 @@ impl App {
                 && rt.started_at.map(|t| t.elapsed().as_secs() > 180).unwrap_or(false)
             {
                 rt.startup_warned = true;
-                rt.last_msg = "已运行，但未检测到服务端就绪标志（可能不是标准 MC 服务端），请查看日志确认".to_string();
+                rt.last_msg = if rt.stop_after_ready {
+                    "启动中… 已排入停止（未检测到就绪标志，仍在等待）".to_string()
+                } else {
+                    "已运行，但未检测到服务端就绪标志（可能不是标准 MC 服务端），请查看日志确认".to_string()
+                };
                 // D5 兜底：非标准/代理端/被改过本地化的服务端可能永远不输出 "Done ("
                 // → 插件事件永远不触发。超时后仍按「已启动」补发一次 server_started。
                 if plugins_active && !rt.plugin_start_emitted {
@@ -6459,6 +6677,16 @@ impl App {
                     let name = self.cfg.servers.get(idx).map(|s| s.name.clone()).unwrap_or_default();
                     plugin_evts.push(PluginEvt::ServerStarted(name));
                 }
+            }
+        }
+        // 启动阶段推进：直接复用本帧已尾随到的日志数据判定就绪（不新增文件读取、不阻塞）。
+        // 放在 `if let Some(p) = &rt.proc` 之外：外部接管实例（proc 为 None）同样走这里。
+        if rt.start_phase == StartPhase::Starting && process::start_ready_seen(&buf) {
+            rt.start_phase = StartPhase::Ready;
+            if rt.stop_after_ready {
+                // 启动中点了停止：就绪标志刚出现，本帧末尾自动发送 stop（优雅停止）
+                rt.last_msg = "已就绪，正在自动停止…".to_string();
+                queued_stop_now.push(idx);
             }
         }
         // 非用户主动停止时进程消失：先判定是否属于"正常关闭"（控制台输入 /stop 等），
@@ -6548,6 +6776,10 @@ impl App {
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| "?".to_string());
                 let name = self.cfg.servers.get(idx).map(|s| s.name.clone()).unwrap_or_default();
+                // 进程已退出：回到 Idle，并取消"启动中排队停止"（排队期间自己崩了/退了就按既有退出路径处理）
+                rt.start_phase = StartPhase::Idle;
+                rt.stop_after_ready = false;
+                rt.stop_queued_at = None;
                 // 三重信号取或：日志出现 Stopping server/Saving worlds 或 退出码为 0，
                 // 且自本次启动以来没有新增崩溃报告
                 let since = rt
@@ -6821,7 +7053,26 @@ impl App {
     }
     // 退出后的快照判定（正常关服 → reason=stop；异常退出 → 仅在显式开启崩溃备份时才做）
     for (i, code_opt, tail, new_crash) in exit_events {
+        // 排队期间自己退了：撤掉"启动超时"确认窗，避免指向一台已停止的服务器
+        if self.ready_stop_timeout == Some(i) {
+            self.ready_stop_timeout = None;
+        }
         self.try_exit_snapshot(i, false, code_opt, &tail, new_crash);
+    }
+    // 「启动中点了停止」的排队：就绪标志已出现 → 本帧自动发起优雅停止
+    //（发送 stop → 等服务器保存退出 → 走既有 reason=stop 关服快照）
+    for idx in queued_stop_now {
+        let name = self
+            .cfg
+            .servers
+            .get(idx)
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+        process::launch_log_line(&format!(
+            "阶段=排队停止 结果=已就绪，自动发送 stop（服务器={name}）"
+        ));
+        self.set_toast(format!("「{name}」已就绪，正在自动停止"));
+        self.begin_graceful_stop(idx);
     }
         plugin_evts
     }
@@ -6849,6 +7100,9 @@ impl App {
             if let Some(rt) = self.runtimes.get_mut(i) {
                 rt.stopping = false;
                 rt.proc = None;
+                rt.start_phase = StartPhase::Idle;
+                rt.stop_after_ready = false;
+                rt.stop_queued_at = None;
                 rt.last_msg = match &res {
                     Ok(rep) => format!("回退完成，共恢复 {} 个文件", rep.restored),
                     Err(e) => format!("回退失败: {e}"),
@@ -7248,6 +7502,12 @@ impl App {
         };
         if let Some(rt) = self.runtimes.get_mut(idx) {
             rt.last_msg = "正在停止服务器并回退备份…".to_string();
+            // 回退自己会停服：清掉排队标记，避免残留
+            rt.stop_after_ready = false;
+            rt.stop_queued_at = None;
+        }
+        if self.ready_stop_timeout == Some(idx) {
+            self.ready_stop_timeout = None;
         }
         self.restore_inflight.insert(idx);
         self.backup_cache = None;
@@ -12365,6 +12625,8 @@ impl eframe::App for App {
         self.tick_crash_restart();
         // 优雅停止后台线程回传
         self.tick_stop();
+        // 启动中排队停止的超时提示（5 分钟仍未就绪才弹确认窗）
+        self.tick_ready_stop_timeout();
         // 网络下载模块回传（下载完成唤醒一次 repaint；托盘态不轮询）
         self.tick_download();
         // mods 内 .jar 更新回传（Modrinth 指纹检测）
@@ -12894,6 +13156,8 @@ impl eframe::App for App {
         if features::is_enabled(&self.cfg.features, features::FEATURE_FORCE_STOP_CONFIRM) {
             self.ui_force_stop_confirm(ctx);
         }
+        // 「启动中排队停止」超时确认（继续等待 / 强制停止）
+        self.ui_ready_stop_timeout(ctx);
 
         // 回退确认弹窗（二次确认；回退全程在后台线程执行）
         if self.confirm_restore.is_some() {
@@ -14501,6 +14765,10 @@ impl App {
             .get(idx)
             .map(|r| r.fallback_started)
             .unwrap_or(false);
+        // 启动阶段 + 是否已排入停止（启动中点停止后按钮/状态卡都要跟着变）
+        let start_phase = self.runtimes.get(idx).map(|r| r.start_phase).unwrap_or(StartPhase::Idle);
+        let stop_queued = self.runtimes.get(idx).map(|r| r.stop_after_ready).unwrap_or(false);
+        let starting = run_kind == RunKind::Managed && start_phase == StartPhase::Starting;
         let busy = running || stopping || adopted;
         let last_msg = self.runtimes.get(idx).map(|r| r.last_msg.clone()).unwrap_or_default();
         // 预检结果摘要（失败数 / 警告数），用于按钮旁的提示
@@ -14564,12 +14832,26 @@ impl App {
             } else {
                 match run_kind {
                     RunKind::Managed => (
-                        if fallback_started {
+                        if starting {
+                            if stop_queued {
+                                "启动中…（已排入停止）".to_string()
+                            } else {
+                                "启动中…".to_string()
+                            }
+                        } else if fallback_started {
                             "运行中（回退启动：直连 java）".to_string()
                         } else {
                             "运行中".to_string()
                         },
-                        Color32::from_rgb(80, 200, 120),
+                        if starting {
+                            if stop_queued {
+                                Color32::from_rgb(235, 165, 90)
+                            } else {
+                                Color32::from_rgb(230, 190, 110)
+                            }
+                        } else {
+                            Color32::from_rgb(80, 200, 120)
+                        },
                     ),
                     RunKind::Adopted => (
                         "运行中（外部启动·已接管）".to_string(),
@@ -14698,9 +14980,26 @@ impl App {
                     self.start_server(idx);
                 }
             }
-            let stop_btn = ui.add_enabled(busy, egui::Button::new(RichText::new("⏹ 停止 (stop)").size(15.0)));
+            // 「停止」按钮随启动阶段变形：启动中=排入停止（就绪后自动停），已排队=改为强制停止
+            let stop_label = if stop_queued {
+                "⏹ 强制停止"
+            } else if starting {
+                "⏹ 停止（启动后执行）"
+            } else {
+                "⏹ 停止 (stop)"
+            };
+            let stop_btn = ui.add_enabled(busy, egui::Button::new(RichText::new(stop_label).size(15.0)));
             if stop_btn.clicked() {
-                self.stop_server(idx);
+                if stop_queued {
+                    // 已在排队：这一下是"我不想等了" → 走既有强停流程（含既有二次确认）
+                    if features::is_enabled(&self.cfg.features, features::FEATURE_FORCE_STOP_CONFIRM) {
+                        self.request_force_stop(idx);
+                    } else {
+                        self.kill_server(idx);
+                    }
+                } else {
+                    self.stop_server(idx);
+                }
             }
             let kill_btn = ui.add_enabled(busy, egui::Button::new(RichText::new("⏹ 强制结束").size(15.0)));
             if kill_btn.clicked() {
