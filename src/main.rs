@@ -2314,6 +2314,8 @@ struct App {
     server_il_notified: HashSet<String>,
     /// 服务器目录完整性自检是否已在启动后跑过（只跑一次，不每帧扫盘）
     server_il_checked: bool,
+    /// 服务器目录完整性自检：本次运行是否已写过「全部正常」的汇总记录（只写一条）
+    server_il_summary_logged: bool,
     /// 启动诊断（「🧪 启动诊断」）是否正在后台执行
     launch_diag_busy: bool,
     /// 启动诊断结果文本（Some 时显示可滚动小窗口）
@@ -3347,6 +3349,7 @@ impl App {
             low_il_pending: Vec::new(),
             server_il_notified: HashSet::new(),
             server_il_checked: false,
+            server_il_summary_logged: false,
             launch_diag_busy: false,
             launch_diag_text: None,
             tray_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -4909,8 +4912,8 @@ impl App {
     /// Low IL 的特征是「半可用」：读文件、写自己目录（data）正常，写其它目录一律
     /// 「拒绝访问 (os error 5)」，打开目录/调用系统程序（explorer / ShellExecute）看似成功
     /// 却没有窗口 —— 极易被误判成多个互不相干的 bug。检测到 Low 时弹一次修复提示
-    /// （见 ui_low_il_notice）；Medium/High 不打扰用户；API 失败按「未知」处理，
-    /// 但三种结论都写进诊断日志留痕。
+    /// （见 ui_low_il_notice）；Medium/High 不打扰用户；API 失败按「未知」处理。
+    /// 三种结论都写进 `integrity_check.log` 留痕，但**工具日志只在 Low 时记一条**。
     fn check_integrity_level(&mut self) {
         let rid = current_integrity_rid();
         let exe_dir = std::env::current_exe()
@@ -4944,15 +4947,14 @@ impl App {
             "工具启动 版本={} exe_dir={dir_text} 完整性level={level} rid={rid_text} 本进程在Job内={in_job} 本进程cwd={self_cwd}",
             env!("CARGO_PKG_VERSION")
         ));
-        toollog::tool_log(
-            if level == "Low" {
-                toollog::ToolLevel::Error
-            } else {
-                toollog::ToolLevel::Info
-            },
-            "诊断",
-            format!("完整性自检：level={level}（exe 目录 {dir_text}）"),
-        );
+        // 工具日志只在异常（Low）时打扰用户：Medium/未知只进 integrity_check.log 留痕
+        if level == "Low" {
+            toollog::tool_log(
+                toollog::ToolLevel::Error,
+                "诊断",
+                format!("完整性自检：level={level}（exe 目录 {dir_text}）"),
+            );
+        }
         // Job 限制逐项落盘（多行文本压成一行便于 grep）：带进程数/内存上限的外层 Job
         // 会拦住需要大堆的 java，而 cmd/echo 这类小进程看不出异常 —— 这是第一个怀疑对象。
         process::launch_log_line(&format!(
@@ -4987,31 +4989,35 @@ impl App {
     ///
     /// 服务器目录带 Low 标签时，目录里的 java.exe 也以 Low IL 运行，连 `logs\latest.log`
     /// 都写不出来（表现为"连日志都没有、退出码 1、stderr 为空"，而同一份 run.bat 在
-    /// PowerShell 里能正常启动，见 AGENTS.md §9.1）。逐台检查并把结论写进工具日志，
-    /// 命中 Low 时登记一条提示（每个目录本次运行只提示一次）。
+    /// PowerShell 里能正常启动，见 AGENTS.md §9.1）。
+    ///
+    /// 记录规则（正常时一律不打扰）：
+    /// - 只有 Low 才写：某台服务器有 Low 目录时写一条错误级日志（该台的 Low 目录合并进同一条）；
+    /// - Medium / 未知不写：读得到 Medium 或读不到标签都不记日志；
+    /// - 全部正常时，**整个运行只写一条**汇总（`server_il_summary_logged` 保证不重复）。
+    /// 检查与提示逻辑不变：Low 仍登记一次弹窗提示（每台本次运行一次）。
     fn check_server_dirs_integrity(&mut self) {
         if self.server_il_checked {
             return;
         }
         self.server_il_checked = true;
         let servers = self.cfg.servers.clone();
+        let mut low_servers = 0usize;
         for sc in &servers {
-            for (dir, rid) in server_integrity_scan(sc) {
-                if rid == Some(winapi::um::winnt::SECURITY_MANDATORY_LOW_RID) {
-                    continue; // Low 由 queue_server_il_notice 统一写错误级日志
-                }
-                toollog::tool_log(
-                    toollog::ToolLevel::Info,
-                    "诊断",
-                    format!(
-                        "服务器目录完整性自检：{} 目录={} level={}",
-                        sc.name,
-                        dir.display(),
-                        integrity_level_text(rid)
-                    ),
-                );
+            let lows = server_integrity_lows(sc);
+            if !lows.is_empty() {
+                low_servers += 1;
             }
-            self.queue_server_il_notice(sc);
+            self.notify_server_il_lows(sc, &lows);
+        }
+        // 正常时最多一条汇总：所有服务器目录都不含 Low，才写「N 台服务器目录正常」
+        if low_servers == 0 && !servers.is_empty() && !self.server_il_summary_logged {
+            self.server_il_summary_logged = true;
+            toollog::tool_log(
+                toollog::ToolLevel::Info,
+                "诊断",
+                format!("完整性自检：{} 台服务器目录正常", servers.len()),
+            );
         }
     }
 
@@ -5020,17 +5026,14 @@ impl App {
         let Some(sc) = self.cfg.servers.get(idx).cloned() else {
             return;
         };
-        self.queue_server_il_notice(&sc);
+        let lows = server_integrity_lows(&sc);
+        self.notify_server_il_lows(&sc, &lows);
     }
 
-    /// 登记一台服务器的「目录完整性级别为 Low」提示：错误级工具日志 + 入队。
-    /// 每台服务器本次运行只提示一次（同一台的低完整性目录合并进同一条提示）。
-    fn queue_server_il_notice(&mut self, sc: &ServerConfig) {
-        let lows: Vec<PathBuf> = server_integrity_scan(sc)
-            .into_iter()
-            .filter(|(_, rid)| *rid == Some(winapi::um::winnt::SECURITY_MANDATORY_LOW_RID))
-            .map(|(d, _)| d)
-            .collect();
+    /// 登记一台服务器的「目录完整性级别为 Low」：错误级工具日志 + 提示入队。
+    /// 每台服务器本次运行只记录/提示一次（同一台的多个低完整性目录合并进同一条）。
+    /// `lows` 为空（正常或未知）时什么也不做 —— 正常情况不写日志。
+    fn notify_server_il_lows(&mut self, sc: &ServerConfig, lows: &[PathBuf]) {
         if lows.is_empty() {
             return;
         }
@@ -12010,6 +12013,15 @@ fn server_integrity_scan(sc: &ServerConfig) -> Vec<(PathBuf, Option<u32>)> {
             let rid = path_integrity_rid(&d);
             (d, rid)
         })
+        .collect()
+}
+
+/// 一次扫描里筛出**确认为 Low** 的目录。读不到标签（未知）不算 Low，也不记日志。
+fn server_integrity_lows(sc: &ServerConfig) -> Vec<PathBuf> {
+    server_integrity_scan(sc)
+        .into_iter()
+        .filter(|(_, rid)| *rid == Some(winapi::um::winnt::SECURITY_MANDATORY_LOW_RID))
+        .map(|(d, _)| d)
         .collect()
 }
 
