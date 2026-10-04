@@ -10436,6 +10436,20 @@ fn load_config(path: &Path) -> GlobalConfig {
             let _ = std::fs::write(path, json);
         }
     }
+    // 界面密度旧默认值收敛：批 3 的默认（间距 8 + 控件高 26 + 更厚的按钮内边距）观感偏厚，
+    // 收敛到 18；只处理从未手动调整过的旧默认组合（见 migrate_ui_density_defaults）。
+    if migrate_ui_density_defaults(&mut cfg) {
+        migrated.push("界面密度旧默认值收敛 26→18");
+        if let Ok(json) = serde_json::to_string_pretty(&cfg) {
+            if let Some(data_dir) = path.parent() {
+                let _ = std::fs::create_dir_all(data_dir);
+            }
+            let tmp = path.with_extension("json.tmp");
+            if std::fs::write(&tmp, json.as_bytes()).is_ok() {
+                let _ = std::fs::rename(&tmp, path);
+            }
+        }
+    }
     // 崩溃熔断参数收敛：历史上默认「5 次 / 等待 10 秒 / 窗口 10 分钟」，
     // 故障循环里会把服务器反复拉起很久；有改动时原子回写磁盘（临时文件 → 替换）。
     if migrate_crash_restart_defaults(&mut cfg) {
@@ -10492,6 +10506,24 @@ fn migrate_backup_exclude_tmp(cfg: &mut GlobalConfig) -> bool {
         }
     }
     changed
+}
+
+/// 界面密度旧默认值收敛（一次性，标记见 `GlobalConfig::ui_density_tight`）。
+///
+/// 批 3 引入 `ui_ctl_h` 时默认 26，同时把 `item_spacing.y` 从 3 抬到 6、按钮上下内边距
+/// 从 1 抬到 3，三者叠加的观感是"所有区域都变大/变厚"；本轮把默认收敛到 18（= 该字段
+/// 引入前的控件高度），这里负责把**仍是那组旧默认值**（间距 8 + 控件高 26）的配置一并收敛。
+/// 手动调过任一项的配置只打标记、不改数值；返回是否有改动（有改动才回写配置）。
+fn migrate_ui_density_defaults(cfg: &mut GlobalConfig) -> bool {
+    if cfg.ui_density_tight {
+        return false;
+    }
+    cfg.ui_density_tight = true;
+    if (cfg.ui_item_spacing - 8.0).abs() < 0.01 && (cfg.ui_ctl_h - 26.0).abs() < 0.01 {
+        cfg.ui_ctl_h = 18.0;
+        return true;
+    }
+    false
 }
 
 /// 崩溃熔断的旧默认值收敛（默认值见 config.rs 的 default_crash_*）。
@@ -12835,7 +12867,13 @@ fn main() -> eframe::Result {
             }
         }));
     }
-    if !single_instance_check() {
+    // 自动化入口（XMST_OPEN_PAGE / XMST_SHOT / XMST_OPEN_TEST / XMST_CRASHSCAN）**不参与单实例检查**：
+    // 否则程序已在运行（多数情况停在托盘里）时，诊断实例会走"唤醒已有窗口并静默 exit(0)"，
+    // 表现为「exit=0 但一帧没渲染、没有 stderr、没有截图」——最坏会把无头回归误判成通过。
+    let automated = ["XMST_OPEN_PAGE", "XMST_SHOT", "XMST_OPEN_TEST", "XMST_CRASHSCAN"]
+        .iter()
+        .any(|k| std::env::var(k).is_ok());
+    if !automated && !single_instance_check() {
         std::process::exit(0);
     }
     // F1：窗口位置/大小记忆（读取启动前即可用的配置；data 目录与 App::new 同源）
@@ -14586,8 +14624,26 @@ fn content_frame(mut frame: egui::Frame) -> egui::Frame {
 // 都引用同一组常量，避免"每页各写一套数字"造成的参差。
 // 圆角与字号沿用主题层（theme::apply 的 corner_scale / ui_font_scale），此处不重复定义。
 
-/// 控件统一高度（工具条上的输入框与按钮同高）
-const UI_CTL_H: f32 = 26.0;
+/// 工具条一行内容的**最小**高度：真正的控件高度跟随全局「控件高度」（设置 → 界面），
+/// 这里只兜一个下限，避免把控件高度调到很小时工具条被压扁。
+/// （批 3 曾把工具条的控件高度硬编码成 26pt，与全局设置脱钩：用户把控件高度调小后，
+///   工具条仍是全场最厚的一条 —— 这正是"区域都变厚"的来源之一。）
+const UI_TOOLBAR_MIN_H: f32 = 18.0;
+
+/// 当前生效的全局控件高度（pt × 100，见设置 → 界面「控件高度」）。
+///
+/// 为什么用静态量而不是直接读 `ui.spacing()`：工具条与固定尺寸按钮里写的是
+/// `ui.add_sized([w, ui_ctl_h()], …)`，若换成 `ui.spacing()` 会在 `&mut ui` 调用
+/// 的实参位置同时借用 `ui`（E0502）。该值每帧由界面令牌写回（`apply_theme` 里），
+/// 渲染只读，天然与 `style.spacing.interact_size.y` 相同。
+static UI_CTL_H_PT: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new((UI_TOOLBAR_MIN_H * 100.0) as u32);
+
+/// 读当前全局控件高度（pt）
+#[inline]
+fn ui_ctl_h() -> f32 {
+    UI_CTL_H_PT.load(std::sync::atomic::Ordering::Relaxed) as f32 / 100.0
+}
 /// 控件横向间距
 const UI_SPACE_X: f32 = 8.0;
 /// 控件纵向间距
@@ -14641,7 +14697,7 @@ impl<'a> PageToolbar<'a> {
         A: FnOnce(&mut egui::Ui),
     {
         let Self { ui, title } = self;
-        let item_h = UI_CTL_H;
+        let item_h = ui_ctl_h().max(UI_TOOLBAR_MIN_H);
         let pad = UI_BLOCK_PAD;
         egui::Frame::none()
             .fill(ui.visuals().faint_bg_color)
@@ -14765,7 +14821,7 @@ impl App {
                 },
                 |ui| {
                     if ui
-                        .add_sized([84.0, UI_CTL_H], egui::Button::new("🔄 刷新"))
+                        .add_sized([84.0, ui_ctl_h()], egui::Button::new("🔄 刷新"))
                         .on_hover_text("立即重绘并重新采样运行状态")
                         .clicked()
                     {
@@ -15326,14 +15382,14 @@ impl App {
             },
             |tba| {
                 if tba
-                    .add_sized([84.0, UI_CTL_H], egui::Button::new("💾 保存"))
+                    .add_sized([84.0, ui_ctl_h()], egui::Button::new("💾 保存"))
                     .on_hover_text("立即把当前配置写入磁盘（平时自动保存）")
                     .clicked()
                 {
                     tb_save = true;
                 }
                 if tba
-                    .add_sized([84.0, UI_CTL_H], egui::Button::new("🔄 刷新"))
+                    .add_sized([84.0, ui_ctl_h()], egui::Button::new("🔄 刷新"))
                     .on_hover_text("重新读取文件列表与服务器信息")
                     .clicked()
                 {
@@ -15342,7 +15398,7 @@ impl App {
                 if let Some(i) = tb_idx {
                     if tba
                         .add_sized(
-                            [104.0, UI_CTL_H],
+                            [104.0, ui_ctl_h()],
                             egui::Button::new(if tb_running { "⏹ 停止" } else { "▶ 启动" }),
                         )
                         .clicked()
@@ -15591,14 +15647,14 @@ impl App {
             },
             |tba| {
                 if tba
-                    .add_sized([104.0, UI_CTL_H], egui::Button::new("🗑 清空输出"))
+                    .add_sized([104.0, ui_ctl_h()], egui::Button::new("🗑 清空输出"))
                     .on_hover_text("清空本页输出缓冲（会先弹出二次确认）")
                     .clicked()
                 {
                     tb_clear = true;
                 }
                 if tba
-                    .add_sized([84.0, UI_CTL_H], egui::Button::new("🔄 刷新"))
+                    .add_sized([84.0, ui_ctl_h()], egui::Button::new("🔄 刷新"))
                     .on_hover_text("重新读取崩溃来源与日志列表")
                     .clicked()
                 {
@@ -18024,7 +18080,7 @@ impl App {
             },
             |tba| {
                 if tba
-                    .add_sized([84.0, UI_CTL_H], egui::Button::new("🔄 刷新"))
+                    .add_sized([84.0, ui_ctl_h()], egui::Button::new("🔄 刷新"))
                     .on_hover_text("立即重新读取名单与在线玩家")
                     .clicked()
                 {
@@ -18359,14 +18415,14 @@ impl App {
             |tba| {
                 tba.horizontal(|ui| {
                     if ui
-                        .add_sized([88.0, UI_CTL_H], egui::Button::new("🔄 刷新"))
+                        .add_sized([88.0, ui_ctl_h()], egui::Button::new("🔄 刷新"))
                         .on_hover_text("重新读取当前目录")
                         .clicked()
                     {
                         do_refresh = true;
                     }
                     if ui
-                        .add_sized([124.0, UI_CTL_H], egui::Button::new("📂 打开当前目录"))
+                        .add_sized([124.0, ui_ctl_h()], egui::Button::new("📂 打开当前目录"))
                         .on_hover_text("在资源管理器中打开当前目录")
                         .clicked()
                     {
@@ -19360,21 +19416,21 @@ impl App {
             },
             |tba| {
                 if tba
-                    .add_sized([120.0, UI_CTL_H], egui::Button::new("🔄 刷新列表"))
+                    .add_sized([120.0, ui_ctl_h()], egui::Button::new("🔄 刷新列表"))
                     .on_hover_text("重新读取快照与旧版 zip 列表")
                     .clicked()
                 {
                     tb_refresh = true;
                 }
                 if tba
-                    .add_sized([132.0, UI_CTL_H], egui::Button::new("🧹 按策略清理"))
+                    .add_sized([132.0, ui_ctl_h()], egui::Button::new("🧹 按策略清理"))
                     .on_hover_text("按保留策略清理超出部分")
                     .clicked()
                 {
                     tb_retention = true;
                 }
                 if tba
-                    .add_sized([124.0, UI_CTL_H], egui::Button::new("🔄 立即备份"))
+                    .add_sized([124.0, ui_ctl_h()], egui::Button::new("🔄 立即备份"))
                     .on_hover_text("马上生成一份快照（不等待定时器）")
                     .clicked()
                 {
@@ -19998,7 +20054,7 @@ impl App {
                 },
                 |tba| {
                     if tba
-                        .add_sized([84.0, UI_CTL_H], egui::Button::new("🔄 刷新"))
+                        .add_sized([84.0, ui_ctl_h()], egui::Button::new("🔄 刷新"))
                         .on_hover_text("立即重绘页面（状态与流量按固定周期刷新）")
                         .clicked()
                     {
@@ -20590,14 +20646,14 @@ impl App {
             },
             |tba| {
                 if tba
-                    .add_sized([84.0, UI_CTL_H], egui::Button::new("🔄 刷新"))
+                    .add_sized([84.0, ui_ctl_h()], egui::Button::new("🔄 刷新"))
                     .on_hover_text("立即重绘页面")
                     .clicked()
                 {
                     tba.ctx().request_repaint();
                 }
                 if tba
-                    .add_sized([112.0, UI_CTL_H], egui::Button::new("➕ 创建隧道"))
+                    .add_sized([112.0, ui_ctl_h()], egui::Button::new("➕ 创建隧道"))
                     .on_hover_text("转到创建隧道页")
                     .clicked()
                 {
@@ -21529,12 +21585,18 @@ impl App {
         // 只覆盖 spacing 的两个字段，不动主题的其它样式。
         {
             let sp = self.cfg.ui_item_spacing.clamp(4.0, 16.0);
-            let ch = self.cfg.ui_ctl_h.clamp(20.0, 34.0);
+            let ch = self.cfg.ui_ctl_h.clamp(18.0, 34.0);
             let mut style = (*ctx.style()).clone();
             style.spacing.item_spacing.x = sp;
-            style.spacing.item_spacing.y = (sp * 0.75).max(2.0);
+            // 纵向间距与按钮内边距**跟随控件高度缓慢增长**：批 3 用的是 `sp*0.75` 与
+            // `(ch-20)*0.5`，在默认值下把行距从 3 抬到 6、按钮上下各再厚 3pt —— 观感是
+            // "所有区域都变大/变厚"。这里两个系数都调回与旧观感一致的档位（8→3、18→1）。
+            style.spacing.item_spacing.y = (sp * 0.375).max(2.0);
             style.spacing.interact_size.y = ch;
-            style.spacing.button_padding.y = ((ch - 20.0) * 0.5).max(1.0);
+            style.spacing.button_padding.y = ((ch - 18.0) * 0.25).max(1.0);
+            // 工具条与固定尺寸按钮读这个值（见 ui_ctl_h()）：两边同源，避免"配置调小、
+            // 工具条仍按旧高度绘制"的脱钩。
+            UI_CTL_H_PT.store((ch * 100.0) as u32, std::sync::atomic::Ordering::Relaxed);
             ctx.set_style(style);
         }
         // 界面字号：以启动时系统 DPI 为基线，按 scaled_font(1.0, ui_font_scale) 缩放
@@ -22064,7 +22126,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.label("控件高度:");
             if ui
-                .add(egui::Slider::new(&mut self.cfg.ui_ctl_h, 20.0..=34.0).fixed_decimals(1).suffix(" px"))
+                .add(egui::Slider::new(&mut self.cfg.ui_ctl_h, 18.0..=34.0).fixed_decimals(1).suffix(" px"))
                 .changed()
             {
                 self.save_config();
@@ -22225,7 +22287,7 @@ impl App {
                 },
                 |tba| {
                     if tba
-                        .add_sized([110.0, UI_CTL_H], egui::Button::new("💾 保存配置"))
+                        .add_sized([110.0, ui_ctl_h()], egui::Button::new("💾 保存配置"))
                         .on_hover_text("把当前配置立即写入磁盘")
                         .clicked()
                     {
@@ -23589,14 +23651,14 @@ const MATERIAL_OWNER_FALLBACK: &str = "xmst-frosted-glass-demo";
                     },
                     |tba| {
                         if tba
-                            .add_sized([128.0, UI_CTL_H], egui::Button::new("📥 导入插件"))
+                            .add_sized([128.0, ui_ctl_h()], egui::Button::new("📥 导入插件"))
                             .on_hover_text("选择插件 zip 导入到插件目录")
                             .clicked()
                         {
                             tb_import = true;
                         }
                         if tba
-                            .add_sized([128.0, UI_CTL_H], egui::Button::new("🔄 重新扫描"))
+                            .add_sized([128.0, ui_ctl_h()], egui::Button::new("🔄 重新扫描"))
                             .on_hover_text("重新加载插件目录下的全部插件")
                             .clicked()
                         {
@@ -25072,7 +25134,7 @@ impl App {
                     },
                     |tba| {
                         if tba
-                            .add_sized([84.0, UI_CTL_H], egui::Button::new("🔍 搜索"))
+                            .add_sized([84.0, ui_ctl_h()], egui::Button::new("🔍 搜索"))
                             .on_hover_text("按关键词搜索社区项目")
                             .clicked()
                         {
@@ -26208,21 +26270,21 @@ impl App {
                     },
                     |tba| {
                         if tba
-                            .add_sized([104.0, UI_CTL_H], egui::Button::new("📂 日志文件"))
+                            .add_sized([104.0, ui_ctl_h()], egui::Button::new("📂 日志文件"))
                             .on_hover_text("打开 data\\tool.log 所在目录并选中该文件")
                             .clicked()
                         {
                             do_open_file = true;
                         }
                         if tba
-                            .add_sized([92.0, UI_CTL_H], egui::Button::new("🗑 清空"))
+                            .add_sized([92.0, ui_ctl_h()], egui::Button::new("🗑 清空"))
                             .on_hover_text("清空本页显示缓冲（会先弹出二次确认；不删除 data\\tool.log 文件）")
                             .clicked()
                         {
                             ask_clear_view = true;
                         }
                         if tba
-                            .add_sized([84.0, UI_CTL_H], egui::Button::new("🔄 刷新"))
+                            .add_sized([84.0, ui_ctl_h()], egui::Button::new("🔄 刷新"))
                             .on_hover_text("立即重算过滤缓存")
                             .clicked()
                         {

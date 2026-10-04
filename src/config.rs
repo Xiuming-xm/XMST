@@ -108,9 +108,18 @@ pub struct GlobalConfig {
     /// 与控件高度一起构成"全局间距/字体/圆角"里的间距一项（圆角走 corner_scale，字号走 ui_font_scale）
     #[serde(default = "default_ui_item_spacing")]
     pub ui_item_spacing: f32,
-    /// 界面控件高度（20.0..=34.0，默认 26.0）：按钮与输入框的统一高度（工具条上两者同高）
+    /// 界面控件高度（18.0..=34.0，默认 18.0）：按钮与输入框的统一高度（工具条上两者同高）
+    ///
+    /// 默认值取 18，与「全局密度」引入前的观感一致；26（该字段最初的默认）会让按钮、
+    /// 输入框与每行间距一起变厚，用户反馈"区域都变大/变厚"，故收敛回紧凑档。
     #[serde(default = "default_ui_ctl_h")]
     pub ui_ctl_h: f32,
+    /// 界面密度默认值已收敛（一次性迁移标记，见 `migrate_ui_density_defaults`）
+    ///
+    /// true 表示这台机器已经处理过"旧默认 26 → 18"的迁移，此后用户手动把控件高度
+    /// 调回 26 也不会再被改写。
+    #[serde(default)]
+    pub ui_density_tight: bool,
     /// Window corner radius scale, independent from widget corners
     #[serde(default = "default_window_corner_scale")]
     pub window_corner_scale: f32,
@@ -231,7 +240,7 @@ fn default_ui_item_spacing() -> f32 {
 }
 
 fn default_ui_ctl_h() -> f32 {
-    26.0
+    18.0
 }
 
 fn default_window_corner_scale() -> f32 {
@@ -330,7 +339,8 @@ impl Default for GlobalConfig {
             window_round_corners: true,
             corner_scale: 1.0,
             ui_item_spacing: 8.0,
-            ui_ctl_h: 26.0,
+            ui_ctl_h: 18.0,
+            ui_density_tight: true,
             window_corner_scale: 1.0,
             toast_style: "slide".to_string(),
             toast_duration_secs: 5.0,
