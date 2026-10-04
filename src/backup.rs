@@ -1218,6 +1218,70 @@ pub fn sync_snapshot_dir(snapshot_dir: &Path, dest_root: &Path) -> Result<u64, S
     Ok(copied)
 }
 
+/// 把某服务器的快照目录批量转存到目标根目录：遍历 `.mcsrv_backups/snapshots/*`
+/// （按目录名 = 时间升序），逐份调用 [`sync_snapshot_dir`]；单份失败只记入失败清单，
+/// 不中断其余份数。`names` 为 `Some` 时只处理名单内的目录名（重复项自动去重）。
+/// 目标根不存在时自动创建；`dest_root` 为空 → `Err("未设置远端目标")`。
+///
+/// 返回 `(成功份数, 复制字节数, 失败清单)`，失败清单元素形如 `"<快照名>: <原因>"`。
+/// 快照是目录树，因此远端目标只支持本地目录或 UNC（`\\nas\share`）；
+/// 目标写成 `http(s)://` URL 时不支持（WebDAV 转存不在本函数范围内）。
+pub fn sync_all_snapshots(
+    server_dir: &Path,
+    dest_root: &Path,
+    names: Option<&[String]>,
+) -> Result<(usize, u64, Vec<String>), String> {
+    let dest_text = dest_root.to_string_lossy();
+    if dest_text.trim().is_empty() {
+        return Err("未设置远端目标".to_string());
+    }
+    if dest_text.starts_with("http://") || dest_text.starts_with("https://") {
+        return Err("远端目标为 http(s) URL，不支持快照目录转存".to_string());
+    }
+    fs::create_dir_all(dest_root)
+        .map_err(|e| format!("创建远端目标目录失败（{}）: {e}", dest_root.display()))?;
+
+    let snap_root = server_dir.join(SNAPSHOTS_DIR);
+    let mut pending: Vec<String> = match names {
+        Some(list) => list.to_vec(),
+        None => fs::read_dir(&snap_root)
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| e.path().is_dir())
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+    pending.sort();
+    pending.dedup();
+
+    let mut synced = 0usize;
+    let mut bytes = 0u64;
+    let mut failed: Vec<String> = Vec::new();
+    for name in pending {
+        // 名单可能来自配置：拒绝分隔符与相对段，保证目录始终落在快照根目录内
+        if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\')
+        {
+            failed.push(format!("{name}: 目录名不合法"));
+            continue;
+        }
+        let dir = snap_root.join(&name);
+        if !dir.is_dir() {
+            failed.push(format!("{name}: 快照目录不存在"));
+            continue;
+        }
+        match sync_snapshot_dir(&dir, dest_root) {
+            Ok(n) => {
+                synced += 1;
+                bytes = bytes.saturating_add(n);
+            }
+            Err(e) => failed.push(format!("{name}: {e}")),
+        }
+    }
+    Ok((synced, bytes, failed))
+}
+
 /// 存储总览：占用、份数、可回滚范围、按变化速度估算的可保留天数
 pub fn storage_stats(server_dir: &Path, policy: &RetentionPolicy) -> StorageStats {
     let snaps = list_snapshots(server_dir);
@@ -1306,18 +1370,21 @@ fn free_space_bytes(path: &Path) -> u64 {
         use std::os::windows::ffi::OsStrExt;
         let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
         wide.push(0);
-        let mut avail: u64 = 0;
-        // 第 2/3 个出参不需要：传空指针，避免多写两个临时变量
+        // 三个出参都可为 null；都按 *mut ULARGE_INTEGER 传入真实变量接收
+        let mut free_to_caller: winapi::um::winnt::ULARGE_INTEGER = unsafe { std::mem::zeroed() };
+        let mut total: winapi::um::winnt::ULARGE_INTEGER = unsafe { std::mem::zeroed() };
+        let mut total_free: winapi::um::winnt::ULARGE_INTEGER = unsafe { std::mem::zeroed() };
         let ok = unsafe {
             winapi::um::fileapi::GetDiskFreeSpaceExW(
                 wide.as_ptr(),
-                &mut avail as *mut u64 as *mut winapi::um::winnt::ULARGE_INTEGER,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
+                &mut free_to_caller as *mut _,
+                &mut total as *mut _,
+                &mut total_free as *mut _,
             )
         };
         if ok != 0 {
-            return avail;
+            // QuadPart() 返回 64 位无符号值的引用
+            return unsafe { *free_to_caller.QuadPart() };
         }
         0
     }

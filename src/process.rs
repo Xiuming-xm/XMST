@@ -835,7 +835,7 @@ pub fn child_running(child: &Arc<Mutex<Child>>) -> bool {
 
 /// 获取主进程 PID（用于性能采样）
 pub fn pid(proc: &ManagedProcess) -> Option<u32> {
-    proc.child.lock().ok().map(|c| c.id())
+    Some(proc.child.lock().unwrap_or_else(|e| e.into_inner()).id())
 }
 
 /// 服务端「启动完成」就绪标志判定（纯字符串，不读文件、不阻塞）。

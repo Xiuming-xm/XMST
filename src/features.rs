@@ -2,7 +2,7 @@
 //!
 //! 设计目的：
 //! 1. 每个功能有唯一稳定 ID（语义化 slug，如 `server.backup.auto`），代码/配置/日志统一引用；
-//! 2. 用户对功能的个性化覆盖（启用/禁用/显示/排序/样式）全部以 ID 为键持久化，
+//! 2. 用户对功能的个性化覆盖（启用/禁用/排序/样式）全部以 ID 为键持久化，
 //!    缺省时用默认值，不膨胀配置文件；
 //! 3. 后续自定义 UI（布局/拖拽排序/样式/显隐）直接基于本注册表驱动，无需再动硬编码。
 //!
@@ -67,8 +67,6 @@ pub struct FeatureMeta {
     pub group: FeatureGroup,
     /// 默认启用（false=默认禁用，仅测试功能使用）
     pub default_enabled: bool,
-    /// 默认可见（false=默认隐藏 UI）
-    pub default_visible: bool,
     /// 是否需要重启程序才完全生效（true 时界面标注"下次启动生效"）
     ///
     /// 目前所有已登记项都在运行时读取开关（后台调度每轮重新判断），
@@ -85,9 +83,6 @@ pub struct FeatureState {
     /// 是否启用：false = UI 隐藏 + 后台调度拦截（彻底禁用）
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// 是否显示：false = 仅隐藏 UI，功能照常运行
-    #[serde(default = "default_true")]
-    pub visible: bool,
     /// 排序覆盖（None=默认顺序）；自定义 UI 预留
     #[serde(default)]
     pub order: Option<i32>,
@@ -101,7 +96,6 @@ impl Default for FeatureState {
     fn default() -> Self {
         Self {
             enabled: true,
-            visible: true,
             order: None,
         }
     }
@@ -133,7 +127,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "服务器首页：启动/停止、核心信息与常用快捷入口。",
         group: FeatureGroup::Server,
         default_enabled: true,
-        default_visible: true,
         restart_required: false,
         order: 10,
     },
@@ -143,7 +136,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "实时查看进程 CPU/内存占用与运行时长。",
         group: FeatureGroup::Server,
         default_enabled: true,
-        default_visible: true,
         restart_required: false,
         order: 20,
     },
@@ -153,7 +145,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "在界面里浏览、编辑服务器目录下的文件。",
         group: FeatureGroup::Server,
         default_enabled: true,
-        default_visible: true,
         restart_required: false,
         order: 30,
     },
@@ -163,7 +154,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "备份与自动重启等自动能力的集中入口。",
         group: FeatureGroup::Server,
         default_enabled: true,
-        default_visible: true,
         restart_required: false,
         order: 40,
     },
@@ -173,7 +163,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "服务器异常退出后按倒计时自动重新启动。",
         group: FeatureGroup::Server,
         default_enabled: true,
-        default_visible: true,
         restart_required: false,
         order: 50,
     },
@@ -183,7 +172,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "检测到崩溃后自动重启（反复崩溃时建议关闭）。",
         group: FeatureGroup::Server,
         default_enabled: true,
-        default_visible: true,
         restart_required: false,
         order: 51,
     },
@@ -193,7 +181,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "管理白名单、封禁与 OP 名单，改动直接写入服务端文件。",
         group: FeatureGroup::Server,
         default_enabled: true,
-        default_visible: true,
         restart_required: false,
         order: 60,
     },
@@ -203,7 +190,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "图形化编辑 server.properties 与常用启动参数。",
         group: FeatureGroup::Server,
         default_enabled: true,
-        default_visible: true,
         restart_required: false,
         order: 61,
     },
@@ -213,7 +199,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "编辑 run.bat 与 JVM 参数等启动脚本。",
         group: FeatureGroup::Server,
         default_enabled: true,
-        default_visible: true,
         restart_required: false,
         order: 62,
     },
@@ -223,7 +208,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "为每台服务器指定 Java 路径与内存参数。",
         group: FeatureGroup::Server,
         default_enabled: true,
-        default_visible: true,
         restart_required: false,
         order: 63,
     },
@@ -233,7 +217,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "强制结束服务器进程前弹窗确认，避免误点丢档。",
         group: FeatureGroup::Server,
         default_enabled: true,
-        default_visible: true,
         restart_required: false,
         order: 64,
     },
@@ -243,7 +226,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "从日志解析 TPS/MSPT 指标并展示变化。",
         group: FeatureGroup::Server,
         default_enabled: true,
-        default_visible: true,
         restart_required: false,
         order: 70,
     },
@@ -254,7 +236,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "内网穿透总览：隧道状态与连接信息。",
         group: FeatureGroup::Tunnel,
         default_enabled: true,
-        default_visible: true,
         restart_required: false,
         order: 10,
     },
@@ -264,7 +245,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "新建 frp/rathole 隧道并映射本地端口。",
         group: FeatureGroup::Tunnel,
         default_enabled: true,
-        default_visible: true,
         restart_required: false,
         order: 20,
     },
@@ -274,7 +254,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "启停、编辑与删除已有隧道。",
         group: FeatureGroup::Tunnel,
         default_enabled: true,
-        default_visible: true,
         restart_required: false,
         order: 30,
     },
@@ -284,7 +263,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "查看穿透内核输出的运行日志。",
         group: FeatureGroup::Tunnel,
         default_enabled: true,
-        default_visible: true,
         restart_required: false,
         order: 40,
     },
@@ -294,7 +272,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "从零开始的内网穿透图文步骤说明。",
         group: FeatureGroup::Tunnel,
         default_enabled: true,
-        default_visible: true,
         restart_required: false,
         order: 50,
     },
@@ -304,7 +281,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "下载、更新或指定 frpc 可执行文件。",
         group: FeatureGroup::Tunnel,
         default_enabled: true,
-        default_visible: true,
         restart_required: false,
         order: 60,
     },
@@ -315,7 +291,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "全局通用设置（启动行为、默认值等）。",
         group: FeatureGroup::Settings,
         default_enabled: true,
-        default_visible: true,
         restart_required: false,
         order: 10,
     },
@@ -325,7 +300,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "日志采集与日志库相关设置。",
         group: FeatureGroup::Settings,
         default_enabled: true,
-        default_visible: true,
         restart_required: false,
         order: 20,
     },
@@ -335,7 +309,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "主题、字号、动效与布局设置。",
         group: FeatureGroup::Settings,
         default_enabled: true,
-        default_visible: true,
         restart_required: false,
         order: 30,
     },
@@ -345,7 +318,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "全局默认 Java 环境与内存参数。",
         group: FeatureGroup::Settings,
         default_enabled: true,
-        default_visible: true,
         restart_required: false,
         order: 40,
     },
@@ -355,7 +327,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "系统通知与弹窗提醒的开关。",
         group: FeatureGroup::Settings,
         default_enabled: true,
-        default_visible: true,
         restart_required: false,
         order: 50,
     },
@@ -366,7 +337,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "左侧导航栏的服务器入口。",
         group: FeatureGroup::Tool,
         default_enabled: true,
-        default_visible: true,
         restart_required: false,
         order: 10,
     },
@@ -376,7 +346,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "左侧导航栏的内网穿透入口。",
         group: FeatureGroup::Tool,
         default_enabled: true,
-        default_visible: true,
         restart_required: false,
         order: 20,
     },
@@ -386,7 +355,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "左侧导航栏的设置入口。",
         group: FeatureGroup::Tool,
         default_enabled: true,
-        default_visible: true,
         restart_required: false,
         order: 30,
     },
@@ -396,7 +364,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "关服、崩溃等事件用 Windows 气泡通知提醒。",
         group: FeatureGroup::Tool,
         default_enabled: true,
-        default_visible: true,
         restart_required: false,
         order: 40,
     },
@@ -407,7 +374,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "按策略自动生成世界与配置快照；启用后会定时占用磁盘与磁盘 IO。",
         group: FeatureGroup::Beta,
         default_enabled: false,
-        default_visible: true,
         restart_required: false,
         order: 10,
     },
@@ -417,7 +383,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "自动读取 crash-reports，给出根因归类与可疑文件定位。",
         group: FeatureGroup::Beta,
         default_enabled: false,
-        default_visible: true,
         restart_required: false,
         order: 20,
     },
@@ -427,7 +392,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "在穿透页面显示实时上下行流量与累计用量。",
         group: FeatureGroup::Beta,
         default_enabled: false,
-        default_visible: true,
         restart_required: false,
         order: 30,
     },
@@ -437,7 +401,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "内置服务端核心与模组下载（含 Modrinth 搜索与翻译）。",
         group: FeatureGroup::Tool,
         default_enabled: true,
-        default_visible: true,
         restart_required: false,
         order: 60,
     },
@@ -447,7 +410,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "在线玩家、白名单、封禁与 OP 四个页签的集中管理。",
         group: FeatureGroup::Tool,
         default_enabled: true,
-        default_visible: true,
         restart_required: false,
         order: 70,
     },
@@ -457,7 +419,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "用 rhai 脚本扩展 XMST，支持 zip 热加载与自定义界面效果。",
         group: FeatureGroup::Tool,
         default_enabled: true,
-        default_visible: true,
         restart_required: false,
         order: 80,
     },
@@ -467,7 +428,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "启用后可创建 rathole 隧道替代 frp（需自备 rathole 服务端）。",
         group: FeatureGroup::Beta,
         default_enabled: false,
-        default_visible: true,
         restart_required: false,
         order: 70,
     },
@@ -477,7 +437,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "把备份额外转存到远端目录或网络位置，实现异地留存。",
         group: FeatureGroup::Beta,
         default_enabled: false,
-        default_visible: true,
         restart_required: false,
         order: 80,
     },
@@ -487,7 +446,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "特殊功能页总开关（当前包含 Spark 性能分析），默认禁用。",
         group: FeatureGroup::Beta,
         default_enabled: false,
-        default_visible: true,
         restart_required: false,
         order: 90,
     },
@@ -497,7 +455,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "读取 mods 内模组版本并与 Modrinth 比对，只报告可更新版本，不自动替换。",
         group: FeatureGroup::Beta,
         default_enabled: false,
-        default_visible: true,
         restart_required: false,
         order: 91,
     },
@@ -507,7 +464,6 @@ pub const REGISTRY: &[FeatureMeta] = &[
         desc: "解析 Spark 报告，定位卡顿的模组、维度与实体。",
         group: FeatureGroup::Server,
         default_enabled: true,
-        default_visible: true,
         restart_required: false,
         order: 91,
     },
@@ -576,14 +532,6 @@ pub fn entry_hint(id: &str) -> &'static str {
         FEATURE_SPARK => "入口：服务器 → 特殊功能 → Spark 性能分析（随「特殊功能」总开关显示）",
         _ => "",
     }
-}
-
-/// 是否可见（无覆盖时按默认值）
-pub fn is_visible(features: &HashMap<String, FeatureState>, id: &str) -> bool {
-    features
-        .get(id)
-        .map(|s| s.visible)
-        .unwrap_or_else(|| meta(id).map(|m| m.default_visible).unwrap_or(true))
 }
 
 #[cfg(test)]
@@ -677,8 +625,7 @@ mod registry_selfcheck {
                 m.id.to_string(),
                 FeatureState {
                     enabled: !m.default_enabled,
-                    visible: m.default_visible,
-                    order: None,
+                    ..Default::default()
                 },
             );
             assert_eq!(is_enabled(&map, m.id), !m.default_enabled, "{} 覆盖未生效", m.id);

@@ -139,7 +139,7 @@ egui 的 `ui_*` 每帧执行。曾出现（已修/部分修）：
 - 概览页每帧递归遍历 `world/` —— 实测 **5352 文件 / 7.9 GB / 单次 282 ms**（现在 30 s 记忆化）；
 - 日志页每帧 `COUNT(*)` + 取 800 行（现在 500 ms 节流缓存）；
 - 已接缓存的：`serverinfo::detect_cached`（3 s TTL）、`mod_jar_index`（进 mods 页扫一次后复用）。
-- 仍待处理：`dir_stats`（每文件夹 walkdir）、`ui_whitelist_blacklist` 三个折叠标题里的白名单 JSON 每帧读盘（§6.2 第 14 条）。
+- 仍待处理：`dir_stats`（每文件夹 walkdir）。`ui_whitelist_blacklist` 三个折叠标题里的白名单条目数已改读 5 秒 TTL 快照，渲染路径不再读盘（§6.2 第 14 条）。
 - **手法**：把结果缓存到 `ServerRuntime`/静态 TTL 缓存，渲染只读缓存；数据变更时主动失效。
 
 ### 4.5 数据安全：配置与备份
@@ -151,7 +151,7 @@ egui 的 `ui_*` 每帧执行。曾出现（已修/部分修）：
 - 备份系统历史坑（已修，勿回退）：快照遍历被"含 backup 的路径"误剪枝 → 增量退化为全量（`has_backup_dir_segment` 只看最后两段 + 精确目录名）。
 
 ### 4.6 稳定性
-- release 是 **`panic=abort`**：任何 `unwrap()` panic = 进程直接消失。**锁访问一律** `lock().unwrap_or_else(|e| e.into_inner())`（已完成 22 处）。
+- release 是 **`panic=abort`**：任何 `unwrap()` panic = 进程直接消失。**锁访问一律** `lock().unwrap_or_else(|e| e.into_inner())`（全仓已统一：2026-10-03 的 22 处 + 2026-10-05 收敛的 15 处，见 §6.1 第 26 条）。
 - 后台线程请带**上限/池化**（历史上每图标、每服务器各起一个线程）。
 - rhai 插件：`max_operations` 必须钳制（已钳 20 万）+ 单帧时间预算，插件分发在 UI 线程。
 
@@ -174,7 +174,7 @@ egui 的 `ui_*` 每帧执行。曾出现（已修/部分修）：
 
 ## 6. 已知问题 / 待办（按建议优先级）
 
-### 6.1 已完成（2026-10-04 收尾批；移出待办，仅作对照，勿回退）
+### 6.1 已完成（2026-10-04 收尾批 + 2026-10-05 补充；移出待办，仅作对照，勿回退）
 
 1. **备份系统改造**（2026-10-04）：硬链接快照引擎与锁定/转存、关服自动快照、旧版 zip 链式回退（细节见 §4.5）。
 2. **托盘隐藏态 tick**（2026-10-04）：`spawn_tray_heartbeat` + `tray_hidden_tick`（1s 节流），隐藏期间自动行为照常推进。
@@ -200,10 +200,14 @@ egui 的 `ui_*` 每帧执行。曾出现（已修/部分修）：
 22. **下载文件名消毒**（2026-10-04）：`sanitize_remote_filename()`，`.part` 路径同源（防 zip-slip）。
 23. **锁中毒**（2026-10-03）：22 处改 `lock().unwrap_or_else(|e| e.into_inner())`（见 §4.6）。
 24. **日志页工具日志化**：**进行中**（另一工作流）。目标见 §9.7；当前页面说明仍写着"含服务器输出汇总"，尚未收口。
+25. **`features` 可见性机制删除**（2026-10-05）：`is_visible()` / `FeatureMeta.default_visible` / `FeatureState.visible` 全仓库无消费者，已全部删除——注册表只保留 `default_enabled`，`FeatureState` 只保留 `enabled` / `order`（UI 一律用 `is_enabled`）。
+26. **锁访问统一**（2026-10-05）：`main.rs` 的 9 处 `pm.configs.lock()`（4 处 `.lock().ok()` + 5 处 `if let Ok(..) = ..lock()`）、`process.rs::pid`、`modrinth.rs` 翻译缓存 6 处，全部改 `lock().unwrap_or_else(|e| e.into_inner())`；全仓 `\.lock\(\)\.ok\(\)` 归零。
+27. **备份全部转存入口**（2026-10-05）：「备份」页「存储与远程」内新增 `☁️ 全部转存到远端`（后台调 `backup::sync_all_snapshots(server_dir, remote_target, None)`，逐份复制、单份失败不中断；完成 toast 报「成功 N 份，复制 X，失败 M 份」，失败明细进工具日志类别「备份」）；远端目标始终只读，不删本地快照。
+28. **服务器页签重构**（2026-10-05，审计表 §6 批 2）：`概览 · 控制台 · 文件 · 备份 ·（玩家）· 设置 ·（特殊功能）`；原「服务器状态」与概览内嵌日志合并为「控制台」（性能条 + 日志 + 命令输入 + 折叠的崩溃分析 / TPS 占位）；「自动功能」拆为「备份」与「设置」（自动重启 / 崩溃重启迁入设置）；删除「🧬 属性」占位子页签与 `ui_players_props_disabled`。
 
 ### 6.2 仍待办（按建议优先级）
 
-1. **界面信息架构重组**：逐项盘点、合并结论与迁移批次见 `docs\UI-审计表.md`（一级导航 7 → 6、服务器页签收敛、统一工具条、设置分组折叠）。其中含两处死代码：`ui_perf`（`ServerTab::Perf` 有渲染分支但页签表里没有它，任何路径都进不去）、`ui_players_props`（已被 `ui_players_props_disabled` 取代，无调用者）。
+1. **界面信息架构重组**：逐项盘点、合并结论与迁移批次见 `docs\UI-审计表.md`（一级导航 7 → 6、服务器页签收敛、统一工具条、设置分组折叠）。**进度（2026-10-05）**：批 1（一级导航 7 → 6，「插件 / 日志」收进「工具」二级）与批 2（服务器页签重构：`概览 / 控制台 / 文件 / 备份 /（玩家）/ 设置 /（特殊功能）`）已落地（见 §6.1 第 28 条）；批 3（统一工具条 + 设置分组规范化）与批 4（弹窗与文案收敛）待做。两处死代码 `ui_perf`（含 `ServerTab::Perf`）与 `ui_players_props` 已删除，`ui_players_props_disabled` 占位（`🧬 属性` 子页签）也已随批 2 删除。
 1a. **仪表盘增强**：成就/里程碑（本地统计 + 灰显卡片 + 达成通知）与公告位；详见 `docs\UI-审计表.md` §8。
 1b. **仪表盘与内网穿透保留为一级导航**（已在 UI 重组决定中确认，重组时不要动这两项）。
 2. **发布 0.1.1**：产物已在 `dist\XMST-0.1.1-alpha.exe` 与 `versions\0.1.1-alpha\`，等确认后走 `tools/release.ps1`。
@@ -211,14 +215,14 @@ egui 的 `ui_*` 每帧执行。曾出现（已修/部分修）：
 4. **`XMST_OPEN_PAGE` 退出加固**：收尾走 `ViewportCommand::Close`，被"有服务器运行"的二次确认拦住后靠 300 帧兜底 `std::process::exit(0)`；该兜底跳过配置去抖与日志落盘（现在只在进入退出前 `flush_config()` 一次）。
 5. **远端备份覆盖面**：`BETA_REMOTE_BACKUP` 目前只对旧版 zip 生效；快照是目录，未做远端同步。
 6. **硬链接快照的固有代价**：源文件"原地改写"会让旧快照同步变化（见 §4.5）；要做防篡改归档需改为复制或加写时校验。
-7. **`features` 可见性机制无消费者**：`is_visible()` / `FeatureMeta.default_visible` / `FeatureState.visible` 全仓库无调用（UI 只用 `is_enabled`），要么接上"仅隐藏 UI"，要么删掉。
-8. **锁访问规约**：`into_inner()` 已覆盖 22 处；仍剩 **4 处 `.lock().ok()`**（`plugins` 的 `pm.configs.lock().ok()`），与"一律 `unwrap_or_else`"的约定不符。
+7. **`features` 可见性机制** → **已删（2026-10-05）**：`is_visible()` / `FeatureMeta.default_visible` / `FeatureState.visible` 全仓库无消费者，已全部删除，注册表与 `FeatureState` 只保留"启用"语义（`enabled` / `order`）。详见 §6.1 第 25 条。
+8. **锁访问规约** → **已统一（2026-10-05）**：`main.rs` 的 9 处 `pm.configs.lock()`（4 处 `.lock().ok()` + 5 处 `if let Ok(..) = ..lock()`）、`process.rs::pid`、`modrinth.rs` 翻译缓存的 6 处全部收敛为 `lock().unwrap_or_else(|e| e.into_inner())`；全仓 `\.lock\(\)\.ok\(\)` 为 0。详见 §6.1 第 26 条。
 9. **`DownloadState` 解包过密**：`self.dl` 上 `.as_mut().unwrap()` 49 处 + `.as_ref().unwrap()` 57 处（合计 106；此前记的"96 处"只是其中一部分）。`panic=abort` 下任一处失手即闪退，应改为一次 `let Some(dl) = ...` 或集中取引用。
-10. **`windows_version_text` 缓冲契约**：函数在 `main.rs` 内返回 `String` 供系统信息拼接，缓冲区与长度契约未写明；改动时按"一次调用一次分配、不做跨帧复用"处理。
-11. **`GetDiskFreeSpaceExW` 指针用法**：在 `backup.rs`（约 L1312），`lpFreeBytesAvailableToCaller` 等输出参数的传参形态需复核，避免 64 位值被当 32 位读。
-12. **主线程栈大小兜底**：`main` 未显式设置 `stack_size`；§9.2 的栈溢出直接让进程消失，应给主线程留足栈，或在递归点加深度上限。
+10. **`windows_version_text` 缓冲契约** → **已注明（2026-10-05）**：`main.rs` 该函数的文档注释已写明"缓冲区是**函数内局部数组**、每次调用重新分配、**不做跨帧/跨调用复用**；`RegGetValueW` 最后一个参数是**字节数**（初值 `buf.len()*2`，成功后被写回实际字节数）；任一读取失败返回空串、不 panic"。改动前按该契约执行。
+11. **`GetDiskFreeSpaceExW` 指针用法** → **已修（2026-10-05）**：`backup.rs` 改为三个出参各传真实 `ULARGE_INTEGER` 变量的地址（`*mut _`），返回值按 `QuadPart()` 解引用取 64 位，不再有"64 位值被当 32 位读"的隐患。
+12. **主线程栈大小** → **结论：不可安全改动（2026-10-05 复核）**：`main` 直接 `eframe::run_native`，Win32 窗口过程、托盘消息线程、DWM 与桌面捕获都建立在"UI 在主线程"这一前提上；把整个入口搬进 `std::thread::Builder::stack_size(..)` 会同时牵动窗口与 GL 上下文的归属，回归风险大于收益，故**保持现状**，并把"在递归点加深度上限"作为首选手段（§9.2 的栈溢出即由 `log_rows_cached` 自我递归引起）。**可选方案（未采用）**：在 `.cargo/config.toml` 的链接参数里给主线程加栈——Windows GNU 目标加 `-Wl,--stack=<字节数>`，只动构建配置、不改代码结构。
 13. **rhai 插件递归未实测**：`max_operations` 已钳 20 万 + 单帧预算，但脚本内深度递归的实际表现未测。
-14. **剩余每帧读盘**：`ui_whitelist_blacklist` 把 `load_json_list(...).len()` 写进三个 `CollapsingHeader` 标题（白名单 / 封禁玩家 / 封禁 IP），每帧读盘；玩家管理侧的同一批数据已走 5s 快照缓存，可照搬。
+14. **剩余每帧读盘** → **白名单部分已修（2026-10-05）**：`ui_whitelist_blacklist` 三个折叠标题的条目数改读 5 秒 TTL 快照（`wl_lists` / `WlListsCache`，增删名单后 `invalidate_wl_lists` 立即失效），渲染路径不再读盘。**仍待处理**：`dir_stats`（每文件夹 walkdir）。
 15. **下载健壮性剩余项**：下载 client 的总超时不应管大文件；落盘应统一走 `.part` → 校验字节/哈希 → `rename`（文件名消毒已完成，见 §6.1 第 22 条）。
 
 ---

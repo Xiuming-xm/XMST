@@ -1156,17 +1156,35 @@ struct ForceStopReq {
 /// 强停确认有效期（秒）
 const FORCE_STOP_TOKEN_TTL: u64 = 30;
 
-/// 左侧导航
+/// 左侧一级导航（目标 6 项：仪表盘 / 服务器 / 下载 / 内网穿透 / 工具 / 设置）
+///
+/// ★ 索引与导航项数量绑定：`nav_anim` / 滑块绘制 / `target_nav` 都按
+/// `App::nav_items()` 的返回顺序取索引，改动本枚举或 `nav_items()` 的顺序时必须同步核对，
+/// 否则滑块起点与"是否正在动画"的判定会一起错位。
 #[derive(PartialEq, Clone, Copy)]
 enum Nav {
     Dashboard,
     Servers,
     Tunnel,
-    /// 工具自身日志（XMST 日志库 + 相关设置；与服务器日志无关，不按服务器拆分）
-    Logs,
+    /// 工具（其下二级：插件 / 日志，见 `ToolsTab`）
+    ///
+    /// 原「插件」「日志」两个一级入口收进此处，页面实现未改动（仍用
+    /// `ui_plugins` / `ui_logs_page`）。
+    Tools,
     Settings,
     Download,
+}
+
+/// 「工具」一级下的二级入口
+///
+/// ★ 索引与条目数量绑定：二级导航按下面的声明顺序渲染，增删项需同步
+/// `ui_tools` 里的数组与 `XMST_OPEN_PAGE` 的页面名映射。
+#[derive(PartialEq, Clone, Copy)]
+enum ToolsTab {
+    /// 插件（`ui_plugins`，BETA_PLUGINS 门控）
     Plugins,
+    /// 工具自身日志（`ui_logs_page`；与服务器日志无关，不按服务器拆分）
+    Logs,
 }
 
 /// 图2 模组社区左侧导航（Modrinth 分类 + 收藏栏）
@@ -1630,15 +1648,19 @@ fn is_snapshot_version(v: &str) -> bool {
 /// 服务器页子页
 #[derive(PartialEq, Clone, Copy)]
 enum ServerTab {
+    /// 概览（平台识别 + 主操作 + 状态消息 + 打开目录）
     Overview,
-    Scripts,
+    /// 控制台（性能条 + 服务器输出日志 + 命令输入 + 崩溃分析折叠）
+    ///
+    /// 由原「服务器状态」页（性能 / 崩溃报告分析）与概览内嵌的服务器输出日志合并而来，
+    /// 日志渲染与滚动仍走 `show_colored_log`（未重写）。
+    Console,
+    /// 文件 / 模组
     Files,
-    /// 自动功能（备�?+ 自动重启�?
+    /// 备份（快照 / 回退 / 保留 / 存储总览 / 锁定 / 转存；BETA_BACKUP 启用时显示）
     Backup,
-    /// 独立性能�?
-    Perf,
-    /// 状态页（玩家列表日志解析 + 性能/网络）
-    Status,
+    /// 服务器设置（启动脚本 / run.bat / server.properties / Java·JVM / 自动重启 / 崩溃重启）
+    Scripts,
     /// 玩家管理页（B1 四 Tab：在线/白名单/封禁/OP，BETA_PLAYERS 启用时显示）
     Players,
     /// 特殊功能页（Spark 性能分析：总开关 BETA_SPECIAL + Spark 子开关 FEATURE_SPARK，2026-10-02 回归测试功能，默认禁用）
@@ -1646,13 +1668,15 @@ enum ServerTab {
 }
 
 /// 玩家管理页子页签（B1）
+///
+/// 「属性」子页签原为禁用占位（只显示一句说明、无任何控件），审计表 §4 判定其无意义，
+/// 已随本轮删除（含 `ui_players_props_disabled`）；恢复属性编辑时按 git 历史重写。
 #[derive(PartialEq, Clone, Copy)]
 enum PlayerTab {
     Online,
     Whitelist,
     Banned,
     Ops,
-    Props,
 }
 
 /// 玩家列表快照状态（B5 防竞态：状态模型补 Unknown）
@@ -1677,6 +1701,23 @@ struct PlayersSnapshot {
 
 /// 玩家快照异步回传消息：(server_idx, 请求序号, 快照)
 type PlayersMsg = (usize, u64, PlayersSnapshot);
+
+/// 白名单 / 封禁玩家 / 封禁 IP 列表快照缓存（服务器设置页的降级入口用）
+///
+/// 存在的意义：这三个折叠标题要显示条目数量，旧实现把 `load_json_list(...).len()`
+/// 直接写在标题里 —— 每帧读盘 + 解析 JSON（审计表 §4.4）。现在渲染只读本快照，
+/// 5 秒 TTL 到期才重新读盘；增删名单后立即失效（`App::invalidate_wl_lists`）。
+/// 用 `Arc` 让每帧取用的是引用计数而非深拷贝。
+#[derive(Default)]
+struct WlListsCache {
+    /// 快照对应的服务器下标（切换服务器立即失效）
+    idx: usize,
+    /// 上次读盘时刻（None = 需要重新读盘）
+    at: Option<std::time::Instant>,
+    wl: std::sync::Arc<Vec<serde_json::Value>>,
+    bp: std::sync::Arc<Vec<serde_json::Value>>,
+    bi: std::sync::Arc<Vec<serde_json::Value>>,
+}
 
 /// 服务器启动阶段（本工具托管进程 / 已接管外部实例共用）：
 /// Idle = 未运行或已停止；Starting = 进程已拉起、尚未出现就绪标志；Ready = 已就绪。
@@ -1954,7 +1995,6 @@ enum TunnelSide {
 #[derive(PartialEq, Clone, Copy)]
 enum SettingsSide {
     General,
-    Logs,
     Ui,
     Java,
     Notify,
@@ -2186,7 +2226,7 @@ struct App {
     backup_exclude_text: String,
     backup_exclude_for: Option<usize>,
     /// run.bat 重启次数的探测结果：(服务器目录, 脚本名与 MAX_RESTARTS)。
-    /// 目录不匹配表示还没在「自动功能」页检查过该服务器（进入页面才读一次脚本，避免每帧读盘）；
+    /// 目录不匹配表示还没在「设置」页检查过该服务器（进入页面才读一次脚本，避免每帧读盘）；
     /// 内层 None 表示该目录没有 run.bat / 没有 MAX_RESTARTS。
     crash_bat_probe: Option<(PathBuf, Option<(String, i32)>)>,
     /// 优雅停止后台线程回传�?(服务器下�? 是否优雅完成)
@@ -2348,12 +2388,18 @@ struct App {
     tunnel_nav_anim: f32,
     /// 设置页左侧栏当前分组
     settings_side: SettingsSide,
+    /// 「工具」页当前二级入口（插件 / 日志）
+    tools_tab: ToolsTab,
     /// 待确认启用的测试功能 ID（弹警告确认窗）
     beta_confirm: Option<String>,
     /// 服务器删除二次确认（服务器下标）
     confirm_delete_server: Option<usize>,
     /// 隧道删除二次确认（隧道下标）
     confirm_remove_tunnel: Option<usize>,
+    /// 「清空日志」（服务器控制台缓冲）二次确认（服务器下标）
+    confirm_clear_console: Option<usize>,
+    /// 「清空视图」（工具日志内存缓冲）二次确认
+    confirm_clear_tool_log: bool,
     /// 隧道基础配置编辑窗口目标（隧道下标，None=未打开）
     tunnel_edit_idx: Option<usize>,
     /// 隧道配置弹窗编辑草稿（打开时从 cfg 拷贝一次，跨帧复用，避免每帧重建丢输入）
@@ -2410,12 +2456,11 @@ struct App {
     /// SQLite 日志库（阶段C）；初始化失败时保持 None 并在设置页展示错误
     logdb: Option<logdb::LogDb>,
     logdb_err: String,
-    /// 玩家属性（阶段C）：目标玩家名
-    player_prop_name: String,
-    /// 玩家属性（阶段C）：目标游戏模式
-    player_prop_gamemode: String,
-    /// 玩家属性（阶段C）：是否 OP
-    player_prop_op: bool,
+    /// 服务器设置页「白名单 / 黑名单」列表快照（5 秒 TTL，渲染路径不读盘）
+    ///
+    /// 该页只在 BETA_PLAYERS 关闭时出现，此时玩家管理侧的快照缓存不刷新，
+    /// 因此这里单独持有一份缓存；增删名单后立即失效（`invalidate_wl_lists`）。
+    wl_lists: WlListsCache,
     toast: String,
     /// 导航滑块动画进度 (0..2)
     nav_anim: f32,
@@ -2836,6 +2881,8 @@ enum BgMsg {
     Pinned(usize, String, Result<u64, String>),
     /// 快照转存完成：(服务器下标, 快照目录名, 结果=复制的字节数)
     Synced(usize, String, Result<u64, String>),
+    /// 全部快照转存完成：(服务器下标, 结果=(成功份数, 复制字节数, 失败清单))
+    SyncedAll(usize, Result<(usize, u64, Vec<String>), String>),
     /// 诊断包：(zip 路径, 字节数) 或错误
     Diag(Result<(PathBuf, u64), String>),
     /// 启动前预检：(服务器下标, 结果)
@@ -3414,9 +3461,12 @@ impl App {
             tunnel_side: TunnelSide::Dashboard,
             tunnel_nav_anim: 0.0,
             settings_side: SettingsSide::General,
+            tools_tab: ToolsTab::Plugins,
             beta_confirm: None,
             confirm_delete_server: None,
             confirm_remove_tunnel: None,
+            confirm_clear_console: None,
+            confirm_clear_tool_log: false,
             tunnel_edit_idx: None,
             tunnel_edit_draft: None,
             tunnel_edit_advanced: false,
@@ -3441,11 +3491,9 @@ impl App {
             tunnel_search: String::new(),
             tunnel_diag: None,
             settings_search: String::new(),
-            player_prop_name: String::new(),
-            player_prop_gamemode: "survival".to_string(),
-            player_prop_op: false,
             logdb: None,
             logdb_err: String::new(),
+            wl_lists: WlListsCache::default(),
             // 托盘依赖窗口 Context 与平�?API，初始化�?new() 尾部统一完成
             //（见下方 setup_tray_and_menu 注释�?
             toast: String::new(),
@@ -3527,7 +3575,8 @@ impl App {
     ///
     /// 启动后直接切到指定页面，渲染指定帧数后自动退出，让「点某个页面就崩溃」这类问题
     /// 能在命令行里复现并拿到退出码/崩溃日志，不需要人工点击。
-    /// 页面名：`dashboard` / `servers` / `tunnel` / `logs` / `settings` / `download` / `plugins`；
+    /// 页面名：`dashboard` / `servers` / `tunnel` / `tools` / `settings` / `download`；
+    /// 「工具」二级页沿用旧一级页面名 `plugins` / `logs`（别名，入口已收到「工具」下）；
     /// 服务器页内的子页：`files` / `backup` / `players` / `special`。
     fn apply_open_page_env(&mut self) {
         let page = match std::env::var("XMST_OPEN_PAGE") {
@@ -3548,13 +3597,26 @@ impl App {
             "dashboard" => self.nav = Nav::Dashboard,
             "servers" => self.nav = Nav::Servers,
             "tunnel" => self.nav = Nav::Tunnel,
-            "logs" => self.nav = Nav::Logs,
+            // 工具（一级）与其两个二级页；`plugins` / `logs` 保持旧页面名可用
+            "tools" => self.nav = Nav::Tools,
+            "logs" => {
+                self.nav = Nav::Tools;
+                self.tools_tab = ToolsTab::Logs;
+            }
             "settings" => self.nav = Nav::Settings,
             "download" => self.nav = Nav::Download,
-            "plugins" => self.nav = Nav::Plugins,
+            "plugins" => {
+                self.nav = Nav::Tools;
+                self.tools_tab = ToolsTab::Plugins;
+            }
             "files" => {
                 self.nav = Nav::Servers;
                 self.server_tab = ServerTab::Files;
+                need_server = true;
+            }
+            "console" => {
+                self.nav = Nav::Servers;
+                self.server_tab = ServerTab::Console;
                 need_server = true;
             }
             "backup" => {
@@ -3586,6 +3648,9 @@ impl App {
         }
         if page == "players" && !features::is_enabled(&self.cfg.features, features::BETA_PLAYERS) {
             eprintln!("XMST_OPEN_PAGE: 玩家管理总开关未启用，页签会回落到概览");
+        }
+        if page == "backup" && !features::is_enabled(&self.cfg.features, features::BETA_BACKUP) {
+            eprintln!("XMST_OPEN_PAGE: 备份总开关未启用，页签会回落到概览");
         }
         if need_server && self.selected_server.is_none() {
             eprintln!("XMST_OPEN_PAGE: 配置里没有服务器，{page} 只渲染到服务器列表");
@@ -6230,6 +6295,43 @@ impl App {
                         }
                     }
                 }
+                BgMsg::SyncedAll(idx, res) => {
+                    self.bg_busy.remove(&format!("syncall:{idx}"));
+                    match res {
+                        Ok((ok, bytes, failed)) => {
+                            self.set_toast(format!(
+                                "转存完成：成功 {ok} 份，复制 {}，失败 {} 份",
+                                fmt_size(bytes),
+                                failed.len()
+                            ));
+                            toollog::tool_log(
+                                toollog::ToolLevel::Info,
+                                "备份",
+                                format!(
+                                    "快照全部转存：成功 {ok} 份，复制 {}，失败 {} 份",
+                                    fmt_size(bytes),
+                                    failed.len()
+                                ),
+                            );
+                            // 失败明细逐份进工具日志（类别「备份」），便于在日志页按类别筛出
+                            for f in failed {
+                                toollog::tool_log(
+                                    toollog::ToolLevel::Error,
+                                    "备份",
+                                    format!("快照转存失败：{f}"),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            self.set_toast(format!("转存未执行：{e}"));
+                            toollog::tool_log(
+                                toollog::ToolLevel::Error,
+                                "备份",
+                                format!("快照全部转存未执行：{e}"),
+                            );
+                        }
+                    }
+                }
                 BgMsg::Diag(res) => {
                     self.bg_busy.remove("diag");
                     match res {
@@ -6654,6 +6756,32 @@ impl App {
         std::thread::spawn(move || {
             let res = backup::sync_snapshot_dir(&snapshot_dir, &dest_root);
             let _ = tx.send(BgMsg::Synced(idx, dir_name, res));
+        });
+    }
+
+    /// 把该服务器的**全部快照**转存到「远端备份目标」：后台线程逐份复制（单份失败不中断）。
+    ///
+    /// 与单份「转存」的区别只在批量；目标为空 / 写成 http(s) 时不做前置判断，
+    /// 直接由 `backup::sync_all_snapshots` 回传明确错误（前端只负责提示）。
+    /// 远端目标始终**只读**：本入口不删除、不改写本地快照。
+    fn spawn_sync_all_snapshots(&mut self, idx: usize) {
+        let key = format!("syncall:{idx}");
+        if self.bg_busy.contains_key(&key) {
+            return;
+        }
+        let target = self.cfg.servers[idx].backup.remote_target.trim().to_string();
+        self.bg_busy.insert(key, "转存中…".to_string());
+        self.set_toast(if target.is_empty() {
+            "未设置远端备份目标，无法转存".to_string()
+        } else {
+            format!("正在把全部快照转存到 {target} …")
+        });
+        let tx = self.bg_tx.clone();
+        let server_dir = self.cfg.servers[idx].dir.clone();
+        let dest_root = PathBuf::from(target);
+        std::thread::spawn(move || {
+            let res = backup::sync_all_snapshots(&server_dir, &dest_root, None);
+            let _ = tx.send(BgMsg::SyncedAll(idx, res));
         });
     }
 
@@ -7284,7 +7412,7 @@ impl App {
                         }
                     } else {
                         rt.last_msg = format!(
-                            "⚠️ 服务器进程已退出（exit code {code}），未经过正常停止。如遇数据异常，可在「自动功能」页回滚")
+                            "⚠️ 服务器进程已退出（exit code {code}），未经过正常停止。如遇数据异常，可在「备份」页回滚")
                         ;
                     }
                 }
@@ -10422,6 +10550,27 @@ impl App {
         window_is_maximized_now(hwnd, self.win_rect_px)
     }
 
+    /// 左侧一级导航项（顺序 = 导航索引）
+    ///
+    /// ★ 索引与导航项数量绑定：`nav_anim`、滑块绘制、`target_nav`（"是否正在动画"判定）
+    /// 全部按本函数的返回顺序取索引，因此这一处是唯一的顺序定义，不要在别处再写一份列表。
+    /// 条件项（下载）按门控插入，索引随之浮动，读取索引一律走 `position()`，不要硬编码。
+    fn nav_items(&self) -> Vec<(&'static str, &'static str, Nav)> {
+        let mut items: Vec<(&'static str, &'static str, Nav)> = vec![
+            // 分组一：管理
+            ("📊", "仪表盘", Nav::Dashboard),
+            ("🗂", "服务器", Nav::Servers),
+        ];
+        if features::is_enabled(&self.cfg.features, features::BETA_DOWNLOAD) {
+            items.push(("⬇️", "下载", Nav::Download));
+        }
+        // 分组二：系统（内网穿透 / 工具 / 设置 永远可用）
+        items.push(("🔗", "内网穿透", Nav::Tunnel));
+        items.push(("🧰", "工具", Nav::Tools));
+        items.push(("⚙️", "设置", Nav::Settings));
+        items
+    }
+
     /// 侧栏导航图标：**全部用矢量图元绘制**，不再用 emoji。
     ///
     /// 为什么不再用 emoji：📊 / 🗂 / ⬇️ / 🧩 / 🔗 / ⚙️ 来自不同字体（彩色 emoji 字体 vs
@@ -10433,16 +10582,29 @@ impl App {
         let h = 9.0f32; // 18×18 方框的半边长
         let st = egui::Stroke::new(1.5, color);
         match kind {
-            Nav::Logs => {
-                // 日志：三横线文档 + 右下角一点（区别于"设置"的推子）
-                for k in 0..3 {
-                    let y = c.y - 5.0 + k as f32 * 5.0;
-                    painter.line_segment(
-                        [egui::pos2(c.x - h + 2.0, y), egui::pos2(c.x + h - 4.0, y)],
-                        egui::Stroke::new(1.4, color),
-                    );
-                }
-                painter.circle_filled(egui::pos2(c.x + h - 3.0, c.y + 5.0), 2.0, color);
+            Nav::Tools => {
+                // 工具：工具箱（圆角箱体 + 顶部提手 + 箱盖线）
+                let bx = egui::Rect::from_min_max(
+                    egui::pos2(c.x - h + 1.0, c.y - 3.0),
+                    egui::pos2(c.x + h - 1.0, c.y + h - 1.0),
+                );
+                painter.rect_stroke(bx, 1.5, st);
+                painter.line_segment(
+                    [egui::pos2(c.x - 3.5, c.y - 3.0), egui::pos2(c.x - 3.5, c.y - 6.0)],
+                    st,
+                );
+                painter.line_segment(
+                    [egui::pos2(c.x + 3.5, c.y - 3.0), egui::pos2(c.x + 3.5, c.y - 6.0)],
+                    st,
+                );
+                painter.line_segment(
+                    [egui::pos2(c.x - 3.5, c.y - 6.0), egui::pos2(c.x + 3.5, c.y - 6.0)],
+                    st,
+                );
+                painter.line_segment(
+                    [egui::pos2(bx.left(), c.y + 2.0), egui::pos2(bx.right(), c.y + 2.0)],
+                    egui::Stroke::new(1.2, color),
+                );
             }
             Nav::Dashboard => {
                 // 柱状图：三根高低不同的柱子
@@ -10479,17 +10641,6 @@ impl App {
                     [egui::pos2(c.x - h + 2.0, c.y + h - 3.0), egui::pos2(c.x + h - 2.0, c.y + h - 3.0)],
                     st,
                 );
-            }
-            Nav::Plugins => {
-                // 插件：插头（圆角矩形 + 两个触点 + 引线）
-                let rect = egui::Rect::from_min_max(
-                    egui::pos2(c.x - 5.0, c.y - 2.0),
-                    egui::pos2(c.x + 5.0, c.y + h - 1.0),
-                );
-                painter.rect_stroke(rect, 2.0, st);
-                painter.line_segment([egui::pos2(c.x - 3.0, c.y - h + 2.0), egui::pos2(c.x - 3.0, c.y - 2.0)], st);
-                painter.line_segment([egui::pos2(c.x + 3.0, c.y - h + 2.0), egui::pos2(c.x + 3.0, c.y - 2.0)], st);
-                painter.line_segment([egui::pos2(c.x, c.y + h - 1.0), egui::pos2(c.x, c.y + h + 1.0)], st);
             }
             Nav::Tunnel => {
                 // 内网穿透：链条（两个斜向交叠的圆角矩形）
@@ -13327,7 +13478,8 @@ impl eframe::App for App {
                     .extension()
                     .map(|e| e.to_string_lossy().to_lowercase() == "zip")
                     .unwrap_or(false);
-                if is_zip && self.nav == Nav::Plugins {
+                // 插件 zip 拖入：「工具 → 插件」页时直接导入
+                if is_zip && self.nav == Nav::Tools && self.tools_tab == ToolsTab::Plugins {
                     self.import_plugin_zip(&p);
                     continue;
                 }
@@ -13767,22 +13919,14 @@ impl eframe::App for App {
                 // Stage 6：SeaLantern 风格导航分组（管理 / 系统），条件项并入对应分组。
                 // Bug7：顶部栏已绘制「XMST + 版本号」，此处不再重复绘制标题。
                 ui.separator();
-                let mut nav_items: Vec<(&str, &str, Nav)> = vec![];
-                // 分组一：管理
-                nav_items.push(("📊", "仪表盘", Nav::Dashboard));
-                nav_items.push(("🗂", "服务器", Nav::Servers));
-                if features::is_enabled(&self.cfg.features, features::BETA_DOWNLOAD) {
-                    nav_items.push(("⬇️", "下载", Nav::Download));
-                }
-                if features::is_enabled(&self.cfg.features, features::BETA_PLUGINS) {
-                    nav_items.push(("🧩", "插件", Nav::Plugins));
-                }
-                // 分组二：系统（内网穿透/设置 永远可用）
-                let sys_group_start = nav_items.len();
-                // 工具自身日志（独立页：日志库浏览 + 相关设置，从设置里搬出来）
-                nav_items.push(("📜", "日志", Nav::Logs));
-                nav_items.push(("🔗", "内网穿透", Nav::Tunnel));
-                nav_items.push(("⚙️", "设置", Nav::Settings));
+                // 一级导航 6 项：仪表盘 / 服务器 / 下载（门控）/ 内网穿透 / 工具 / 设置。
+                // 顺序由 `App::nav_items()` 单点定义（索引与滑块动画都依赖它，勿在此另写一份）。
+                let nav_items = self.nav_items();
+                // 分组二：系统（内网穿透 / 工具 / 设置 永远可用）
+                let sys_group_start = nav_items
+                    .iter()
+                    .position(|(_, _, v)| *v == Nav::Tunnel)
+                    .unwrap_or(0);
                 let group_headers: std::collections::HashMap<usize, &str> =
                     [(0usize, "管理"), (sys_group_start, "系统")]
                         .into_iter()
@@ -13884,9 +14028,15 @@ impl eframe::App for App {
                     self.nav = v;
                 }
                 // 滑块沿实际按钮位置插值（选中高亮背景：强调色半透明，保留并叠加竖条）
-                let i0 = self.nav_anim.floor() as usize;
-                let i1 = (self.nav_anim.ceil() as usize).min(nav_items.len() - 1);
-                let t = self.nav_anim - i0 as f32;
+                // ★ 索引安全：`nav_anim` 是滞后值，门控开关在同帧改变条目数量时它可能越界
+                // （例如停在「设置」时关掉「下载」），这里按当前条目数量夹取后再取下标，
+                // 与隧道二级导航的写法一致（`panic=abort` 下越界即进程消失）。
+                let anim = self
+                    .nav_anim
+                    .clamp(0.0, nav_items.len().saturating_sub(1) as f32);
+                let i0 = anim.floor() as usize;
+                let i1 = (anim.ceil() as usize).min(nav_items.len() - 1);
+                let t = anim - i0 as f32;
                 let r0 = nav_rects[i0];
                 let r1 = nav_rects[i1];
                 let slider_rect = egui::Rect::from_min_max(
@@ -13949,10 +14099,9 @@ impl eframe::App for App {
             Nav::Dashboard => self.ui_dashboard(ctx),
             Nav::Servers => self.ui_servers(ctx),
             Nav::Tunnel => self.ui_tunnel(ctx),
-            Nav::Logs => self.ui_logs_page(ctx),
+            Nav::Tools => self.ui_tools(ctx),
             Nav::Settings => self.ui_settings(ctx),
             Nav::Download => self.ui_download(ctx),
-            Nav::Plugins => self.ui_plugins(ctx),
         }
 
         // B3 强停二次确认弹窗（全局，不依赖当前页签）
@@ -13961,6 +14110,8 @@ impl eframe::App for App {
         }
         // 「启动中排队停止」超时确认（继续等待 / 强制停止）
         self.ui_ready_stop_timeout(ctx);
+        // 清空类操作的二次确认（服务器输出日志 / 工具日志视图）
+        self.ui_clear_confirm(ctx);
 
         // 回退确认弹窗（二次确认；回退全程在后台线程执行）
         if self.confirm_restore.is_some() {
@@ -14144,11 +14295,11 @@ impl eframe::App for App {
             }
         }
 
-        // 性能采样：Servers(状态/概览) 采选中服务器；Dashboard 采全部在线服务器；2 Hz 限频
+        // 性能采样：Servers(控制台/概览) 采选中服务器；Dashboard 采全部在线服务器；2 Hz 限频
         if self.last_perf_sample.elapsed().as_millis() >= 500 {
             self.last_perf_sample = std::time::Instant::now();
             let need_perf_sel = matches!(self.nav, Nav::Servers)
-                && (matches!(self.server_tab, ServerTab::Status)
+                && (matches!(self.server_tab, ServerTab::Console)
                     || matches!(self.server_tab, ServerTab::Overview));
             let on_dash = matches!(self.nav, Nav::Dashboard);
             let idxs: Vec<usize> = if on_dash {
@@ -14225,21 +14376,34 @@ impl eframe::App for App {
         }
 
         // 动态重绘：动画收敛期间 60 FPS，空闲时降到 5 FPS（后台最小消耗）
-        let target_nav = [Nav::Dashboard, Nav::Servers, Nav::Tunnel, Nav::Settings]
+        // ★ 索引与导航项数量绑定：目标索引取自 `nav_items()`（唯一顺序定义），
+        // 与侧栏滑块实际使用的索引同源，避免"动画早已收敛却一直按 60FPS 重绘"。
+        let target_nav = self
+            .nav_items()
             .iter()
-            .position(|v| *v == self.nav)
+            .position(|(_, _, v)| *v == self.nav)
             .unwrap_or(0) as f32;
-        let target_tab = [
+        // 页签顺序必须与 `ui_server_detail` 里 `tabs` 的构造顺序一致（门控项按位置计入），
+        // 否则同样的索引错位问题会出现在页签切换动画上。
+        let mut tab_order: Vec<ServerTab> = vec![
             ServerTab::Overview,
-            ServerTab::Scripts,
+            ServerTab::Console,
             ServerTab::Files,
-            ServerTab::Backup,
-            ServerTab::Perf,
-            ServerTab::Status,
-        ]
-        .iter()
-        .position(|v| *v == self.server_tab)
-        .unwrap_or(0) as f32;
+        ];
+        if features::is_enabled(&self.cfg.features, features::BETA_BACKUP) {
+            tab_order.push(ServerTab::Backup);
+        }
+        if features::is_enabled(&self.cfg.features, features::BETA_PLAYERS) {
+            tab_order.push(ServerTab::Players);
+        }
+        tab_order.push(ServerTab::Scripts);
+        if features::is_enabled(&self.cfg.features, features::BETA_SPECIAL) {
+            tab_order.push(ServerTab::Special);
+        }
+        let target_tab = tab_order
+            .iter()
+            .position(|v| *v == self.server_tab)
+            .unwrap_or(0) as f32;
         let animating = self.cfg.ui_animations
             && ((self.nav_anim - target_nav).abs() > 0.02
                 || (self.tab_anim - target_tab).abs() > 0.02);
@@ -14766,19 +14930,23 @@ impl App {
         // 顶部页签（带平滑滑块动画，可在设置中关闭）
         ui.spacing_mut().item_spacing.y = 2.0;
         ui.spacing_mut().item_spacing.x = 4.0; // 页签间距收紧，选项整体靠左
-        // 玩家管理页签仅在 BETA_PLAYERS 启用时出现（渐进式开关：关闭时不占用 UI 与调度）
+        // 玩家管理 / 备份 / 特殊功能页签都受测试功能门控（关闭时不占用 UI 与调度）
         let players_on = features::is_enabled(&self.cfg.features, features::BETA_PLAYERS);
         let special_on = features::is_enabled(&self.cfg.features, features::BETA_SPECIAL);
+        let backup_on = features::is_enabled(&self.cfg.features, features::BETA_BACKUP);
+        // 页签顺序（顺序即最终顺序）：概览 · 控制台 · 文件 · 备份 · 玩家 · 设置 ·（特殊功能）
         let mut tabs: Vec<(&str, ServerTab)> = vec![
             ("概览", ServerTab::Overview),
-            ("服务器设置", ServerTab::Scripts),
-            ("文件浏览", ServerTab::Files),
-            ("自动功能", ServerTab::Backup),
-            ("服务器状态", ServerTab::Status),
+            ("控制台", ServerTab::Console),
+            ("文件", ServerTab::Files),
         ];
-        if players_on {
-            tabs.insert(4, ("玩家管理", ServerTab::Players));
+        if backup_on {
+            tabs.push(("备份", ServerTab::Backup));
         }
+        if players_on {
+            tabs.push(("玩家", ServerTab::Players));
+        }
+        tabs.push(("设置", ServerTab::Scripts));
         // 特殊功能页在总开关 BETA_SPECIAL 启用时出现（2026-10-02 起属测试功能，默认禁用；可在设置-测试中的功能开关）
         if special_on {
             tabs.push(("特殊功能", ServerTab::Special));
@@ -14788,6 +14956,9 @@ impl App {
             self.server_tab = ServerTab::Overview;
         }
         if !special_on && self.server_tab == ServerTab::Special {
+            self.server_tab = ServerTab::Overview;
+        }
+        if !backup_on && self.server_tab == ServerTab::Backup {
             self.server_tab = ServerTab::Overview;
         }
         let n_tabs = tabs.len() as f32;
@@ -14832,8 +15003,8 @@ impl App {
             }
         });
         if let Some(v) = clicked_tab {
-            // 切回概览时自动贴到日志底部（用户需求：切回来就应在最底下，而非加按钮）
-            if v == ServerTab::Overview {
+            // 切回控制台时自动贴到日志底部（用户需求：切回来就应在最底下，而非加按钮）
+            if v == ServerTab::Console {
                 if let Some(rt) = self.runtimes.get_mut(idx) {
                     rt.force_scroll_bottom = true;
                 }
@@ -14846,16 +15017,21 @@ impl App {
             if v == ServerTab::Special {
                 self.clear_special_marks();
             }
-            // 进入自动功能页：重新读一次 run.bat，把窗口内最大重启次数对齐到脚本
-            if v == ServerTab::Backup {
+            // 进入设置页：重新读一次 run.bat，把窗口内最大重启次数对齐到脚本
+            if v == ServerTab::Scripts {
                 self.crash_bat_probe = None;
             }
             self.server_tab = v;
         }
-        // 滑块沿实际按钮位置横向插�?
-        let i0 = self.tab_anim.floor() as usize;
-        let i1 = (self.tab_anim.ceil() as usize).min(tabs.len() - 1);
-        let t = self.tab_anim - i0 as f32;
+        // 滑块沿实际按钮位置横向插值
+        // ★ 索引安全：门控（BETA_PLAYERS / BETA_SPECIAL）会让页签数量在同帧变化，
+        // `tab_anim` 作为滞后值可能越界，取下标前按当前页签数量夹取。
+        let anim = self
+            .tab_anim
+            .clamp(0.0, tabs.len().saturating_sub(1) as f32);
+        let i0 = anim.floor() as usize;
+        let i1 = (anim.ceil() as usize).min(tabs.len() - 1);
+        let t = anim - i0 as f32;
         let r0 = tab_rects[i0];
         let r1 = tab_rects[i1];
         let slider_rect = egui::Rect::from_min_max(
@@ -14868,44 +15044,14 @@ impl App {
 
         match self.server_tab {
             ServerTab::Overview => self.ui_overview(ui, idx),
-            ServerTab::Scripts => self.ui_scripts(ui, idx),
+            ServerTab::Console => self.ui_console(ui, idx),
             ServerTab::Files => self.ui_files(ui, idx),
             ServerTab::Backup => self.ui_backup(ui, idx),
-            ServerTab::Perf => self.ui_perf(ui, idx),
-            ServerTab::Status => self.ui_status(ui, idx),
+            ServerTab::Scripts => self.ui_scripts(ui, idx),
             ServerTab::Players => self.ui_players(ui, idx),
             ServerTab::Special => self.ui_special(ui, idx),
         }
     }
-
-    /// 独立性能页：服务器运行中显示实时采样图表，未运行提示无数�?
-    fn ui_perf(&mut self, ui: &mut egui::Ui, idx: usize) {
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-        let running = self
-            .runtimes
-            .get(idx)
-            .and_then(|r| r.proc.as_ref())
-            .map(|p| process::is_running(p))
-            .unwrap_or(false);
-        if !running {
-            ui.add_space(24.0);
-            ui.centered_and_justified(|ui| {
-                ui.label("服务器未运行，无性能数据");
-            });
-            return;
-        }
-        show_perf_bar(ui, &self.runtimes[idx], true);
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new("CPU / 内存采样")
-                .size(12.0)
-                .color(self.fg(Color32::from_rgb(160, 160, 160))),
-        );
-            });
-    }
-
 
     /// 从服务器日志解析当前在线玩家（无需 RCON）：跟踪 " joined the game" / " left the game" 事件。
     fn parse_online_players(log: &str) -> Vec<String> {
@@ -14945,8 +15091,12 @@ impl App {
         if name.is_empty() { None } else { Some(name) }
     }
 
-    /// 状态页：玩家列表（日志解析）+ 性能 + 网络
-    fn ui_status(&mut self, ui: &mut egui::Ui, idx: usize) {
+    /// 控制台页：运行状态 / 性能条 + 服务器输出日志（含命令输入）+ 崩溃报告分析（默认折叠）。
+    ///
+    /// 来源：日志与命令输入原内嵌在概览页，性能与崩溃分析原在「服务器状态」页；
+    /// 两处合并后 `ServerTab::Status` / `ui_status` 不再存在（审计表 §3.1）。
+    /// 日志渲染与滚动仍走 `show_colored_log`（自动贴底、点击聚焦命令输入），未重写。
+    fn ui_console(&mut self, ui: &mut egui::Ui, idx: usize) {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -14957,9 +15107,10 @@ impl App {
             .map(|p| process::is_running(p))
             .unwrap_or(false);
 
-        // ---------- 性能（合并自原独�?性能"页：无需再区分页面） ----------
+        // ---------- 运行状态 + 性能条（原「服务器状态」页的性能段） ----------
+        ui.add_space(6.0);
+        ui.label(RichText::new("服务器状态").strong());
         ui.separator();
-        ui.label(RichText::new("性能").strong());
         if !running {
             ui.label(RichText::new("服务器未运行，无性能数据").weak());
         } else {
@@ -14972,16 +15123,14 @@ impl App {
             show_perf_bar(ui, &self.runtimes[idx], true);
         }
 
-        // ---------- TPS/MSPT（Spark 方案，开发中） ----------
-        ui.separator();
-        ui.label(RichText::new("服务端性能").strong());
-        ui.label(RichText::new("TPS / MSPT 与卡顿源分析：待接入 Spark 方案（当前版本未实现）").weak());
-
-        // ---------- 崩溃报告分析（离线可用，参考 PCL 的日志/报告模式匹配思路） ----------
+        // ---------- 崩溃报告分析（折叠分组，默认折叠） ----------
+        // 离线可用，参考 PCL 的日志/报告模式匹配思路。
         // 测试功能「崩溃报告分析」禁用时整块隐藏（分析结果缓存保留，重新启用后可见）
         if features::is_enabled(&self.cfg.features, features::BETA_CRASH_ANALYSIS) {
-            ui.separator();
-            ui.label(RichText::new("崩溃报告分析").strong());
+            egui::CollapsingHeader::new(RichText::new("崩溃报告分析").strong())
+                .id_salt(("console_crash_group", idx))
+                .default_open(false)
+                .show(ui, |ui| {
             ui.label(RichText::new("列出可分析的崩溃来源（latest.log / crash-reports / hs_err_pid），可逐个或一键全量分析").weak().small());
             ui.horizontal(|ui| {
                 if ui.button("🔍 分析全部").clicked() {
@@ -15050,17 +15199,151 @@ impl App {
                         .weak(),
                 );
             }
+                });
         }
 
-
-        if !running {
-            ui.add_space(12.0);
-            ui.centered_and_justified(|ui| {
-                ui.label("服务器未运行，无法获取状态");
+        // ---------- 服务端性能（TPS/MSPT 占位，Spark 方案，折叠分组默认折叠） ----------
+        egui::CollapsingHeader::new(RichText::new("服务端性能（TPS / MSPT）").strong())
+            .id_salt(("console_tps_group", idx))
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(RichText::new("TPS / MSPT 与卡顿源分析：待接入 Spark 方案（当前版本未实现）").weak());
             });
-            return;
-        }
 
+        // ---------- 服务器输出日志 + 命令输入（原概览页内嵌，渲染与滚动结构未改） ----------
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("服务器输出日志").strong());
+            // 清空日志：seek_end 跳过文件已有内容，避免重启后旧日志回灌（修复"假清空、重启不清空"）；
+            // 不可撤销（旧内容在本页不再回灌），因此先走二次确认。
+            if ui
+                .button("清空日志")
+                .on_hover_text("清空本页日志缓冲（会先弹出二次确认）")
+                .clicked()
+            {
+                self.confirm_clear_console = Some(idx);
+            }
+        });
+        let (changed, force_bottom) = {
+            let rt = &mut self.runtimes[idx];
+            // 缓冲被裁剪后长度可能恒定，必须按“新增行数”判断是否贴底
+            let changed = rt.log_pending > 0;
+            rt.log_pending = 0;
+            let fb = rt.force_scroll_bottom;
+            rt.force_scroll_bottom = false;
+            (changed, fb)
+        };
+        // 借用而非 clone：show_colored_log 只读日志缓冲，避免可见态每帧大字符串克隆造成内存峰值
+        let log_resp = show_colored_log(
+            ui,
+            &self.runtimes[idx].log_buf,
+            changed,
+            force_bottom,
+            Some(ui.available_height() - 44.0),
+        );
+        // 点击日志区域：聚焦命令输入框（用户需求：点击日志即可输入，而非独立搜索框）
+        if log_resp.clicked() {
+            if let Some(rt) = self.runtimes.get_mut(idx) {
+                rt.cmd_focus = true;
+            }
+        }
+        // 命令输入框（日志下方控制台风格）：Enter 发送，↑↓ 回看历史
+        ui.horizontal(|ui| {
+            // 先取聚焦标记并复位（避免与 cmd_input 的可变借用冲突）
+            let want_focus = self.runtimes.get_mut(idx).map(|r| {
+                let f = r.cmd_focus;
+                r.cmd_focus = false;
+                f
+            }).unwrap_or(false);
+            let mut send_cmd = String::new();
+            let mut hist_move: Option<i32> = None; // -1=上一条 1=下一条
+            let input_opt = self.runtimes.get_mut(idx).map(|r| &mut r.cmd_input);
+            if let Some(input) = input_opt {
+                let input_id = egui::Id::new(("cmd_input", idx));
+                if want_focus {
+                    ui.memory_mut(|m| m.request_focus(input_id));
+                }
+                let resp = ui.add(
+                    TextEdit::singleline(input)
+                        .id(input_id)
+                        .hint_text("输入 stop / say hello 等命令（Enter 发送，↑↓ 回看历史）")
+                        .desired_width(f32::INFINITY),
+                );
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    send_cmd = input.clone();
+                }
+                if resp.has_focus() {
+                    if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                        hist_move = Some(-1);
+                    }
+                    if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                        hist_move = Some(1);
+                    }
+                }
+            }
+            // 上下键历史导航
+            if let Some(dir) = hist_move {
+                if let Some(rt) = self.runtimes.get_mut(idx) {
+                    if !rt.cmd_history.is_empty() {
+                        let pos = match rt.cmd_hist_pos {
+                            Some(p) => p,
+                            None => rt.cmd_history.len(), // 光标在末尾（当前输入中）
+                        };
+                        let new_pos = if dir < 0 {
+                            pos.saturating_sub(1)
+                        } else {
+                            (pos + 1).min(rt.cmd_history.len())
+                        };
+                        if new_pos == rt.cmd_history.len() {
+                            rt.cmd_hist_pos = None;
+                        } else {
+                            rt.cmd_input = rt.cmd_history[new_pos].clone();
+                            rt.cmd_hist_pos = Some(new_pos);
+                        }
+                    }
+                }
+            }
+            if ui.button("发送命令").clicked() {
+                send_cmd = self.runtimes.get(idx).map(|r| r.cmd_input.clone()).unwrap_or_default();
+            }
+            if !send_cmd.is_empty() {
+                let cmd = send_cmd.trim().to_string();
+                if !cmd.is_empty() {
+                    let sent = self
+                        .runtimes
+                        .get(idx)
+                        .and_then(|rt| rt.proc.as_ref())
+                        .map(|p| process::write_stdin(p, &cmd).is_ok())
+                        .unwrap_or(false);
+                    if sent {
+                        if let Some(rt) = self.runtimes.get_mut(idx) {
+                            rt.cmd_input.clear();
+                            rt.cmd_hist_pos = None;
+                            // 历史去重后追加（最多保留 50 条）
+                            if rt.cmd_history.last().map(|s| s.as_str()) != Some(cmd.as_str()) {
+                                rt.cmd_history.push(cmd);
+                                if rt.cmd_history.len() > 50 {
+                                    rt.cmd_history.remove(0);
+                                }
+                            }
+                        }
+                    } else {
+                        // 已接管的外部实例没有 stdin：明确告知，避免用户以为"命令发出去了"
+                        let adopted = self
+                            .runtimes
+                            .get(idx)
+                            .and_then(|rt| rt.adopted_pid)
+                            .is_some();
+                        self.set_toast(if adopted {
+                            "发送失败：该实例由外部启动后接管，无法写入它的控制台（请到服务器窗口操作）"
+                                .to_string()
+                        } else {
+                            "发送失败：服务器未运行，stdin 未启用".to_string()
+                        });
+                    }
+                }
+            }
+        });
         ui.add_space(CONTENT_EDGE_PAD);
             });
     }
@@ -15930,144 +16213,18 @@ impl App {
             };
             ui.label(RichText::new(&last_msg).color(msg_color));
         }
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("服务器输出日志").strong());
-            // 清空日志：seek_end 跳过文件已有内容，避免重启后旧日志回灌（修复"假清�?重启不清�?�?
-            if ui.button("清空日志").clicked() {
-                if let Some(rt) = self.runtimes.get_mut(idx) {
-                    rt.log_buf.clear();
-                    rt.log_pending = 0;
-                    if let Some(t) = &mut rt.log_tail {
-                        t.seek_end();
-                    }
-                }
-            }
-        });
-        let (changed, force_bottom) = {
-            let rt = &mut self.runtimes[idx];
-            // 缓冲被裁剪后长度可能恒定，必须按“新增行数”判断是否贴�?
-            let changed = rt.log_pending > 0;
-            rt.log_pending = 0;
-            let fb = rt.force_scroll_bottom;
-            rt.force_scroll_bottom = false;
-            (changed, fb)
-        };
-        // 借用而非 clone：show_colored_log 只读日志缓冲，避免可见态每帧大字符串克隆造成内存峰值
-        let log_resp = show_colored_log(
-            ui,
-            &self.runtimes[idx].log_buf,
-            changed,
-            force_bottom,
-            Some(ui.available_height() - 44.0),
+        // 日志与命令输入已并入「控制台」页签（审计表 §3.1）：概览只留一行指引，不再重复渲染日志
+        ui.label(
+            RichText::new("服务器输出日志与命令输入已移至「控制台」页签")
+                .weak()
+                .small(),
         );
-        // 点击日志区域：聚焦命令输入框（用户需求：点击日志即可输入，而非独立搜索框）
-        if log_resp.clicked() {
-            if let Some(rt) = self.runtimes.get_mut(idx) {
-                rt.cmd_focus = true;
-            }
-        }
-        // 命令输入框（日志下方控制台风格）：Enter 发送，�?�?回看历史
-        ui.horizontal(|ui| {
-            // 先取聚焦标记并复位（避免�?cmd_input 的可变借用冲突�?
-            let want_focus = self.runtimes.get_mut(idx).map(|r| {
-                let f = r.cmd_focus;
-                r.cmd_focus = false;
-                f
-            }).unwrap_or(false);
-            let mut send_cmd = String::new();
-            let mut hist_move: Option<i32> = None; // -1=停止 1=启动
-            let input_opt = self.runtimes.get_mut(idx).map(|r| &mut r.cmd_input);
-            if let Some(input) = input_opt {
-                let input_id = egui::Id::new(("cmd_input", idx));
-                if want_focus {
-                    ui.memory_mut(|m| m.request_focus(input_id));
-                }
-                let resp = ui.add(
-                    TextEdit::singleline(input)
-                        .id(input_id)
-                        .hint_text("输入 stop / say hello 等命令（Enter 发送，↑↓ 回看历史）")
-                        .desired_width(f32::INFINITY),
-                );
-                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    send_cmd = input.clone();
-                }
-                if resp.has_focus() {
-                    if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
-                        hist_move = Some(-1);
-                    }
-                    if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
-                        hist_move = Some(1);
-                    }
-                }
-            }
-            // 上下键历史导�?
-            if let Some(dir) = hist_move {
-                if let Some(rt) = self.runtimes.get_mut(idx) {
-                    if !rt.cmd_history.is_empty() {
-                        let pos = match rt.cmd_hist_pos {
-                            Some(p) => p,
-                            None => rt.cmd_history.len(), // 光标在末尾（当前输入中
-                        };
-                        let new_pos = if dir < 0 {
-                            pos.saturating_sub(1)
-                        } else {
-                            (pos + 1).min(rt.cmd_history.len())
-                        };
-                        if new_pos == rt.cmd_history.len() {
-                            rt.cmd_hist_pos = None;
-                        } else {
-                            rt.cmd_input = rt.cmd_history[new_pos].clone();
-                            rt.cmd_hist_pos = Some(new_pos);
-                        }
-                    }
-                }
-            }
-            if ui.button("发送命令").clicked() {
-                send_cmd = self.runtimes.get(idx).map(|r| r.cmd_input.clone()).unwrap_or_default();
-            }
-            if !send_cmd.is_empty() {
-                let cmd = send_cmd.trim().to_string();
-                if !cmd.is_empty() {
-                    let sent = self
-                        .runtimes
-                        .get(idx)
-                        .and_then(|rt| rt.proc.as_ref())
-                        .map(|p| process::write_stdin(p, &cmd).is_ok())
-                        .unwrap_or(false);
-                    if sent {
-                        if let Some(rt) = self.runtimes.get_mut(idx) {
-                            rt.cmd_input.clear();
-                            rt.cmd_hist_pos = None;
-                            // 历史去重后追加（最多保�?50 条）
-                            if rt.cmd_history.last().map(|s| s.as_str()) != Some(cmd.as_str()) {
-                                rt.cmd_history.push(cmd);
-                                if rt.cmd_history.len() > 50 {
-                                    rt.cmd_history.remove(0);
-                                }
-                            }
-                        }
-                    } else {
-                        // 已接管的外部实例没有 stdin：明确告知，避免用户以为"命令发出去了"
-                        let adopted = self
-                            .runtimes
-                            .get(idx)
-                            .and_then(|rt| rt.adopted_pid)
-                            .is_some();
-                        self.set_toast(if adopted {
-                            "发送失败：该实例由外部启动后接管，无法写入它的控制台（请到服务器窗口操作）"
-                                .to_string()
-                        } else {
-                            "发送失败：服务器未运行，stdin 未启用".to_string()
-                        });
-                    }
-                }
-            }
-        });
         ui.add_space(CONTENT_EDGE_PAD);
             });
     }
 
+    /// 设置页：启动脚本 / 服务器属性（server.properties、run.bat）/ 启动方式 / Java 与 JVM /
+    /// 开机自启 / 自动重启 / 崩溃重启（后两项由原「自动功能」页迁入，审计表 §3.3）。
     fn ui_scripts(&mut self, ui: &mut egui::Ui, idx: usize) {
         let sc = self.cfg.servers[idx].clone();
         let dir = sc.dir.clone();
@@ -16084,17 +16241,29 @@ impl App {
             .max_height(scripts_max_h)
             .show(ui, |ui| {
         ui.add_space(6.0);
+        ui.label(RichText::new("设置").strong());
+        ui.label(
+            RichText::new("启动脚本 / 服务器属性 / Java 与 JVM / 开机自启 / 自动重启 / 崩溃重启")
+                .weak()
+                .small(),
+        );
+        ui.separator();
 
         // 分区一：白名单/黑名单管理（标题由 ui_whitelist_blacklist 内部绘制，置于页面顶部）
         // 整合去重（B1）：BETA_PLAYERS 启用时白名单/封禁已并入「玩家」页签，此处不再重复展示；
         // 仅当玩家管理开关关闭时保留原三折叠区作为降级入口（行为不变，仅写 JSON 文件）。
         if !features::is_enabled(&self.cfg.features, features::BETA_PLAYERS) {
+            ui.label(
+                RichText::new("玩家管理（测试功能）未启用，名单管理暂留在本页；启用后请到「玩家」页签操作")
+                    .weak()
+                    .small(),
+            );
             self.ui_whitelist_blacklist(ui, idx);
         }
         ui.separator();
 
-        // 分区二：服务器设置（server.properties 核心配置）
-        ui.label(RichText::new("服务器设置").strong());
+        // 分区二：服务器属性（server.properties 核心配置）
+        ui.label(RichText::new("服务器属性").strong());
         ui.separator();
 
         // 初始化编辑缓�?
@@ -16576,11 +16745,278 @@ impl App {
             };
             ui.label(RichText::new(text).weak());
         }
+        // ---------- 自动重启 / 崩溃重启（原「自动功能」页，审计表 §3.3 起归入本页签） ----------
+        // ---------- 自动重启 ----------
+        egui::CollapsingHeader::new(RichText::new("自动重启").strong())
+            .id_salt(("auto_restart_group", idx))
+            .default_open(false)
+            .show(ui, |ui| {
+            ui.label("到点后使用 /stop 关服，进程退出后自动重新启动。手动停止/强杀会取消待执行的重启");
+            let mut ar = sc.auto_restart.clone();
+            let mut ar_changed = false;
+            if ui.checkbox(&mut ar.enabled, "启用自动重启").changed() {
+                ar_changed = true;
+            }
+            if ar.enabled {
+                ui.horizontal(|ui| {
+                    ui.label("模式:");
+                    let mode_label = if ar.mode == "daily" { "每天固定时刻" } else { "按间隔" };
+                    egui::ComboBox::from_label("")
+                        .selected_text(mode_label)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut ar.mode, "interval".to_string(), "按间隔");
+                            ui.selectable_value(&mut ar.mode, "daily".to_string(), "每天固定时刻");
+                        });
+                });
+                if ar.mode == "daily" {
+                    ui.horizontal(|ui| {
+                        ui.label("每天时刻 (HH:MM):");
+                        ui.add(TextEdit::singleline(&mut ar.daily_time).desired_width(70.0));
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label("间隔(分钟):");
+                        ui.add(egui::DragValue::new(&mut ar.interval_min).range(1..=10080));
+                    });
+                }
+                ui.horizontal(|ui| {
+                    ui.label("重启前倒计时（秒）:");
+                    ui.add(egui::DragValue::new(&mut ar.warn_secs).range(3..=300));
+                });
+                if ar != sc.auto_restart {
+                    ar_changed = true;
+                }
+            }
+            if ar_changed {
+                self.cfg.servers[idx].auto_restart = ar;
+                self.save_config();
+                self.set_toast("自动重启设置已保存".to_string());
+            }
+            let ar_cfg = &self.cfg.servers[idx].auto_restart;
+            if ar_cfg.enabled {
+                if let Some(lr) = &ar_cfg.last_restart {
+                    ui.label(format!("上次自动重启: {lr}"));
+                } else {
+                    ui.label("尚未自动重启过（下次启动服务器后开始计时）");
+                }
+                if self.auto_restart_pending.contains(&idx) {
+                    ui.label(RichText::new("⏳ 自动重启倒计时中").color(self.fg(Color32::from_rgb(255, 200, 80))));
+                } else if self.auto_restart_after_stop.contains(&idx) {
+                    ui.label(RichText::new("⏳ 正在停止，准备自动重启").color(self.fg(Color32::from_rgb(255, 200, 80))));
+                }
+            }
+            ui.separator();
+        });
+
+        // ---------- 崩溃重启 ----------
+        egui::CollapsingHeader::new(RichText::new("崩溃重启").strong())
+            .id_salt(("crash_restart_group", idx))
+            .default_open(false)
+            .show(ui, |ui| {
+            ui.label("进程异常退出（崩溃/强杀/断电，非手动停止）时自动重新拉起；熔断窗口内连续崩溃达到上限后停止");
+            // run.bat 自带的 MAX_RESTARTS 重启循环与工具自重启会**叠加**（表现为"一直重启很多次"）。
+            // 处理方式是**静默同步**：以脚本为准，进入本页（或切换服务器）时读一次脚本，
+            // 把工具的上限对齐成脚本的值，两者一致就不会双重启；只在数值确实不一致时落盘。
+            let need_probe = !matches!(self.crash_bat_probe.as_ref(), Some((d, _)) if *d == sc.dir);
+            if need_probe {
+                let probe = read_bat_max_restarts(&sc.dir);
+                if let Some((_, bat_max)) = &probe {
+                    // 控件取值范围是 1..=50（DragValue 每帧都会把越界值钳回范围），这里先钳好再写回
+                    let want = (*bat_max).clamp(1, 50);
+                    if self.cfg.servers[idx].crash_restart.max_restarts as i32 != want {
+                        self.cfg.servers[idx].crash_restart.max_restarts = want as u32;
+                        self.save_config();
+                    }
+                }
+                self.crash_bat_probe = Some((sc.dir.clone(), probe));
+            }
+            let bat_probe = self
+                .crash_bat_probe
+                .as_ref()
+                .filter(|(d, _)| *d == sc.dir)
+                .and_then(|(_, v)| v.clone());
+            // 同步之后再取控件副本，本帧的 DragValue 就显示同步后的值
+            let mut cr = self.cfg.servers[idx].crash_restart.clone();
+            let mut cr_changed = false;
+            if ui.checkbox(&mut cr.enabled, "启用崩溃自动重启").changed() {
+                cr_changed = true;
+            }
+            if cr.enabled {
+                ui.horizontal(|ui| {
+                    ui.label("窗口内最大重启次数");
+                    ui.add(egui::DragValue::new(&mut cr.max_restarts).range(1..=50));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("崩溃后等待（秒）:");
+                    ui.add(egui::DragValue::new(&mut cr.wait_secs).range(1..=300));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("熔断窗口(分钟):");
+                    ui.add(egui::DragValue::new(&mut cr.circuit_minutes).range(1..=240));
+                });
+                if cr != self.cfg.servers[idx].crash_restart {
+                    cr_changed = true;
+                }
+            }
+            if cr_changed {
+                self.cfg.servers[idx].crash_restart = cr;
+                self.save_config();
+                self.set_toast("崩溃重启设置已保存".to_string());
+            }
+            if let Some((bat, bat_max)) = bat_probe {
+                let tool_max = self.cfg.servers[idx].crash_restart.max_restarts as i32;
+                ui.horizontal_wrapped(|ui| {
+                    if tool_max == bat_max {
+                        ui.label(
+                            RichText::new(format!(
+                                "已按 {bat} 同步：窗口内最大重启次数 = {tool_max}（与脚本一致，不会双重启）"
+                            ))
+                            .weak()
+                            .small(),
+                        );
+                    } else {
+                        ui.label(
+                            RichText::new(format!(
+                                "{bat} 的 MAX_RESTARTS={bat_max}，与工具当前值 {tool_max} 不一致"
+                            ))
+                            .weak()
+                            .small(),
+                        );
+                    }
+                    if ui.small_button("从 run.bat 重新同步").clicked() {
+                        // 清掉探测结果，下一帧重新读脚本并同步
+                        self.crash_bat_probe = None;
+                        self.set_toast("已按 run.bat 重新同步重启次数".to_string());
+                    }
+                    if tool_max != bat_max
+                        && ui.small_button(format!("把 {bat} 改为 {tool_max}")).clicked()
+                    {
+                        match write_bat_max_restarts(&sc.dir, tool_max) {
+                            Ok(f) => {
+                                self.crash_bat_probe = None;
+                                self.set_toast(format!("已把 {f} 的 MAX_RESTARTS 改为 {tool_max}"));
+                            }
+                            Err(e) => self.set_toast(format!("写入失败：{e}")),
+                        }
+                    }
+                });
+            }
+            // 崩溃重启状态与倒计时：先取值再画（避免与「取消」按钮的可变借用冲突）
+            let crash_count = self.runtimes.get(idx).map(|rt| rt.crash_count).unwrap_or(0);
+            let pending_secs = self
+                .runtimes
+                .get(idx)
+                .and_then(|rt| rt.crash_restart_at)
+                .map(|at| at.saturating_duration_since(std::time::Instant::now()).as_secs());
+            if crash_count > 0 {
+                ui.label(format!(
+                    "本窗口已连续崩溃 {} 次（上限 {}），{}",
+                    crash_count,
+                    self.cfg.servers[idx].crash_restart.max_restarts,
+                    if pending_secs.is_some() {
+                        "等待自动重启中"
+                    } else {
+                        "已熔断停止自动重启"
+                    }
+                ));
+            }
+            // 待执行重启：显眼倒计时 + 「取消自动重启」按钮（倒计时数字每帧由 crash_restart_at 重算）
+            if let Some(secs) = pending_secs {
+                ui.add_space(4.0);
+                egui::Frame::none()
+                    .fill(Color32::from_rgba_unmultiplied(255, 170, 60, 24))
+                    .stroke(egui::Stroke::new(
+                        1.0_f32,
+                        Color32::from_rgba_unmultiplied(255, 170, 60, 120),
+                    ))
+                    .rounding(egui::Rounding::same(6.0))
+                    .inner_margin(egui::Margin::same(8.0))
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                RichText::new(format!("⏳ {secs} 秒后自动重启（取消）"))
+                                    .strong()
+                                    .color(self.fg(Color32::from_rgb(255, 200, 80))),
+                            );
+                            if ui
+                                .add(egui::Button::new(
+                                    RichText::new("🛑 取消自动重启").strong(),
+                                ))
+                                .on_hover_text("立即清空这次待执行的重启；服务器保持停止，可随时手动启动")
+                                .clicked()
+                            {
+                                if self.cancel_crash_restart(idx) {
+                                    let name = self
+                                        .cfg
+                                        .servers
+                                        .get(idx)
+                                        .map(|s| s.name.clone())
+                                        .unwrap_or_default();
+                                    self.set_toast(format!(
+                                        "已取消「{name}」的自动重启；服务器保持停止，可手动启动"
+                                    ));
+                                    // 另弹一条通知：标题栏的 toast 文本会被截断，这里保证取消结果明确可见
+                                    self.push_toast(
+                                        "XMST - 已取消自动重启",
+                                        &format!(
+                                            "已取消「{name}」的自动重启，服务器保持停止；需要时点「启动服务器」"
+                                        ),
+                                    );
+                                }
+                            }
+                        });
+                    });
+            }
+            ui.separator();
+        });
+
         // 末尾补一段不小于内容区内边距的留白：为什么必须保证最底部内容可达——
         // 窗口高度较低时内容区底部内边距（CONTENT_EDGE_PAD）会吃掉最后一行，
         // 滚到底也看不到 / 点不到保存按钮，所以滚动区要包住整页并留出这段空白。
         ui.add_space(CONTENT_EDGE_PAD);
             });
+    }
+
+    /// 白名单 / 封禁 / 封禁 IP 列表的内存快照（5 秒 TTL）
+    ///
+    /// 渲染路径只读内存；切换服务器（下标不同）或超过 TTL 才重新读盘 + 解析 JSON。
+    /// 增删名单后调用 `invalidate_wl_lists` 立即失效，下一次渲染重新读盘。
+    fn wl_lists(
+        &mut self,
+        idx: usize,
+    ) -> (
+        std::sync::Arc<Vec<serde_json::Value>>,
+        std::sync::Arc<Vec<serde_json::Value>>,
+        std::sync::Arc<Vec<serde_json::Value>>,
+    ) {
+        let fresh = self.wl_lists.idx == idx
+            && self
+                .wl_lists
+                .at
+                .map(|t| t.elapsed() < std::time::Duration::from_secs(5))
+                .unwrap_or(false);
+        if !fresh {
+            let dir = match self.cfg.servers.get(idx) {
+                Some(s) => s.dir.clone(),
+                None => PathBuf::new(),
+            };
+            self.wl_lists.idx = idx;
+            self.wl_lists.at = Some(std::time::Instant::now());
+            self.wl_lists.wl = std::sync::Arc::new(load_json_list(&dir.join("whitelist.json")));
+            self.wl_lists.bp =
+                std::sync::Arc::new(load_json_list(&dir.join("banned-players.json")));
+            self.wl_lists.bi = std::sync::Arc::new(load_json_list(&dir.join("banned-ips.json")));
+        }
+        (
+            std::sync::Arc::clone(&self.wl_lists.wl),
+            std::sync::Arc::clone(&self.wl_lists.bp),
+            std::sync::Arc::clone(&self.wl_lists.bi),
+        )
+    }
+
+    /// 名单变更后立即失效白名单/封禁列表快照（下一次渲染重新读盘）
+    fn invalidate_wl_lists(&mut self) {
+        self.wl_lists.at = None;
     }
 
     /// 白名单 / 黑名单管理（whitelist.json / banned-players.json / banned-ips.json）
@@ -16594,6 +17030,9 @@ impl App {
         let wl_path = dir.join("whitelist.json");
         let bp_path = dir.join("banned-players.json");
         let bi_path = dir.join("banned-ips.json");
+        // 三份列表取内存快照（5 秒 TTL）：折叠标题的数量与表格内容都只读它，
+        // 不在渲染路径里读盘（审计表 §4.4）。写入前仍重新读盘，避免用旧快照覆盖文件。
+        let (wl_list, bp_list, bi_list) = self.wl_lists(idx);
 
         ui.label(RichText::new("白名单 / 黑名单管理").size(15.0).strong());
         ui.label(
@@ -16603,7 +17042,7 @@ impl App {
         );
 
         // 白名单
-        egui::CollapsingHeader::new(format!("白名单（{}）", load_json_list(&wl_path).len()))
+        egui::CollapsingHeader::new(format!("白名单（{}）", wl_list.len()))
             .default_open(true)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -16620,7 +17059,7 @@ impl App {
                         self.add_whitelist_entry(idx, &wl_path);
                     }
                 });
-                let list = load_json_list(&wl_path);
+                let list = &wl_list;
                 if list.is_empty() {
                     ui.label(RichText::new("（暂无白名单条目）").weak());
                 } else {
@@ -16634,7 +17073,7 @@ impl App {
                             ui.label(RichText::new("添加时间").strong());
                             ui.label(RichText::new("操作").strong());
                             ui.end_row();
-                            for v in &list {
+                            for v in list.iter() {
                                 let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("?").to_string();
                                 let uuid = v.get("uuid").and_then(|x| x.as_str()).unwrap_or("").to_string();
                                 ui.label(&name);
@@ -16642,6 +17081,7 @@ impl App {
                                 ui.label("Server");
                                 ui.label("—");
                                 if ui.button("移除").clicked() {
+                                    // 写盘前重新读盘（不用快照整表覆盖，避免覆盖别处的改动）
                                     let mut nl = load_json_list(&wl_path);
                                     nl.retain(|e| {
                                         e.get("name").and_then(|x| x.as_str()) != Some(name.as_str())
@@ -16649,6 +17089,7 @@ impl App {
                                     });
                                     if save_json_list(&wl_path, &nl).is_ok() {
                                         self.set_toast(format!("已从白名单移除 {name}"));
+                                        self.invalidate_wl_lists();
                                     }
                                 }
                                 ui.end_row();
@@ -16658,7 +17099,7 @@ impl App {
             });
 
         // 封禁玩家
-        egui::CollapsingHeader::new(format!("封禁玩家（{}）", load_json_list(&bp_path).len()))
+        egui::CollapsingHeader::new(format!("封禁玩家（{}）", bp_list.len()))
             .default_open(true)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -16678,7 +17119,7 @@ impl App {
                         self.add_ban_entry(idx, &bp_path);
                     }
                 });
-                let list = load_json_list(&bp_path);
+                let list = &bp_list;
                 if list.is_empty() {
                     ui.label(RichText::new("（暂无封禁玩家）").weak());
                 } else {
@@ -16693,7 +17134,7 @@ impl App {
                             ui.label(RichText::new("理由").strong());
                             ui.label(RichText::new("操作").strong());
                             ui.end_row();
-                            for v in &list {
+                            for v in list.iter() {
                                 let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("?").to_string();
                                 let uuid = v.get("uuid").and_then(|x| x.as_str()).unwrap_or("").to_string();
                                 let source = v
@@ -16724,6 +17165,7 @@ impl App {
                                     });
                                     if save_json_list(&bp_path, &nl).is_ok() {
                                         self.set_toast(format!("已解除玩家 {name} 的封禁"));
+                                        self.invalidate_wl_lists();
                                     }
                                 }
                                 ui.end_row();
@@ -16733,7 +17175,7 @@ impl App {
             });
 
         // 封禁 IP
-        egui::CollapsingHeader::new(format!("封禁 IP（{}）", load_json_list(&bi_path).len()))
+        egui::CollapsingHeader::new(format!("封禁 IP（{}）", bi_list.len()))
             .default_open(true)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -16753,7 +17195,7 @@ impl App {
                         self.add_banip_entry(idx, &bi_path);
                     }
                 });
-                let list = load_json_list(&bi_path);
+                let list = &bi_list;
                 if list.is_empty() {
                     ui.label(RichText::new("（暂无封禁 IP）").weak());
                 } else {
@@ -16767,7 +17209,7 @@ impl App {
                             ui.label(RichText::new("理由").strong());
                             ui.label(RichText::new("操作").strong());
                             ui.end_row();
-                            for v in &list {
+                            for v in list.iter() {
                                 let ip = v.get("ip").and_then(|x| x.as_str()).unwrap_or("?").to_string();
                                 let source = v
                                     .get("source")
@@ -16793,6 +17235,7 @@ impl App {
                                     nl.retain(|e| e.get("ip").and_then(|x| x.as_str()) != Some(ip.as_str()));
                                     if save_json_list(&bi_path, &nl).is_ok() {
                                         self.set_toast(format!("已解除 IP {ip} 的封禁"));
+                                        self.invalidate_wl_lists();
                                     }
                                 }
                                 ui.end_row();
@@ -16813,6 +17256,7 @@ impl App {
         if self.players_send_cmd(idx, &format!("whitelist add {name}")) {
             self.set_toast(format!("已发送 /whitelist add {name}，等待服务端处理"));
             self.runtimes[idx].wl_add_name.clear();
+            self.invalidate_wl_lists();
             return;
         }
         let mut list = load_json_list(path);
@@ -16830,6 +17274,7 @@ impl App {
                 self.set_toast(format!("已将 {name} 加入白名单（操作人: Server）"));
                 self.runtimes[idx].wl_add_name.clear();
                 self.players_schedule_refresh(idx);
+                self.invalidate_wl_lists();
             }
             Err(e) => self.set_toast(format!("写白名单失败: {e}")),
         }
@@ -16848,6 +17293,7 @@ impl App {
             self.set_toast(format!("已发送 /ban {name}，等待服务端处理"));
             self.runtimes[idx].ban_add_name.clear();
             self.runtimes[idx].ban_add_reason.clear();
+            self.invalidate_wl_lists();
             return;
         }
         let now_ms = std::time::SystemTime::now()
@@ -16873,6 +17319,7 @@ impl App {
                 self.runtimes[idx].ban_add_name.clear();
                 self.runtimes[idx].ban_add_reason.clear();
                 self.players_schedule_refresh(idx);
+                self.invalidate_wl_lists();
             }
             Err(e) => self.set_toast(format!("写封禁列表失败: {e}")),
         }
@@ -16956,53 +17403,6 @@ impl App {
 
     /// 玩家操作双路径：服务端进程运行中优先走 stdin 命令通道（/whitelist /ban /pardon 等），
     /// 发送成功返回 true；未运行返回 false，由调用方回退写 JSON 文件。
-    /// 玩家属性（阶段C）：gamemode / OP 权限，经服务器控制台 stdin 发送命令；服务端未运行时提示不生效。
-    fn ui_players_props(&mut self, ui: &mut egui::Ui, idx: usize) {
-        ui.horizontal(|ui| {
-            ui.label("玩家名:");
-            ui.add(
-                TextEdit::singleline(&mut self.player_prop_name)
-                    .desired_width(160.0)
-                    .hint_text("如 Steve"),
-            );
-        });
-        ui.horizontal(|ui| {
-            ui.label("游戏模式:");
-            for (label, mode) in [
-                ("生存", "survival"),
-                ("创造", "creative"),
-                ("冒险", "adventure"),
-                ("旁观", "spectator"),
-            ] {
-                ui.radio_value(&mut self.player_prop_gamemode, mode.to_string(), label);
-            }
-        });
-        ui.checkbox(&mut self.player_prop_op, "设为 OP（勾选执行 op，取消执行 deop）");
-        let name = self.player_prop_name.trim().to_string();
-        let apply = ui.add_enabled(!name.is_empty(), egui::Button::new("▶ 应用属性"));
-        if apply.clicked() && !name.is_empty() {
-            let mut ok = self.players_send_cmd(idx, &format!("gamemode {} {}", self.player_prop_gamemode, name));
-            if ok {
-                let op_cmd = if self.player_prop_op { "op" } else { "deop" };
-                ok = self.players_send_cmd(idx, &format!("{} {}", op_cmd, name));
-            }
-            if ok {
-                self.set_toast(format!(
-                    "已应用属性: {name} ({}){}",
-                    self.player_prop_gamemode,
-                    if self.player_prop_op { ", OP" } else { "" }
-                ));
-            } else {
-                self.set_toast("服务器未运行或命令发送失败，属性未生效".to_string());
-            }
-        }
-        ui.label(
-            RichText::new("说明：gamemode / op 命令经服务器控制台 stdin 发送，需服务端运行中才生效")
-                .weak()
-                .small(),
-        );
-    }
-
     fn players_send_cmd(&mut self, idx: usize, cmd: &str) -> bool {
         let sent = self
             .runtimes
@@ -17100,14 +17500,13 @@ impl App {
         if self.runtimes[idx].players_snapshot.is_none() && self.runtimes[idx].players_seq == 0 {
             self.refresh_players_snapshot(idx);
         }
-        // 子页签
+        // 子页签（原「🧬 属性」禁用占位已删除，见 PlayerTab 注释）
         ui.horizontal(|ui| {
             let tabs = [
                 ("🌐 在线", PlayerTab::Online),
                 ("📜 白名单", PlayerTab::Whitelist),
                 ("🔨 封禁", PlayerTab::Banned),
                 ("⭐ OP", PlayerTab::Ops),
-                ("🧬 属性", PlayerTab::Props),
             ];
             for (label, tab) in tabs {
                 let sel = self.runtimes[idx].players_tab == tab;
@@ -17136,40 +17535,8 @@ impl App {
                     PlayerTab::Whitelist => self.ui_players_wl(ui, idx),
                     PlayerTab::Banned => self.ui_players_banned(ui, idx),
                     PlayerTab::Ops => self.ui_players_ops(ui, idx),
-                    // 玩家属性功能暂时禁用（需求）：入口保留但只显示说明，
-                    // 不再渲染任何可操作控件（原实现 ui_players_props 仍保留在代码里备用）。
-                    PlayerTab::Props => self.ui_players_props_disabled(ui, idx),
                 }
                 ui.add_space(CONTENT_EDGE_PAD);
-            });
-    }
-
-    /// 玩家属性（阶段C）——**暂时禁用**（需求）。
-    ///
-    /// 保留标签页入口与说明，但不渲染任何控件，避免误导用户以为可用。
-    /// 恢复时把下面的提示替换回原实现即可（原实现见 git 历史 / 备份分支）。
-    fn ui_players_props_disabled(&mut self, ui: &mut egui::Ui, idx: usize) {
-        let _ = idx;
-        ui.add_space(8.0);
-        egui::Frame::none()
-            .fill(self.theme_cur.widget_bg)
-            .stroke(egui::Stroke::new(1.0, self.theme_cur.stroke))
-            .rounding(6.0)
-            .inner_margin(egui::Margin::symmetric(12.0, 10.0))
-            .show(ui, |ui| {
-                ui.label(
-                    RichText::new("玩家属性功能暂时禁用")
-                        .strong()
-                        .color(self.theme_cur.text),
-                );
-                ui.label(
-                    RichText::new(
-                        "该功能通过服务器控制台下发 gamemode / op 指令，目前存在稳定性问题，已临时下线。\n\
-                         可以改用「在线玩家」页查看列表，或在「OP」页管理 OP 权限。",
-                    )
-                    .weak()
-                    .small(),
-                );
             });
     }
 
@@ -18419,20 +18786,21 @@ impl App {
         }
     }
 
+    /// 备份页：快照基础 / 触发时机 / 排除与保留 / 存储与远程 / 操作行 / 存储总览 / 备份列表。
+    ///
+    /// 由原「自动功能」页拆分而来（审计表 §3.3）：自动重启 / 崩溃重启已移到「设置」页签，
+    /// 本页签受 `BETA_BACKUP` 门控（关闭时不出现并回落到概览）。
     fn ui_backup(&mut self, ui: &mut egui::Ui, idx: usize) {
         let sc = self.cfg.servers[idx].clone();
-        // 整页滚动：自动功能选项较多，页面内容超出一屏时可滚动
+        // 整页滚动：备份选项较多，页面内容超出一屏时可滚动
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
         ui.add_space(6.0);
-        ui.label(RichText::new("自动功能").strong());
+        ui.label(RichText::new("备份").strong());
         ui.separator();
 
         if features::is_enabled(&self.cfg.features, features::BETA_BACKUP) {
-            ui.label(RichText::new("快照备份").strong());
-            ui.separator();
-    
             let mut b = sc.backup.clone();
             egui::CollapsingHeader::new(RichText::new("备份基础").strong())
                 .id_salt(("backup_basic", idx))
@@ -18556,7 +18924,7 @@ impl App {
                 if features::is_enabled(&self.cfg.features, features::BETA_REMOTE_BACKUP) {
                 ui.add_space(4.0);
                 ui.label(RichText::new("远端备份目标（可选）").strong());
-                ui.label("留空 = 仅本地备份；填本地目录 / UNC 网络共享（如 D:\\backup 或 \\\\nas\\share）自动复制，或 WebDAV URL（http(s)://...）自动上传；目前仅对旧版 zip 备份生效");
+                ui.label("留空 = 仅本地备份；填本地目录 / UNC 网络共享（如 D:\\backup 或 \\\\nas\\share）自动复制，或 WebDAV URL（http(s)://...）自动上传；自动转存目前仅对旧版 zip 备份生效，快照可用下方「☁️ 全部转存到远端」手动转存（仅支持本地目录与 UNC）");
                 ui.horizontal(|ui| {
                     ui.label("目标:");
                     ui.add(
@@ -18589,6 +18957,31 @@ impl App {
                             .color(self.fg(Color32::from_rgb(255, 160, 80))),
                     );
                 }
+                // 全部快照转存：逐份复制到上面的远端目标（单份失败不中断，明细进工具日志）。
+                // 只写远端、不删本地快照；目标为空或写成 http(s) 时由 backup::sync_all_snapshots 返回明确错误。
+                let syncall_busy = self.bg_busy.contains_key(&format!("syncall:{idx}"));
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            !syncall_busy,
+                            egui::Button::new(if syncall_busy {
+                                "☁️ 转存中…"
+                            } else {
+                                "☁️ 全部转存到远端"
+                            }),
+                        )
+                        .on_hover_text("把该服务器的全部快照按时间顺序复制到上面的远端目标；只读取远端目标，不删除本地快照")
+                        .clicked()
+                    {
+                        self.spawn_sync_all_snapshots(idx);
+                    }
+                    if syncall_busy {
+                        ui.label(
+                            RichText::new("☁️ 转存中…")
+                                .color(self.fg(Color32::from_rgb(255, 200, 80))),
+                        );
+                    }
+                });
                 }
                 ui.separator();
         
@@ -18679,229 +19072,6 @@ impl App {
         }
 
 
-        // ---------- 自动重启 ----------
-        egui::CollapsingHeader::new(RichText::new("自动重启").strong())
-            .id_salt(("auto_restart_group", idx))
-            .default_open(false)
-            .show(ui, |ui| {
-            ui.label("到点后使用 /stop 关服，进程退出后自动重新启动。手动停止/强杀会取消待执行的重启");
-            let mut ar = sc.auto_restart.clone();
-            let mut ar_changed = false;
-            if ui.checkbox(&mut ar.enabled, "启用自动重启").changed() {
-                ar_changed = true;
-            }
-            if ar.enabled {
-                ui.horizontal(|ui| {
-                    ui.label("模式:");
-                    let mode_label = if ar.mode == "daily" { "每天固定时刻" } else { "按间隔" };
-                    egui::ComboBox::from_label("")
-                        .selected_text(mode_label)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut ar.mode, "interval".to_string(), "按间隔");
-                            ui.selectable_value(&mut ar.mode, "daily".to_string(), "每天固定时刻");
-                        });
-                });
-                if ar.mode == "daily" {
-                    ui.horizontal(|ui| {
-                        ui.label("每天时刻 (HH:MM):");
-                        ui.add(TextEdit::singleline(&mut ar.daily_time).desired_width(70.0));
-                    });
-                } else {
-                    ui.horizontal(|ui| {
-                        ui.label("间隔(分钟):");
-                        ui.add(egui::DragValue::new(&mut ar.interval_min).range(1..=10080));
-                    });
-                }
-                ui.horizontal(|ui| {
-                    ui.label("重启前倒计时（秒）:");
-                    ui.add(egui::DragValue::new(&mut ar.warn_secs).range(3..=300));
-                });
-                if ar != sc.auto_restart {
-                    ar_changed = true;
-                }
-            }
-            if ar_changed {
-                self.cfg.servers[idx].auto_restart = ar;
-                self.save_config();
-                self.set_toast("自动重启设置已保存".to_string());
-            }
-            let ar_cfg = &self.cfg.servers[idx].auto_restart;
-            if ar_cfg.enabled {
-                if let Some(lr) = &ar_cfg.last_restart {
-                    ui.label(format!("上次自动重启: {lr}"));
-                } else {
-                    ui.label("尚未自动重启过（下次启动服务器后开始计时）");
-                }
-                if self.auto_restart_pending.contains(&idx) {
-                    ui.label(RichText::new("⏳ 自动重启倒计时中").color(self.fg(Color32::from_rgb(255, 200, 80))));
-                } else if self.auto_restart_after_stop.contains(&idx) {
-                    ui.label(RichText::new("⏳ 正在停止，准备自动重启").color(self.fg(Color32::from_rgb(255, 200, 80))));
-                }
-            }
-            ui.separator();
-        });
-
-        // ---------- 崩溃重启 ----------
-        egui::CollapsingHeader::new(RichText::new("崩溃重启").strong())
-            .id_salt(("crash_restart_group", idx))
-            .default_open(false)
-            .show(ui, |ui| {
-            ui.label("进程异常退出（崩溃/强杀/断电，非手动停止）时自动重新拉起；熔断窗口内连续崩溃达到上限后停止");
-            // run.bat 自带的 MAX_RESTARTS 重启循环与工具自重启会**叠加**（表现为"一直重启很多次"）。
-            // 处理方式是**静默同步**：以脚本为准，进入本页（或切换服务器）时读一次脚本，
-            // 把工具的上限对齐成脚本的值，两者一致就不会双重启；只在数值确实不一致时落盘。
-            let need_probe = !matches!(self.crash_bat_probe.as_ref(), Some((d, _)) if *d == sc.dir);
-            if need_probe {
-                let probe = read_bat_max_restarts(&sc.dir);
-                if let Some((_, bat_max)) = &probe {
-                    // 控件取值范围是 1..=50（DragValue 每帧都会把越界值钳回范围），这里先钳好再写回
-                    let want = (*bat_max).clamp(1, 50);
-                    if self.cfg.servers[idx].crash_restart.max_restarts as i32 != want {
-                        self.cfg.servers[idx].crash_restart.max_restarts = want as u32;
-                        self.save_config();
-                    }
-                }
-                self.crash_bat_probe = Some((sc.dir.clone(), probe));
-            }
-            let bat_probe = self
-                .crash_bat_probe
-                .as_ref()
-                .filter(|(d, _)| *d == sc.dir)
-                .and_then(|(_, v)| v.clone());
-            // 同步之后再取控件副本，本帧的 DragValue 就显示同步后的值
-            let mut cr = self.cfg.servers[idx].crash_restart.clone();
-            let mut cr_changed = false;
-            if ui.checkbox(&mut cr.enabled, "启用崩溃自动重启").changed() {
-                cr_changed = true;
-            }
-            if cr.enabled {
-                ui.horizontal(|ui| {
-                    ui.label("窗口内最大重启次数");
-                    ui.add(egui::DragValue::new(&mut cr.max_restarts).range(1..=50));
-                });
-                ui.horizontal(|ui| {
-                    ui.label("崩溃后等待（秒）:");
-                    ui.add(egui::DragValue::new(&mut cr.wait_secs).range(1..=300));
-                });
-                ui.horizontal(|ui| {
-                    ui.label("熔断窗口(分钟):");
-                    ui.add(egui::DragValue::new(&mut cr.circuit_minutes).range(1..=240));
-                });
-                if cr != self.cfg.servers[idx].crash_restart {
-                    cr_changed = true;
-                }
-            }
-            if cr_changed {
-                self.cfg.servers[idx].crash_restart = cr;
-                self.save_config();
-                self.set_toast("崩溃重启设置已保存".to_string());
-            }
-            if let Some((bat, bat_max)) = bat_probe {
-                let tool_max = self.cfg.servers[idx].crash_restart.max_restarts as i32;
-                ui.horizontal_wrapped(|ui| {
-                    if tool_max == bat_max {
-                        ui.label(
-                            RichText::new(format!(
-                                "已按 {bat} 同步：窗口内最大重启次数 = {tool_max}（与脚本一致，不会双重启）"
-                            ))
-                            .weak()
-                            .small(),
-                        );
-                    } else {
-                        ui.label(
-                            RichText::new(format!(
-                                "{bat} 的 MAX_RESTARTS={bat_max}，与工具当前值 {tool_max} 不一致"
-                            ))
-                            .weak()
-                            .small(),
-                        );
-                    }
-                    if ui.small_button("从 run.bat 重新同步").clicked() {
-                        // 清掉探测结果，下一帧重新读脚本并同步
-                        self.crash_bat_probe = None;
-                        self.set_toast("已按 run.bat 重新同步重启次数".to_string());
-                    }
-                    if tool_max != bat_max
-                        && ui.small_button(format!("把 {bat} 改为 {tool_max}")).clicked()
-                    {
-                        match write_bat_max_restarts(&sc.dir, tool_max) {
-                            Ok(f) => {
-                                self.crash_bat_probe = None;
-                                self.set_toast(format!("已把 {f} 的 MAX_RESTARTS 改为 {tool_max}"));
-                            }
-                            Err(e) => self.set_toast(format!("写入失败：{e}")),
-                        }
-                    }
-                });
-            }
-            // 崩溃重启状态与倒计时：先取值再画（避免与「取消」按钮的可变借用冲突）
-            let crash_count = self.runtimes.get(idx).map(|rt| rt.crash_count).unwrap_or(0);
-            let pending_secs = self
-                .runtimes
-                .get(idx)
-                .and_then(|rt| rt.crash_restart_at)
-                .map(|at| at.saturating_duration_since(std::time::Instant::now()).as_secs());
-            if crash_count > 0 {
-                ui.label(format!(
-                    "本窗口已连续崩溃 {} 次（上限 {}），{}",
-                    crash_count,
-                    self.cfg.servers[idx].crash_restart.max_restarts,
-                    if pending_secs.is_some() {
-                        "等待自动重启中"
-                    } else {
-                        "已熔断停止自动重启"
-                    }
-                ));
-            }
-            // 待执行重启：显眼倒计时 + 「取消自动重启」按钮（倒计时数字每帧由 crash_restart_at 重算）
-            if let Some(secs) = pending_secs {
-                ui.add_space(4.0);
-                egui::Frame::none()
-                    .fill(Color32::from_rgba_unmultiplied(255, 170, 60, 24))
-                    .stroke(egui::Stroke::new(
-                        1.0_f32,
-                        Color32::from_rgba_unmultiplied(255, 170, 60, 120),
-                    ))
-                    .rounding(egui::Rounding::same(6.0))
-                    .inner_margin(egui::Margin::same(8.0))
-                    .show(ui, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(
-                                RichText::new(format!("⏳ {secs} 秒后自动重启（取消）"))
-                                    .strong()
-                                    .color(self.fg(Color32::from_rgb(255, 200, 80))),
-                            );
-                            if ui
-                                .add(egui::Button::new(
-                                    RichText::new("🛑 取消自动重启").strong(),
-                                ))
-                                .on_hover_text("立即清空这次待执行的重启；服务器保持停止，可随时手动启动")
-                                .clicked()
-                            {
-                                if self.cancel_crash_restart(idx) {
-                                    let name = self
-                                        .cfg
-                                        .servers
-                                        .get(idx)
-                                        .map(|s| s.name.clone())
-                                        .unwrap_or_default();
-                                    self.set_toast(format!(
-                                        "已取消「{name}」的自动重启；服务器保持停止，可手动启动"
-                                    ));
-                                    // 另弹一条通知：标题栏的 toast 文本会被截断，这里保证取消结果明确可见
-                                    self.push_toast(
-                                        "XMST - 已取消自动重启",
-                                        &format!(
-                                            "已取消「{name}」的自动重启，服务器保持停止；需要时点「启动服务器」"
-                                        ),
-                                    );
-                                }
-                            }
-                        });
-                    });
-            }
-            ui.separator();
-        });
 
         if features::is_enabled(&self.cfg.features, features::BETA_BACKUP) {
         ui.label(RichText::new("快照 / 备份列表").strong());
@@ -20002,13 +20172,13 @@ impl App {
                             self.tunnel_diag = Some((i, diag));
                         }
                     }
-                    if ui.button("🗑 删除").on_hover_text("按住 Shift 点击可直接删除，无需确认").clicked() {
-                        if ui.input(|i| i.modifiers.shift) {
-                            self.remove_tunnel(i);
-                            self.set_toast("已删除隧道".to_string());
-                        } else {
-                            self.confirm_remove_tunnel = Some(i);
-                        }
+                    // 危险操作：删除隧道一律走二次确认（不再有 Shift 直删的绕过路径）
+                    if ui
+                        .button("🗑 删除")
+                        .on_hover_text("删除隧道（会先弹出二次确认）")
+                        .clicked()
+                    {
+                        self.confirm_remove_tunnel = Some(i);
                     }
                 });
                 if features::is_enabled(&self.cfg.features, features::BETA_TRAFFIC) {
@@ -20489,6 +20659,93 @@ impl App {
         }
         if do_delete {
             self.remove_tunnel(i);
+        }
+    }
+
+    /// 清空服务器控制台日志缓冲（ui_overview 的「清空日志」，经二次确认后调用）
+    ///
+    /// `log_tail.seek_end()` 跳过文件已有内容，避免重启后旧日志回灌。
+    fn clear_server_console(&mut self, idx: usize) {
+        if let Some(rt) = self.runtimes.get_mut(idx) {
+            rt.log_buf.clear();
+            rt.log_pending = 0;
+            if let Some(t) = &mut rt.log_tail {
+                t.seek_end();
+            }
+        }
+    }
+
+    /// 清空类操作的二次确认（服务器控制台日志 / 工具日志视图）
+    fn ui_clear_confirm(&mut self, ctx: &egui::Context) {
+        if let Some(idx) = self.confirm_clear_console {
+            let name = self
+                .cfg
+                .servers
+                .get(idx)
+                .map(|s| s.name.clone())
+                .unwrap_or_default();
+            let mut close = false;
+            let mut do_clear = false;
+            egui::Window::new("清空服务器输出日志")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(format!("确定要清空「{name}」的输出日志吗？"));
+                    ui.label(RichText::new("只清空本页显示缓冲；日志文件保留，但旧内容不会回灌到本页。").weak());
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("取消").clicked() {
+                            close = true;
+                        }
+                        if ui
+                            .button(RichText::new("确认清空").color(self.fg(Color32::from_rgb(230, 120, 120))))
+                            .clicked()
+                        {
+                            do_clear = true;
+                            close = true;
+                        }
+                    });
+                });
+            if close {
+                self.confirm_clear_console = None;
+            }
+            if do_clear {
+                self.clear_server_console(idx);
+                self.set_toast("已清空输出日志缓冲".to_string());
+            }
+        }
+        if self.confirm_clear_tool_log {
+            let mut close = false;
+            let mut do_clear = false;
+            egui::Window::new("清空日志视图")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label("确定要清空本页的日志显示吗？");
+                    ui.label(RichText::new("只清空本页内存缓冲，data\\tool.log 文件不会被删除；可用「📂 打开日志文件」查看历史。").weak());
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("取消").clicked() {
+                            close = true;
+                        }
+                        if ui
+                            .button(RichText::new("确认清空").color(self.fg(Color32::from_rgb(230, 120, 120))))
+                            .clicked()
+                        {
+                            do_clear = true;
+                            close = true;
+                        }
+                    });
+                });
+            if close {
+                self.confirm_clear_tool_log = false;
+            }
+            if do_clear {
+                toollog::clear();
+                self.set_toast("已清空本页视图（内存缓冲），日志文件未删除".to_string());
+            }
         }
     }
 
@@ -21290,9 +21547,10 @@ impl App {
                         ui.add_space(4.0);
                         ui.label(RichText::new("设置").strong());
                         ui.separator();
-                        let items: [(&str, SettingsSide, &str); 6] = [
+                        // ★ 条目数量与 `SettingsSide` 变体绑定：增删分区要同时改这里、
+                        // 下面的搜索关键字数组与 `match self.settings_side` 的分支。
+                        let items: [(&str, SettingsSide, &str); 5] = [
                             ("⚙ 通用", SettingsSide::General, "关闭行为 / 自启 / 数据 / Defender"),
-                            ("📜 日志", SettingsSide::Logs, "日志显示行数"),
                             ("🎨 界面", SettingsSide::Ui, "语言 / 动效 / 动画速度"),
                             ("☕ Java", SettingsSide::Java, "JVM 参数 / Java 列表"),
                             ("🔔 通知", SettingsSide::Notify, "右下角通知样式"),
@@ -21351,9 +21609,9 @@ impl App {
                     ui.separator();
                     let q_search = self.settings_search.trim().to_lowercase();
                     if !q_search.is_empty() {
+                        // ★ 同上：与 `SettingsSide` 变体一一对应
                         let matched: Vec<SettingsSide> = [
                             SettingsSide::General,
-                            SettingsSide::Logs,
                             SettingsSide::Ui,
                             SettingsSide::Java,
                             SettingsSide::Notify,
@@ -21365,7 +21623,6 @@ impl App {
                                 SettingsSide::General => {
                                     &["通用", "关闭行为", "托盘", "最小化", "自启", "注册表", "数据", "defender", "排除", "病毒"]
                                 }
-                                SettingsSide::Logs => &["日志", "显示行数", "自动滚动", "滚动", "行数"],
                                 SettingsSide::Ui => {
                                     &["界面", "语言", "中文", "english", "动效", "动画", "速度"]
                                 }
@@ -21380,7 +21637,7 @@ impl App {
                         .collect();
                         if matched.is_empty() {
                             ui.label(
-                                RichText::new("未找到匹配的设置项，试试「日志 / JVM / 通知 / 托盘」等关键词").weak(),
+                                RichText::new("未找到匹配的设置项，试试「JVM / 通知 / 托盘 / 主题」等关键词").weak(),
                             );
                         } else {
                             ui.horizontal(|ui| {
@@ -21388,7 +21645,6 @@ impl App {
                                 for side in &matched {
                                     let lbl = match side {
                                         SettingsSide::General => "⚙ 通用",
-                                        SettingsSide::Logs => "📜 日志",
                                         SettingsSide::Ui => "🎨 界面",
                                         SettingsSide::Java => "☕ Java",
                                         SettingsSide::Notify => "🔔 通知",
@@ -21405,6 +21661,8 @@ impl App {
                     match self.settings_side {
                         SettingsSide::General => {
                             let sections = std::mem::take(&mut self.settings_sections);
+                            // 折叠默认值规则（审计表 §4）：**常用**分组默认展开；**高级 / 实验 / 危险**
+                            // 分组默认折叠（逐个调用点判断，不做全局反转）。
                             let sections = Self::setting_section(ctx, ui, sections, "close", "关闭行为", None, true, use_anim, self.cfg.anim_speed, |ui| {
                                 ui.label("点击窗口关闭按钮（×）时的行为");
                                 let mut changed = false;
@@ -21448,7 +21706,8 @@ impl App {
                             self.settings_sections = sections;
 
                             let sections = std::mem::take(&mut self.settings_sections);
-                            let sections = Self::setting_section(ctx, ui, sections, "data", "数据与配置", None, true, use_anim, self.cfg.anim_speed, |ui| {
+                            // 高级（审计表 §4）：与导航底部「💾 保存配置」重复，默认折叠
+                            let sections = Self::setting_section(ctx, ui, sections, "data", "数据与配置", None, false, use_anim, self.cfg.anim_speed, |ui| {
                                 ui.label(format!("配置文件: {}", self.config_path.display()));
                                 ui.horizontal(|ui| {
                                     if ui.button("💾 保存全部设置").clicked() {
@@ -21460,7 +21719,8 @@ impl App {
                             self.settings_sections = sections;
 
                             let sections = std::mem::take(&mut self.settings_sections);
-                            let sections = Self::setting_section(ctx, ui, sections, "defender", "Windows Defender", None, true, use_anim, self.cfg.anim_speed, |ui| {
+                            // 危险系统级操作（审计表 §4）：默认折叠，展开后才可能点到禁用按钮
+                            let sections = Self::setting_section(ctx, ui, sections, "defender", "Windows Defender", None, false, use_anim, self.cfg.anim_speed, |ui| {
                                 ui.label(format!(
                                     "XMST 数据目录: {}（备份日志可能被 Defender 误报，可加入排除项）",
                                     self.data_dir().display()
@@ -21513,18 +21773,7 @@ impl App {
                             });
                             self.settings_sections = sections;
                         }
-                        SettingsSide::Logs => {
-                            // 日志已独立成侧栏「📜 日志」页（工具自身日志 + 相关设置），
-                            // 这里只留一个跳转入口，避免同一功能两处维护。
-                            let sections = std::mem::take(&mut self.settings_sections);
-                            let sections = Self::setting_section(ctx, ui, sections, "log", "日志", None, true, use_anim, self.cfg.anim_speed, |ui| {
-                                ui.label("日志浏览与相关设置已移至侧栏「📜 日志」页（工具自身日志，含来源/级别筛选与导出）。");
-                                if ui.button("前往「日志」页").clicked() {
-                                    self.nav = Nav::Logs;
-                                }
-                            });
-                            self.settings_sections = sections;
-                        }                        SettingsSide::Ui => {
+                        SettingsSide::Ui => {
                             let sections = std::mem::take(&mut self.settings_sections);
                             let sections = Self::setting_section(ctx, ui, sections, "ui", "界面", None, true, use_anim, self.cfg.anim_speed, |ui| {
                                 ui.label("语言:");
@@ -21551,7 +21800,8 @@ impl App {
 
                             // 翻译术语表（模组简介 / 更新日志翻译时优先采用用户译法）
                             let sections = std::mem::take(&mut self.settings_sections);
-                            let sections = Self::setting_section(ctx, ui, sections, "glossary", "翻译术语", Some("模组简介与更新日志翻译时按你的译法处理（长词优先匹配）"), true, use_anim, self.cfg.anim_speed, |ui| {
+                            // 高级（审计表 §4）：长词条列表，默认展开会把界面拉得很长
+                            let sections = Self::setting_section(ctx, ui, sections, "glossary", "翻译术语", Some("模组简介与更新日志翻译时按你的译法处理（长词优先匹配）"), false, use_anim, self.cfg.anim_speed, |ui| {
                                 // 导入 / 导出 / 搜索
                                 ui.horizontal(|ui| {
                                     if ui.button("📥 导入…").on_hover_text("从 JSON 文件导入词条（追加合并）").clicked() {
@@ -22142,7 +22392,8 @@ impl App {
             if pm.configs_dirty {
                 if let Some(pm) = self.plugins.as_mut() {
                     pm.configs_dirty = false;
-                    if let Ok(g) = pm.configs.lock() {
+                    {
+                        let g = pm.configs.lock().unwrap_or_else(|e| e.into_inner());
                         self.cfg.plugin_configs = g.clone();
                     }
                     self.save_config();
@@ -22158,7 +22409,8 @@ impl App {
                 .as_ref()
                 .map(|pm| {
                     let mut found = None;
-                    if let Ok(g) = pm.configs.lock() {
+                    {
+                        let g = pm.configs.lock().unwrap_or_else(|e| e.into_inner());
                         for inst in pm.instances.iter().filter(|i| i.enabled) {
                             let Some(m) = g.get(&inst.manifest.name) else {
                                 continue;
@@ -22195,7 +22447,7 @@ impl App {
             let alpha = self
                 .plugins
                 .as_ref()
-                .and_then(|pm| pm.configs.lock().ok())
+                .map(|pm| pm.configs.lock().unwrap_or_else(|e| e.into_inner()))
                 .and_then(|g| {
                     g.get(&pname)
                         .and_then(|m| m.get("bg_alpha"))
@@ -22468,6 +22720,45 @@ const MATERIAL_OWNER_FALLBACK: &str = "xmst-frosted-glass-demo";
         true
     }
 
+    /// 「工具」一级页壳：左侧二级导航（插件 / 日志）+ 内容区
+    ///
+    /// 只做入口位置迁移：二级页仍调用原有的 `ui_plugins` / `ui_logs_page`，
+    /// 页面本身与各自的状态、门控都不变。
+    fn ui_tools(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("tools_side")
+            .resizable(false)
+            .default_width(150.0)
+            .frame(egui::Frame::side_top_panel(&ctx.style()).fill(ctx.style().visuals.window_fill))
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("工具").strong());
+                        ui.separator();
+                        // ★ 索引与条目数量绑定：二级项的顺序即 `ToolsTab` 的展示顺序，
+                        // 增删项要同步本数组与 `XMST_OPEN_PAGE` 的页面名映射。
+                        let items: [(&str, ToolsTab, &str); 2] = [
+                            ("🧩 插件", ToolsTab::Plugins, "脚本插件（zip 热加载）"),
+                            ("📜 日志", ToolsTab::Logs, "工具自身运行日志"),
+                        ];
+                        for (label, tab, hint) in items {
+                            if ui.selectable_label(self.tools_tab == tab, label).clicked() {
+                                self.tools_tab = tab;
+                            }
+                            if self.tools_tab == tab {
+                                ui.label(RichText::new(hint).weak().small());
+                            }
+                        }
+                    });
+            });
+
+        match self.tools_tab {
+            ToolsTab::Plugins => self.ui_plugins(ctx),
+            ToolsTab::Logs => self.ui_logs_page(ctx),
+        }
+    }
+
     /// 插件管理页（BETA_PLUGINS 启用时可用）
     fn ui_plugins(&mut self, ctx: &egui::Context) {
         if self.plugins.is_none() {
@@ -22679,7 +22970,7 @@ const MATERIAL_OWNER_FALLBACK: &str = "xmst-frosted-glass-demo";
                                             let g = self
                                                 .plugins
                                                 .as_ref()
-                                                .and_then(|pm| pm.configs.lock().ok());
+                                                .map(|pm| pm.configs.lock().unwrap_or_else(|e| e.into_inner()));
                                             match g {
                                                 Some(g) => {
                                                     let m = g.get(name.as_str());
@@ -22747,7 +23038,8 @@ const MATERIAL_OWNER_FALLBACK: &str = "xmst-frosted-glass-demo";
                                             {
                                                 // 写回本插件配置（随 configs_dirty 落盘），三种模式共用该值
                                                 if let Some(pm) = self.plugins.as_mut() {
-                                                    if let Ok(mut g) = pm.configs.lock() {
+                                                    {
+                                                        let mut g = pm.configs.lock().unwrap_or_else(|e| e.into_inner());
                                                         g.entry(name.clone())
                                                             .or_default()
                                                             .insert(
@@ -22862,7 +23154,7 @@ const MATERIAL_OWNER_FALLBACK: &str = "xmst-frosted-glass-demo";
                                             let g = self
                                                 .plugins
                                                 .as_ref()
-                                                .and_then(|pm| pm.configs.lock().ok());
+                                                .map(|pm| pm.configs.lock().unwrap_or_else(|e| e.into_inner()));
                                             match g {
                                                 Some(g) => g
                                                     .get(name.as_str())
@@ -22924,7 +23216,8 @@ const MATERIAL_OWNER_FALLBACK: &str = "xmst-frosted-glass-demo";
                                         });
                                         if dirty {
                                             if let Some(pm) = self.plugins.as_mut() {
-                                                if let Ok(mut g) = pm.configs.lock() {
+                                                {
+                                                    let mut g = pm.configs.lock().unwrap_or_else(|e| e.into_inner());
                                                     let m = g.entry(name.clone()).or_default();
                                                     if let Some(k) = del_key {
                                                         m.remove(&k);
@@ -23037,7 +23330,7 @@ const MATERIAL_OWNER_FALLBACK: &str = "xmst-frosted-glass-demo";
             let stored = self
                 .plugins
                 .as_ref()
-                .and_then(|pm| pm.configs.lock().ok())
+                .map(|pm| pm.configs.lock().unwrap_or_else(|e| e.into_inner()))
                 .and_then(|g| {
                     g.get(&pname)
                         .and_then(|m| m.get("bg_alpha"))
@@ -23049,7 +23342,8 @@ const MATERIAL_OWNER_FALLBACK: &str = "xmst-frosted-glass-demo";
             // 背景效果状态写回该插件配置区（bg_style 保留键），脚本端可用 xmst_config_get 读到，
             // 下次启动也由 tick_plugins 的恢复逻辑读回
             if let Some(pm) = self.plugins.as_mut() {
-                if let Ok(mut g) = pm.configs.lock() {
+                {
+                    let mut g = pm.configs.lock().unwrap_or_else(|e| e.into_inner());
                     let m = g.entry(pname.clone()).or_default();
                     m.insert("bg_style".to_string(), bg.key().to_string());
                     // 非默认模式把实际生效的不透明度写回（含把历史 0.00 纠正为默认值），
@@ -24884,7 +25178,8 @@ impl App {
         let mut cat = self.log_src.clone();
         let mut follow = self.log_follow;
         let mut max_show = self.cfg.max_log_lines;
-        let mut do_clear_view = false;
+        // 清空视图：置位后由帧末弹二次确认（危险操作统一走确认，不在此直接清）
+        let mut ask_clear_view = false;
         let mut do_open_file = false;
         let mut copied: Option<String> = None;
         let col_info = self.theme_cur.weak;
@@ -24997,10 +25292,10 @@ impl App {
                     ui.checkbox(&mut follow, "自动跟随最新");
                     if ui
                         .button("🗑 清空视图")
-                        .on_hover_text("只清空本页的内存缓冲，不删除 data\\tool.log 文件")
+                        .on_hover_text("清空本页显示缓冲（会先弹出二次确认；不删除 data\\tool.log 文件）")
                         .clicked()
                     {
-                        do_clear_view = true;
+                        ask_clear_view = true;
                     }
                     if ui
                         .button("📂 打开日志文件")
@@ -25109,9 +25404,9 @@ impl App {
             self.cfg.max_log_lines = max_show;
             self.save_config();
         }
-        if do_clear_view {
-            toollog::clear();
-            self.set_toast("已清空本页视图（内存缓冲），日志文件未删除".to_string());
+        if ask_clear_view {
+            // 二次确认在 `ui_clear_confirm`（全局弹窗，与隧道删除等确认同一套写法）
+            self.confirm_clear_tool_log = true;
         }
         if do_open_file {
             let p = toollog::file_path();
@@ -28159,13 +28454,23 @@ fn sanitize_server_properties(text: &str) -> String {
 }
 
 /// Windows 版本描述（注册表 CurrentVersion：ProductName + DisplayVersion + Build）。
+///
+/// 缓冲契约（改动前请先读）：
+/// - 缓冲区是**函数内局部数组**（512 个 UTF-16 单元），每次调用重新分配、用完即弃，
+///   **不做跨帧/跨调用复用**（复用会让并发的两次读取互相污染）；
+/// - `RegGetValueW` 的最后一个参数是**字节数**而非字符数，因此初始化为
+///   `buf.len() * 2`，读取成功后会写回实际字节数；
+/// - 任何一项读取失败都返回空串，不 panic、不 unwrap；三项都读不到时本函数返回空串
+///   （调用方按普通字符串拼接，无需再处理 Option）。
 fn windows_version_text() -> String {
     #[cfg(windows)]
     {
         use winapi::um::winreg::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
-        fn read(key: &str, name: &str) -> Option<String> {
+        /// 单次读取注册表字符串：失败（含缓冲区不足）返回空串，绝不 panic
+        fn read(key: &str, name: &str) -> String {
             let k: Vec<u16> = key.encode_utf16().chain(std::iter::once(0)).collect();
             let n: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+            // 每次调用各自分配；`len` 为字节容量（win32 约定），返回时被写回实际字节数
             let mut buf = [0u16; 512];
             let mut len = (buf.len() * 2) as u32;
             let rc = unsafe {
@@ -28180,22 +28485,35 @@ fn windows_version_text() -> String {
                 )
             };
             if rc != 0 {
-                return None;
+                return String::new();
             }
-            let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-            Some(String::from_utf16_lossy(&buf[..end]).trim().to_string())
+            // 以第一个 NUL 结束（读不到 NUL 时按实际字节数换算，仍做边界夹取）
+            let units = (len as usize / 2).min(buf.len());
+            let end = buf[..units]
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(units);
+            String::from_utf16_lossy(&buf[..end]).trim().to_string()
         }
         let key = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
-        let product = read(key, "ProductName").unwrap_or_else(|| "Windows".to_string());
-        let disp = read(key, "DisplayVersion").or_else(|| read(key, "ReleaseId"));
+        let product = read(key, "ProductName");
+        let disp = {
+            let d = read(key, "DisplayVersion");
+            if d.is_empty() { read(key, "ReleaseId") } else { d }
+        };
         let build = read(key, "CurrentBuildNumber");
-        let mut s = product;
-        if let Some(d) = disp {
-            s.push(' ');
-            s.push_str(&d);
+        let mut s = String::new();
+        if !product.is_empty() {
+            s.push_str(&product);
         }
-        if let Some(b) = build {
-            s.push_str(&format!(" (Build {b})"));
+        if !disp.is_empty() {
+            if !s.is_empty() {
+                s.push(' ');
+            }
+            s.push_str(&disp);
+        }
+        if !build.is_empty() {
+            s.push_str(&format!(" (Build {build})"));
         }
         return s;
     }
@@ -29924,7 +30242,6 @@ mod feature_gate_selfcheck {
             features::BETA_MOD_UPDATE.to_string(),
             features::FeatureState {
                 enabled: true,
-                visible: true,
                 order: None,
             },
         );
@@ -29933,7 +30250,6 @@ mod feature_gate_selfcheck {
             features::BETA_MOD_UPDATE.to_string(),
             features::FeatureState {
                 enabled: false,
-                visible: true,
                 order: None,
             },
         );

@@ -640,7 +640,11 @@ fn translate_chunked(text: &str) -> Result<String, String> {
     let mut todo: Vec<(usize, String)> = Vec::new();
     for (i, c) in chunks.iter().enumerate() {
         let k = cache_key(c);
-        let hit = cache().lock().ok().and_then(|g| g.get(&k).cloned());
+        let hit = cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&k)
+            .cloned();
         match hit {
             Some(v) => results[i] = Some(v),
             None => todo.push((i, c.clone())),
@@ -657,7 +661,8 @@ fn translate_chunked(text: &str) -> Result<String, String> {
             handles.push(std::thread::spawn(move || {
                 let k = cache_key(&c);
                 if let Ok(r) = mymemory_one(&c) {
-                    if let Ok(mut g) = done.lock() {
+                    {
+                        let mut g = done.lock().unwrap_or_else(|e| e.into_inner());
                         g.push((i, r, k));
                     }
                 }
@@ -667,10 +672,12 @@ fn translate_chunked(text: &str) -> Result<String, String> {
             let _ = h.join();
         }
     }
-    if let Ok(g) = done.lock() {
+    {
+        let g = done.lock().unwrap_or_else(|e| e.into_inner());
         for (i, r, k) in g.iter() {
             results[*i] = Some(r.clone());
-            if let Ok(mut c) = cache().lock() {
+            {
+                let mut c = cache().lock().unwrap_or_else(|e| e.into_inner());
                 if c.len() > 800 {
                     c.clear();
                 }
@@ -727,7 +734,8 @@ fn cache_key(text: &str) -> u64 {
 pub fn translate_best(text: &str) -> Result<String, String> {
     let trimmed: String = text.chars().take(20000).collect();
     let key = cache_key(&trimmed);
-    if let Ok(g) = cache().lock() {
+    {
+        let g = cache().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(v) = g.get(&key) {
             return Ok(v.clone());
         }
@@ -760,7 +768,8 @@ pub fn translate_best(text: &str) -> Result<String, String> {
         }
     };
     if let Ok(out) = &result {
-        if let Ok(mut g) = cache().lock() {
+        {
+            let mut g = cache().lock().unwrap_or_else(|e| e.into_inner());
             if g.len() > 800 {
                 g.clear();
             }
