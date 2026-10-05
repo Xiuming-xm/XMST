@@ -6269,7 +6269,7 @@ impl App {
         for m in msgs {
             match m {
                 BgMsg::Pinned(idx, dir_name, res) => {
-                    self.bg_busy.remove(&format!("pin:{dir_name}"));
+                    self.bg_busy.remove(&format!("pin:{idx}:{dir_name}"));
                     if let Some(rt) = self.runtimes.get_mut(idx) {
                         rt.pin_busy = None;
                     }
@@ -6297,7 +6297,7 @@ impl App {
                     }
                 }
                 BgMsg::Synced(idx, dir_name, res) => {
-                    self.bg_busy.remove(&format!("sync:{dir_name}"));
+                    self.bg_busy.remove(&format!("sync:{idx}:{dir_name}"));
                     if let Some(rt) = self.runtimes.get_mut(idx) {
                         rt.sync_busy = None;
                     }
@@ -6719,14 +6719,16 @@ impl App {
 
     /// 快照锁定/解锁（后台线程：会把整份快照实化成独立副本，可能复制数 GB）。
     fn spawn_pin_snapshot(&mut self, idx: usize, snapshot_dir: PathBuf, pin: bool) {
-        let key = format!("pin:{}", snapshot_dir.display());
-        if self.bg_busy.contains_key(&key) {
-            return;
-        }
         let dir_name = snapshot_dir
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| snapshot_dir.display().to_string());
+        // ★ 占位键必须与回传时删除的键**完全一致**：这里曾用快照全路径作键、回传时用目录名删，
+        //   结果 `bg_busy` 永远留着那个键 ⇒ 同一份快照第二次点击（解锁/再次锁定）被静默吞掉。
+        let key = format!("pin:{idx}:{dir_name}");
+        if self.bg_busy.contains_key(&key) {
+            return;
+        }
         self.bg_busy.insert(key, "锁定中…".to_string());
         if let Some(rt) = self.runtimes.get_mut(idx) {
             rt.pin_busy = Some(dir_name.clone());
@@ -6768,14 +6770,15 @@ impl App {
             self.set_toast("远端目标看起来是 WebDAV 地址；快照转存目前只支持本地目录与 UNC 网络共享".to_string());
             return;
         }
-        let key = format!("sync:{}", snapshot_dir.display());
-        if self.bg_busy.contains_key(&key) {
-            return;
-        }
         let dir_name = snapshot_dir
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| snapshot_dir.display().to_string());
+        // 同 spawn_pin_snapshot：入队键与回传删除键必须一致（曾用全路径入队、用目录名删除 → 只能转存一次）
+        let key = format!("sync:{idx}:{dir_name}");
+        if self.bg_busy.contains_key(&key) {
+            return;
+        }
         self.bg_busy.insert(key, "转存中…".to_string());
         if let Some(rt) = self.runtimes.get_mut(idx) {
             rt.sync_busy = Some(dir_name.clone());
@@ -8440,7 +8443,21 @@ impl App {
             self.backup_cache = None;
             self.backup_stats_cache = None;
             std::thread::spawn(move || {
-                let r = backup::delete_backup(&dir, &path).map(|_| format!("已删除备份 {name}"));
+                let r = backup::delete_backup(&dir, &path);
+                // 手动删除此前没有任何日志，用户报"删不掉"时无从定位：成功/失败都记一条
+                match &r {
+                    Ok(_) => toollog::tool_log(
+                        toollog::ToolLevel::Info,
+                        "备份",
+                        format!("删除备份：{name}"),
+                    ),
+                    Err(e) => toollog::tool_log(
+                        toollog::ToolLevel::Warn,
+                        "备份",
+                        format!("删除备份失败：{name}（{e}）"),
+                    ),
+                }
+                let r = r.map(|_| format!("已删除备份 {name}"));
                 let _ = tx.send((idx, r));
             });
         }
@@ -12585,18 +12602,23 @@ fn reveal_in_explorer(p: &Path) {
     let _ = spawn_reveal(p);
 }
 
-/// 把路径补成绝对路径。资源管理器（explorer.exe / cmd start）拿到**相对**路径时
-/// 会按它自己的工作目录去解析，找不到就退化成打开"文档"目录 —— 这正是
-/// 「打开目录」跳到文档的成因。这里只做"当前目录 + 相对路径"拼接，不做 canonicalize：
+/// 把路径补成绝对路径，并把分隔符统一成 `\`。
+///
+/// 资源管理器（explorer.exe / cmd start）拿到**相对**路径时会按它自己的工作目录解析，
+/// 找不到就退化成打开"文档"目录；**混合分隔符**（如 `D:\a\.mcsrv_backups/snapshots\x`）
+/// 同样会被它当成解析不了的 shell 名称而退化到"文档"（实测 open_diag.log：路径 exists=true
+/// 但仍然弹文档）。这里只做"当前目录 + 相对路径"拼接与分隔符归一，不做 canonicalize：
 /// 目标可能尚不存在，且 canonicalize 会引入 `\\?\` 前缀，反而让部分 shell 交互失效。
 fn abs_path(p: &Path) -> PathBuf {
-    if p.is_absolute() {
-        return p.to_path_buf();
-    }
-    match std::env::current_dir() {
-        Ok(c) => c.join(p),
-        Err(_) => p.to_path_buf(),
-    }
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(c) => c.join(p),
+            Err(_) => p.to_path_buf(),
+        }
+    };
+    PathBuf::from(abs.to_string_lossy().replace('/', "\\"))
 }
 
 /// 目录体积（人类可读，如 "1.2 GB"）；不存在返回 "—"。
@@ -15769,13 +15791,7 @@ impl App {
                 });
         }
 
-        // ---------- 服务端性能（TPS/MSPT 占位，Spark 方案，折叠分组默认折叠） ----------
-        egui::CollapsingHeader::new(RichText::new("服务端性能（TPS / MSPT）").strong())
-            .id_salt(("console_tps_group", idx))
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.label(RichText::new("TPS / MSPT 与卡顿源分析：待接入 Spark 方案（当前版本未实现）").weak());
-            });
+        // 「服务端性能（TPS / MSPT）」占位已删除（未实现的功能不留占位；Spark 分析在「特殊功能」页）
 
         // ---------- 服务器输出日志 + 命令输入（原概览页内嵌，渲染与滚动结构未改） ----------
         ui.separator();
@@ -15833,7 +15849,7 @@ impl App {
                 let resp = ui.add(
                     TextEdit::singleline(input)
                         .id(input_id)
-                        .hint_text("输入 stop / say hello 等命令（Enter 发送，↑↓ 回看历史）")
+                        .hint_text("发送命令")
                         .desired_width(f32::INFINITY),
                 );
                 if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -19786,7 +19802,11 @@ impl App {
                     .default_open(items.len() <= 5)
                     .show(ui, |ui| {
                         for b in items {
-                            ui.horizontal(|ui| {
+                            // ★ 一行放不下：详情文本很长（时间戳 + 文件数 + 体积 + 时间），
+                            //   操作按钮跟在它后面会被挤出 1100px 内容宽度之外 —— 表现就是
+                            //   "删除/解锁点了没反应"（按钮画在可视区外，根本点不到）。
+                            //   因此拆两行：第一行可换行的信息，第二行固定为操作按钮。
+                            ui.horizontal_wrapped(|ui| {
                                 let kind_color = match b.kind {
                                     backup::BackupKind::Full => self.fg(Color32::from_rgb(80, 200, 120)),
                                     backup::BackupKind::Incremental => self.fg(Color32::from_rgb(120, 180, 255)),
@@ -19814,6 +19834,8 @@ impl App {
                                     format!("{}  ({}, {})", b.name, fmt_size(b.size), b.mtime)
                                 };
                                 ui.label(detail);
+                            });
+                            ui.horizontal(|ui| {
                                 if ui.button("回退").clicked() {
                                     restore_target = Some((b.path.clone(), b.name.clone()));
                                 }
@@ -25108,49 +25130,9 @@ impl App {
                 );
                 _inner.set_width(_w);
                 let ui = &mut _inner;
-                // 统一工具条：左侧模组社区关键字（回车或「搜索」触发），右侧主操作
-                let mut tb_q = self.dl.as_ref().map(|d| d.mod_query.clone()).unwrap_or_default();
-                let tb_busy = self
-                    .dl
-                    .as_ref()
-                    .map(|d| d.mod_search_busy)
-                    .unwrap_or(false);
-                let mut tb_go = std::cell::Cell::new(false);
-                page_toolbar(ui, "⬇️ 下载").show(
-                    |tbf| {
-                        tbf.label("🔍");
-                        let resp = tbf.add(
-                            TextEdit::singleline(&mut tb_q)
-                                .frame(false)
-                                .hint_text("搜索 Modrinth 模组 / 插件 / 数据包")
-                                .desired_width(300.0),
-                        );
-                        if resp.lost_focus() && tbf.input(|i| i.key_pressed(egui::Key::Enter)) {
-                            tb_go.set(true);
-                        }
-                        if tb_busy {
-                            tbf.spinner();
-                        }
-                    },
-                    |tba| {
-                        if tba
-                            .add_sized([84.0, ui_ctl_h()], egui::Button::new("🔍 搜索"))
-                            .on_hover_text("按关键词搜索社区项目")
-                            .clicked()
-                        {
-                            tb_go.set(true);
-                        }
-                    },
-                );
-                if let Some(d) = self.dl.as_mut() {
-                    d.mod_query = tb_q;
-                }
-                if tb_go.get() {
-                    if let Some(d) = self.dl.as_mut() {
-                        d.mod_page = 0;
-                    }
-                    self.dl_mod_search_start();
-                }
+                // 工具条只留标题：搜索框不再放在页面顶部 —— 社区列表自己的工具条里已经有一个
+                // （两个框共用 d.mod_query，看起来像"同步的两份"，用户反馈意义不明）。
+                page_toolbar(ui, "⬇️ 下载").show(|_| {}, |_| {});
                 ui.add_space(UI_SPACE_Y);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])

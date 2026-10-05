@@ -10,11 +10,16 @@ use walkdir::WalkDir;
 /// 备份目录相对服务器根目录的名称
 pub const BACKUP_DIR: &str = ".mcsrv_backups";
 /// 快照根目录：每份快照一个子目录（未变文件用硬链接指向上一份，不占新空间）
-pub const SNAPSHOTS_DIR: &str = ".mcsrv_backups/snapshots";
+///
+/// ★ 分隔符必须是**反斜杠**：以前写 `.mcsrv_backups/snapshots`，于是所有快照路径都成了
+/// `D:\...\.mcsrv_backups/snapshots\<时间戳>` 这种混合形态。文件 API 能接受，但
+/// **`explorer.exe <混合路径>` 会解析失败并退化去打开「文档」**（实测 open_diag.log：
+/// 目标路径正确、exists=true，点"打开目录"却弹文档）。全仓统一成 `\` 后该问题消失。
+pub const SNAPSHOTS_DIR: &str = ".mcsrv_backups\\snapshots";
 /// 旧版镜像目录（老配置留下的状态，仅用于清理）
-pub const SNAPSHOT_DIR: &str = ".mcsrv_backups/snapshot";
+pub const SNAPSHOT_DIR: &str = ".mcsrv_backups\\snapshot";
 /// 旧版全量基线清单（老配置留下的状态，仅用于清理）
-pub const MANIFEST_FILE: &str = ".mcsrv_backups/manifest.json";
+pub const MANIFEST_FILE: &str = ".mcsrv_backups\\manifest.json";
 /// 旧版增量 zip 内的删除清单文件名
 pub const DELTA_META: &str = ".mcsrv_delta.json";
 /// 快照格式版本
@@ -1749,5 +1754,63 @@ pub fn set_thread_low_priority() {
         use winapi::um::processthreadsapi::{GetCurrentThread, SetThreadPriority};
         use winapi::um::winbase::THREAD_PRIORITY_BELOW_NORMAL;
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL as i32);
+    }
+}
+
+#[cfg(test)]
+mod ui_flow_probe {
+    use super::*;
+
+    fn tmp_root(tag: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("xmst_probe_{tag}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// 列表给出的 path 能否被 delete_backup 接受（守卫是"父目录必须等于快照根"）
+    #[test]
+    fn delete_snapshot_from_list_path() {
+        let root = tmp_root("del");
+        let snap = root.join(SNAPSHOTS_DIR).join("20260101_000000");
+        fs::create_dir_all(snap.join("world")).unwrap();
+        write_json(&snap.join(SNAPSHOT_META), &fallback_meta(&snap)).unwrap();
+        fs::write(snap.join("world").join("level.dat"), b"x").unwrap();
+        let listed = list_backups(&root);
+        println!("SNAPSHOTS_DIR={SNAPSHOTS_DIR}");
+        for b in &listed {
+            println!("listed path={:?} is_snapshot={}", b.path, b.is_snapshot);
+        }
+        let target = listed
+            .iter()
+            .find(|b| b.name == "20260101_000000")
+            .map(|b| b.path.clone())
+            .expect("snapshot 未出现在列表里");
+        let r = delete_backup(&root, &target);
+        println!("delete(result)={r:?} exists_after={}", target.exists());
+        assert!(r.is_ok(), "删除快照失败：{r:?}");
+        assert!(!target.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 锁定 → 状态查询 → 解锁 能否闭环
+    #[test]
+    fn pin_unpin_roundtrip() {
+        let root = tmp_root("pin");
+        let snap = root.join(SNAPSHOTS_DIR).join("20260101_000002");
+        fs::create_dir_all(&snap).unwrap();
+        write_json(&snap.join(SNAPSHOT_META), &fallback_meta(&snap)).unwrap();
+        fs::write(snap.join("a.txt"), b"hello").unwrap();
+        println!("pinned_before={}", is_snapshot_pinned(&snap));
+        let pin = pin_snapshot(&snap);
+        println!("pin={pin:?} pinned_now={}", is_snapshot_pinned(&snap));
+        assert!(pin.is_ok(), "锁定失败：{pin:?}");
+        assert!(is_snapshot_pinned(&snap), "锁定后状态仍为未锁定");
+        let un = unpin_snapshot(&snap);
+        println!("unpin={un:?} pinned_now={}", is_snapshot_pinned(&snap));
+        assert!(un.is_ok(), "解锁失败：{un:?}");
+        assert!(!is_snapshot_pinned(&snap), "解锁后状态仍为锁定");
+        let _ = fs::remove_dir_all(&root);
     }
 }
