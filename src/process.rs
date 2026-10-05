@@ -14,6 +14,7 @@ use winapi::shared::ntdef::LARGE_INTEGER;
 use winapi::um::errhandlingapi::GetLastError;
 use winapi::um::handleapi::CloseHandle;
 use winapi::um::jobapi::IsProcessInJob;
+use winapi::um::wincon::GetConsoleWindow;
 use winapi::um::jobapi2::{
     AssignProcessToJobObject, CreateJobObjectW, QueryInformationJobObject, SetInformationJobObject,
 };
@@ -44,8 +45,14 @@ const STDERR_TAIL_LINES: usize = 200;
 const LAUNCH_LOG_MAX_BYTES: u64 = 1024 * 1024;
 /// 裁剪时保留的末尾行数
 const LAUNCH_LOG_KEEP_LINES: usize = 500;
-/// 单条记录里环境变量值最多截取的字符数（PATH 可能上千字符，全写进去反而看不清）
+/// 单条记录里环境变量值最多截取的字符数（PATH 可能上千字符，全写进去反而看不清）。
+/// 启动诊断里每一行子进程输出也按同一常量截断，保证记录仍然只是"一行日志"。
 const ENV_SNIPPET_CHARS: usize = 200;
+
+/// 启动诊断里每个输出通道保留的"前 N 行"（原先只留首行；启动器/加载器的报错常在第 2-5 行）
+const LAUNCH_HEAD_LINES: usize = 5;
+/// 启动诊断里 stderr 额外保留的"末 N 行"（`exit(1)` 的真实报错通常出现在最末几行）
+const LAUNCH_TAIL_LINES: usize = 10;
 
 /// 启动尝试编号：每调用一次 `LaunchCtx::new` 递增，同一次启动的所有记录共用。
 static LAUNCH_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -198,6 +205,19 @@ pub fn is_self_in_job() -> Option<bool> {
         } else {
             Some(in_job != 0)
         }
+    }
+}
+
+/// 本进程是否有控制台窗口 → 文本（`windows_subsystem = "windows"` 下应为"无"）。
+///
+/// 用途：把"子进程继承到的标准句柄来自一个没有控制台的父进程"这件事写进 launch.log ——
+/// java 在无控制台句柄下静默退出（无 stderr、无 latest.log）是已知的可疑因素之一。
+fn self_console_text() -> String {
+    let hwnd = unsafe { GetConsoleWindow() };
+    if hwnd.is_null() {
+        "是（无控制台）".to_string()
+    } else {
+        "否（有控制台）".to_string()
     }
 }
 
@@ -454,18 +474,88 @@ fn raw_exit_code(child: &Child) -> Option<u32> {
     }
 }
 
-/// 只在该槽位为空时写入（即记录首行）；纯诊断用途，失败忽略。
-fn record_first_line(slot: &Arc<Mutex<Option<String>>>, line: &str) {
+/// 输出通道的"前 N 行"槽位（`Arc<Mutex<Vec<String>>>`，最多 `LAUNCH_HEAD_LINES` 行）。
+type HeadSlot = Arc<Mutex<Vec<String>>>;
+
+/// 只在该槽位未满时写入（即记录前 `LAUNCH_HEAD_LINES` 行）；纯诊断用途，失败忽略。
+fn record_first_line(slot: &HeadSlot, line: &str) {
     let mut s = slot.lock().unwrap_or_else(|e| e.into_inner());
-    if s.is_none() {
-        *s = Some(line.to_string());
+    if s.len() < LAUNCH_HEAD_LINES {
+        s.push(line.to_string());
     }
 }
 
-/// 槽位取值（空 → `<empty>`，明确写出来而不是留空白）。
-fn first_line_text(slot: &Arc<Mutex<Option<String>>>) -> String {
+/// 首行取值（空 → `<empty>`）：保持既有"首行"语义，供只需要一行的调用点使用。
+fn first_line_text(slot: &HeadSlot) -> String {
     let s = slot.lock().unwrap_or_else(|e| e.into_inner());
-    s.clone().unwrap_or_else(|| "<empty>".to_string())
+    s.first().cloned().unwrap_or_else(|| "<empty>".to_string())
+}
+
+/// 前 N 行取值（沿用既有 ` ⏎ ` 连接风格，仍是一行记录；空 → `<empty>`）。
+/// 单行过长时按 `ENV_SNIPPET_CHARS` 截断，避免一条记录几 KB。
+fn head_text(slot: &HeadSlot) -> String {
+    let s = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if s.is_empty() {
+        return "<empty>".to_string();
+    }
+    let items: Vec<String> = s
+        .iter()
+        .map(|l| truncate_chars(l, ENV_SNIPPET_CHARS))
+        .collect();
+    items.join(" ⏎ ")
+}
+
+/// 末尾行槽位取末尾 `max` 行（不足则全取；空返回空 Vec）。
+fn tail_n_lines(slot: &Arc<Mutex<VecDeque<String>>>, max: usize) -> Vec<String> {
+    let t = slot.lock().unwrap_or_else(|e| e.into_inner());
+    let n = t.len();
+    t.iter().skip(n.saturating_sub(max)).cloned().collect()
+}
+
+/// 从子进程管道逐行读取并按 UTF-8 **宽松**解码（非法字节 → U+FFFD，绝不因此中断读取）。
+///
+/// 为什么不能用 `BufReader::lines()`：它要求整行都是合法 UTF-8；中文 Windows 上 `cmd.exe` /
+/// java 启动器的输出是 **GBK/CP936**（run.bat 按项目约定也是 GBK），于是**第二行**（含中文）
+/// 就返回 `Err`。调用方原来的 `Err(_) => break` 会因此丢掉该行、结束读取线程并关闭读端 ——
+/// 表现就是"子进程输出只剩第一行 ASCII 横幅"，本地化的 java 报错（如
+/// `错误: 找不到或无法加载主类 …`）全部被吞掉，日志栏与 `data\launch.log` 都看不到。
+/// 返回 `Ok(None)` 表示 EOF；行尾的 `\r\n` / `\n` 都已去掉。
+fn read_line_lossy<R: BufRead>(reader: &mut R, buf: &mut Vec<u8>) -> std::io::Result<Option<String>> {
+    buf.clear();
+    let n = reader.read_until(b'\n', buf)?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+    }
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    Ok(Some(String::from_utf8_lossy(buf).into_owned()))
+}
+
+/// 退出行文本。`early` 为真（子进程在前 3 秒观察窗内就已退出）时**再补一次** stderr 末
+/// `LAUNCH_TAIL_LINES` 行 —— 启动器 `exit(1)` 的真实报错通常出现在最后几行，只记首行会漏掉。
+fn exit_line_text(
+    code: Option<i32>,
+    raw: Option<u32>,
+    early: bool,
+    stderr_tail: &Arc<Mutex<VecDeque<String>>>,
+) -> String {
+    let code_text = code
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    let raw_text = raw.map(hex_code).unwrap_or_else(|| "?".to_string());
+    if !early {
+        return format!("阶段=退出 退出码={code_text} 退出码(hex)={raw_text}");
+    }
+    let tail = tail_n_lines(stderr_tail, LAUNCH_TAIL_LINES);
+    format!(
+        "阶段=退出 退出码={code_text} 退出码(hex)={raw_text} 前3秒内退出=是 stderr末{}行=\"{}\"",
+        tail.len(),
+        tail_text(&tail)
+    )
 }
 
 /// 十六进制退出码文本（`0xC0000142`）。
@@ -474,30 +564,56 @@ fn hex_code(code: u32) -> String {
 }
 
 /// 启动后跟踪线程：
-/// ① 满 3 秒时把"前 3 秒内"到达的 stdout/stderr 首行写进 launch.log（空则写 `<empty>`）；
-/// ② 之后继续轮询等待进程退出，记录退出码与十六进制值（Java 从未启动时通常是 1 或 0xC0000142）。
+/// ① 满 3 秒时把"前 3 秒内"到达的输出写进 launch.log：
+///    stdout 前 `LAUNCH_HEAD_LINES` 行 + stderr 前 `LAUNCH_HEAD_LINES` 行 + stderr 末 `LAUNCH_TAIL_LINES` 行（空则 `<empty>`）；
+/// ② 之后继续轮询等待进程退出，记录退出码与十六进制值（Java 从未启动时通常是 1 或 0xC0000142）；
+///    若子进程**在前 3 秒内就已退出**，退出行里再补一次 stderr 末 `LAUNCH_TAIL_LINES` 行。
 /// 轮询间隔 1 秒、最长跟踪 12 小时，避免线程无限长眠。
 fn spawn_launch_watcher(
     ctx: LaunchCtx,
     child: Arc<Mutex<Child>>,
-    first_out: Arc<Mutex<Option<String>>>,
-    first_err: Arc<Mutex<Option<String>>>,
+    first_out: HeadSlot,
+    first_err: HeadSlot,
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
 ) {
     const WINDOW: Duration = Duration::from_secs(3);
+    const POLL: Duration = Duration::from_millis(100);
     const MAX_TRACK: Duration = Duration::from_secs(12 * 3600);
+    /// 子进程提前退出后留给 stderr 读者线程把管道读干的时间（末尾报错要收全）
+    const EXIT_DRAIN: Duration = Duration::from_millis(400);
     thread::spawn(move || {
         let started = Instant::now();
+        // 在 3 秒观察窗内同时盯退出：进程 0.1 秒就 Halt 时，等到窗口结束再查会丢掉"提前退出"这一事实
+        let mut early_exit: Option<(Option<i32>, Option<u32>)> = None;
         while started.elapsed() < WINDOW {
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(POLL);
+            if early_exit.is_none() {
+                let mut c = child.lock().unwrap_or_else(|e| e.into_inner());
+                if let Ok(Some(st)) = c.try_wait() {
+                    early_exit = Some((st.code(), raw_exit_code(&c)));
+                }
+            }
         }
+        if early_exit.is_some() {
+            thread::sleep(EXIT_DRAIN);
+        }
+        let stderr_tail_now = tail_n_lines(&stderr_tail, LAUNCH_TAIL_LINES);
         launch_log_ctx(
             &ctx,
             &format!(
-                "阶段=前3秒输出 stdout首行=\"{}\" stderr首行=\"{}\"",
-                first_line_text(&first_out),
-                first_line_text(&first_err)
+                "阶段=前3秒输出 stdout首行=\"{}\" stderr首行=\"{}\" stderr末{}行=\"{}\" 前3秒内已退出={}",
+                head_text(&first_out),
+                head_text(&first_err),
+                stderr_tail_now.len(),
+                tail_text(&stderr_tail_now),
+                if early_exit.is_some() { "是" } else { "否" }
             ),
         );
+        // 已在窗口内退出：直接写退出行（附 stderr 末 N 行），不必再进轮询循环
+        if let Some((code, raw)) = early_exit {
+            launch_log_ctx(&ctx, &exit_line_text(code, raw, true, &stderr_tail));
+            return;
+        }
         loop {
             let exited = {
                 let mut c = child.lock().unwrap_or_else(|e| e.into_inner());
@@ -507,14 +623,7 @@ fn spawn_launch_watcher(
                 }
             };
             if let Some((code, raw)) = exited {
-                let code_text = code
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| "?".to_string());
-                let raw_text = raw.map(hex_code).unwrap_or_else(|| "?".to_string());
-                launch_log_ctx(
-                    &ctx,
-                    &format!("阶段=退出 退出码={code_text} 退出码(hex)={raw_text}"),
-                );
+                launch_log_ctx(&ctx, &exit_line_text(code, raw, false, &stderr_tail));
                 break;
             }
             if started.elapsed() > MAX_TRACK {
@@ -634,13 +743,16 @@ pub fn spawn_hidden_env_ctx(
     launch_log_ctx(
         ctx,
         &format!(
-            "阶段=spawn program={} args={} cwd={} cwd存在={} stdin={} stdout=piped stderr=piped 标志=CREATE_NO_WINDOW(0x08000000) \
+            "阶段=spawn program={} args={} cwd={} cwd存在={} stdin={} stdout=piped stderr=piped \
+             标志=CREATE_NO_WINDOW(0x08000000) std组合=stdin:{} stdout:piped stderr:piped 无控制台父进程={} \
              继承环境_TEMP={} 继承环境_TMP={} 继承环境_PATH={} 注入环境={} 本进程完整性rid={} 本进程在Job内={} 本进程cwd={}",
             cmd,
             args_text,
             cwd.display(),
             cwd.exists(),
             stdin_text,
+            stdin_text,
+            self_console_text(),
             env_snippet("TEMP"),
             env_snippet("TMP"),
             env_snippet("PATH"),
@@ -738,23 +850,25 @@ pub fn spawn_hidden_env_ctx(
         format!("{} {}", cmd, args.join(" "))
     };
 
-    // 前 3 秒内的 stdout/stderr 首行（写 launch.log 用；不改变既有日志通道行为）
-    let first_out: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let first_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // 前 3 秒内的 stdout/stderr 前 5 行（写 launch.log 用；不改变既有日志通道行为）
+    let first_out: HeadSlot = Arc::new(Mutex::new(Vec::new()));
+    let first_err: HeadSlot = Arc::new(Mutex::new(Vec::new()));
 
-    // stdout 读取线程
+    // stdout 读取线程（宽松解码：GBK 行不再中断读取，见 `read_line_lossy`）
     let tx_out = tx.clone();
     let first_out_t = first_out.clone();
     thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            match line {
-                Ok(l) => {
+        let mut reader = BufReader::new(stdout);
+        let mut buf: Vec<u8> = Vec::with_capacity(256);
+        loop {
+            match read_line_lossy(&mut reader, &mut buf) {
+                Ok(Some(l)) => {
                     record_first_line(&first_out_t, &l);
                     if tx_out.send(l).is_err() {
                         break;
                     }
                 }
+                Ok(None) => break,
                 Err(_) => break,
             }
         }
@@ -764,10 +878,11 @@ pub fn spawn_hidden_env_ctx(
     let tail_shared = stderr_tail.clone();
     let first_err_t = first_err.clone();
     thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines() {
-            match line {
-                Ok(l) => {
+        let mut reader = BufReader::new(stderr);
+        let mut buf: Vec<u8> = Vec::with_capacity(256);
+        loop {
+            match read_line_lossy(&mut reader, &mut buf) {
+                Ok(Some(l)) => {
                     record_first_line(&first_err_t, &l);
                     {
                         let mut tail = tail_shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -780,14 +895,21 @@ pub fn spawn_hidden_env_ctx(
                         break;
                     }
                 }
+                Ok(None) => break,
                 Err(_) => break,
             }
         }
     });
 
     let child_arc = Arc::new(Mutex::new(child));
-    // ---- 诊断记录（四/五）：3 秒输出首行 + 进程退出码（后台线程，best-effort） ----
-    spawn_launch_watcher(ctx.clone(), child_arc.clone(), first_out, first_err);
+    // ---- 诊断记录（四/五）：3 秒输出（前 5 行 + stderr 末 10 行）+ 进程退出码（后台线程，best-effort） ----
+    spawn_launch_watcher(
+        ctx.clone(),
+        child_arc.clone(),
+        first_out,
+        first_err,
+        stderr_tail.clone(),
+    );
 
     Ok(ManagedProcess {
         child: child_arc,
@@ -1672,7 +1794,7 @@ pub fn spawn_diagnostic_mode(
     launch_log_ctx(
         ctx,
         &format!(
-            "阶段=诊断启动 组合={} program={} args=[{}] cwd={} cwd存在={} stdin={} stdout=piped stderr=piped 标志={} Job={} \
+            "阶段=诊断启动 组合={} program={} args=[{}] cwd={} cwd存在={} stdin={} stdout=piped stderr=piped 标志={} Job={} 无控制台父进程={} \
              继承环境_TEMP={} 继承环境_TMP={} 继承环境_PATH={} 注入环境={} 本进程完整性rid={} 本进程在Job内={} 本进程Job限制={} 本进程cwd={}",
             mode.label(),
             cmd,
@@ -1682,6 +1804,7 @@ pub fn spawn_diagnostic_mode(
             if use_stdin_pipe { "piped" } else { "null" },
             if use_no_window { "CREATE_NO_WINDOW(0x08000000)" } else { "无（会短暂出现控制台窗口）" },
             if use_job { "分配" } else { "不分配" },
+            self_console_text(),
             env_snippet("TEMP"),
             env_snippet("TMP"),
             env_snippet("PATH"),
@@ -1772,9 +1895,9 @@ pub fn spawn_diagnostic_mode(
     // 而这正是要对比的差异之一，不能让诊断自己把管道提前关掉。
     let _stdin_hold = if use_stdin_pipe { child.stdin.take() } else { None };
 
-    // 采集槽位：首行 + 末尾 15 行 + "Done (" 标记（读者线程把管道读干，避免子进程写满管道阻塞）
-    let first_out: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let first_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // 采集槽位：前 5 行 + 末尾 15 行 + "Done (" 标记（读者线程把管道读干，避免子进程写满管道阻塞）
+    let first_out: HeadSlot = Arc::new(Mutex::new(Vec::new()));
+    let first_err: HeadSlot = Arc::new(Mutex::new(Vec::new()));
     let out_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
     let err_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
     let done_flag = Arc::new(AtomicBool::new(false));
@@ -1783,16 +1906,18 @@ pub fn spawn_diagnostic_mode(
         let tail = out_tail.clone();
         let done = done_flag.clone();
         thread::spawn(move || {
-            let reader = BufReader::new(out);
-            for line in reader.lines() {
-                match line {
-                    Ok(l) => {
+            let mut reader = BufReader::new(out);
+            let mut buf: Vec<u8> = Vec::with_capacity(256);
+            loop {
+                match read_line_lossy(&mut reader, &mut buf) {
+                    Ok(Some(l)) => {
                         record_first_line(&slot, &l);
                         record_tail_line(&tail, &l);
                         if l.contains("Done (") {
                             done.store(true, Ordering::Relaxed);
                         }
                     }
+                    Ok(None) => break,
                     Err(_) => break,
                 }
             }
@@ -1803,16 +1928,18 @@ pub fn spawn_diagnostic_mode(
         let tail = err_tail.clone();
         let done = done_flag.clone();
         thread::spawn(move || {
-            let reader = BufReader::new(err);
-            for line in reader.lines() {
-                match line {
-                    Ok(l) => {
+            let mut reader = BufReader::new(err);
+            let mut buf: Vec<u8> = Vec::with_capacity(256);
+            loop {
+                match read_line_lossy(&mut reader, &mut buf) {
+                    Ok(Some(l)) => {
                         record_first_line(&slot, &l);
                         record_tail_line(&tail, &l);
                         if l.contains("Done (") {
                             done.store(true, Ordering::Relaxed);
                         }
                     }
+                    Ok(None) => break,
                     Err(_) => break,
                 }
             }
