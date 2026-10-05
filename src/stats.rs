@@ -279,7 +279,9 @@ pub fn save() {
     save_locked(&g);
 }
 
-/// 读一份内存克隆（给渲染读：不读文件、不加长锁）
+/// 读一份内存克隆（给渲染读：不读文件、不加长锁）。
+/// 成就已从界面移除（挂到「设置 → 测试功能」的默认关闭项），本函数**统计保留供后续使用**。
+#[allow(dead_code)]
 pub fn snapshot() -> Stats {
     state(None)
         .lock()
@@ -354,7 +356,9 @@ fn note_day_into(d: &mut Stats, day: &str) -> bool {
     true
 }
 
-/// 成就总开关（关闭只停止记录与通知，不清空已有数据）
+/// 成就总开关（关闭只停止记录与通知，不清空已有数据）。
+/// 界面上的成就开关已移除，**统计保留供后续使用**。
+#[allow(dead_code)]
 pub fn set_enabled(v: bool) {
     let mut g = state(None).lock().unwrap_or_else(|e| e.into_inner());
     if g.data.enabled == v {

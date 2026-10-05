@@ -129,9 +129,11 @@ fn match_java_by_version(homes: &[JavaHome], mc_version: Option<&str>) -> Option
     None
 }
 
-/// 解析服务器实际使用的 Java 可执行文件路径（�?run.bat 时调用）�?
-/// 服务器指定列表项 -> 服务器自定义路径 -> run.bat 提取 -> 按版本自动匹�?-> 全局兜底 -> PATH�?
+/// 解析服务器实际使用的 Java 可执行文件路径：
+/// 服务器显式指定（列表项 / 自定义路径）→ run.bat 内的 java（校验通过）→
+/// 按 MC 版本规则匹配 → 全局列表模糊匹配 → 全局兜底 → PATH 上的 java。
 fn resolve_java_for_server(cfg: &GlobalConfig, sc: &ServerConfig) -> String {
+    // ① 服务器在「Java 设置」里显式选定的列表项 / 自定义路径（用户明确选择优先）
     if let Some(id) = sc.java_home_id.as_ref() {
         if let Some(h) = cfg.java_homes.iter().find(|h| &h.name == id) {
             if !h.path.trim().is_empty() {
@@ -144,14 +146,29 @@ fn resolve_java_for_server(cfg: &GlobalConfig, sc: &ServerConfig) -> String {
             return p.clone();
         }
     }
+    // ② run.bat 里写的 java 路径：能校验通过就用它（与脚本实际执行的一致）
     let bat = sc.dir.join("run.bat");
     if bat.exists() {
         if let Some(p) = extract_java_from_bat(&bat) {
-            if !p.trim().is_empty() {
+            if java_path_is_usable(&p) {
                 return p;
             }
         }
     }
+    // ③ 按 MC 版本规则自动匹配 Java 主版本（1.20.5–1.21.11→21 / 1.17–1.20.4→17 / ≤1.16.5→8 / 26.1+→25）
+    if let Some(maj) = java_major_for_mc(sc.mc_version.as_deref()) {
+        let want = maj.to_string();
+        if let Some(h) = cfg
+            .java_homes
+            .iter()
+            .find(|h| java_home_matches_major(h, &want))
+        {
+            if !h.path.trim().is_empty() {
+                return h.path.clone();
+            }
+        }
+    }
+    // ④ 全局 Java 列表的模糊匹配 → 全局兜底路径 → PATH 上的 java
     if let Some(p) = match_java_by_version(&cfg.java_homes, sc.mc_version.as_deref()) {
         return p;
     }
@@ -159,6 +176,305 @@ fn resolve_java_for_server(cfg: &GlobalConfig, sc: &ServerConfig) -> String {
         return cfg.java_path.clone();
     }
     "java".to_string()
+}
+
+/// 归一 `raw` 并确认它真的指向一个存在的 java.exe（不存在 / 归一不出来返回 None）。
+fn existing_java_exe(raw: &str, dir: &Path) -> Option<PathBuf> {
+    let exe = normalize_java_exe(raw, dir)?;
+    let p = PathBuf::from(exe);
+    p.is_file().then_some(p)
+}
+
+/// 本服务器实际要用的 java.exe 所在目录（启动服务器时前置进**子进程** PATH 用）：
+/// ① `resolve_java_for_server` 的结果能归一成真实存在的 java.exe → 用它的目录；
+/// ② 解析结果是裸名字（`java`，即"PATH 上的 java"）或路径不存在 → 退回 `JAVA_HOME\bin\java.exe`
+///    （run.bat 里的 `JAVA_PATH` 常写成裸名，脚本正常跑时靠的就是机器上的 java；
+///    实测工具进程继承到的 PATH 里可能没有 java，但 JAVA_HOME 有）。
+/// 两条都拿不到返回 None（调用方保持子进程 PATH 原样）。
+fn java_dir_for_child_path(
+    cfg: &GlobalConfig,
+    sc: &ServerConfig,
+    java_home: Option<&str>,
+) -> Option<PathBuf> {
+    let resolved = resolve_java_for_server(cfg, sc);
+    if let Some(exe) = existing_java_exe(&resolved, &sc.dir) {
+        return exe.parent().map(|d| d.to_path_buf());
+    }
+    let home = java_home?.trim().trim_matches('"').trim();
+    if home.is_empty() {
+        return None;
+    }
+    existing_java_exe(home, &sc.dir).and_then(|exe| exe.parent().map(|d| d.to_path_buf()))
+}
+
+/// 把 java 目录前置进**本次 spawn 的子进程** PATH（`PATH=<java 目录>;<原 PATH>`），返回注入的目录。
+///
+/// 为什么需要：`run.bat` 里的 `where %JAVA_PATH%` 只查 PATH —— 工具拉起的 cmd 里 PATH 不含 java 时
+/// 脚本会立刻 `exit /b 1`（实测 1~3 秒退出、退出码 1、logs\latest.log 无变化），而同一个 bat 在
+/// PowerShell 里能起来，差别就在 PATH。这里与 TEMP/TMP 走**同一个** `envs` 列表
+/// （`spawn_hidden_env` 既有机制）：只作用于这一个子进程，不改工具自身环境；
+/// 键名沿用父进程 PATH 的实际大小写，避免 Windows 上出现两个 PATH 项。
+fn inject_java_dir_into_child_path(
+    envs: &mut Vec<(String, String)>,
+    cfg: &GlobalConfig,
+    sc: &ServerConfig,
+    java_home: Option<&str>,
+) -> Option<String> {
+    let dir_text = java_dir_for_child_path(cfg, sc, java_home)?
+        .display()
+        .to_string();
+    if dir_text.trim().is_empty() {
+        return None;
+    }
+    let (key, old) = match std::env::vars_os()
+        .find(|(k, _)| k.to_string_lossy().eq_ignore_ascii_case("PATH"))
+    {
+        Some((k, v)) => (
+            k.to_string_lossy().to_string(),
+            v.to_string_lossy().to_string(),
+        ),
+        None => ("PATH".to_string(), String::new()),
+    };
+    let value = if old.trim().is_empty() {
+        dir_text.clone()
+    } else {
+        format!("{dir_text};{old}")
+    };
+    envs.retain(|(k, _)| !k.eq_ignore_ascii_case("PATH"));
+    envs.push((key, value));
+    Some(dir_text)
+}
+
+/// MC 版本 → 需要的 Java 主版本（用户给定规则）：
+/// 1.20.5–1.21.11 → 21；1.17–1.20.4 → 17；≤1.16.5 → 8；26.1+ → 25。
+/// 解析不出版本号时返回 None（调用方退回全局 Java 列表的模糊匹配）。
+fn java_major_for_mc(mc_version: Option<&str>) -> Option<u32> {
+    let raw = mc_version?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let mut it = raw.split('.');
+    let first = it.next()?.trim().parse::<u32>().ok()?;
+    let second = it.next().and_then(|s| s.trim().parse::<u32>().ok());
+    let third = it.next().and_then(|s| s.trim().parse::<u32>().ok());
+    if first == 1 {
+        let minor = second?;
+        let patch = third.unwrap_or(0);
+        return Some(if minor <= 16 {
+            8
+        } else if minor <= 20 && !(minor == 20 && patch >= 5) {
+            17
+        } else {
+            // 1.20.5 起（含 1.21.x）→ 21
+            21
+        });
+    }
+    // 26.1+ 这类新命名 → 25
+    if first >= 26 {
+        return Some(25);
+    }
+    None
+}
+
+/// 全局 Java 列表项是否满足某个主版本要求（`h.version` 可能是 "21" / "1.21" / "jdk-21"）。
+fn java_home_matches_major(h: &JavaHome, want: &str) -> bool {
+    let v = h.version.trim().to_lowercase();
+    if v.is_empty() {
+        return false;
+    }
+    if v == want {
+        return true;
+    }
+    if let Some(rest) = v.strip_prefix("1.") {
+        if rest.split(['.', '_', '-']).next() == Some(want) {
+            return true;
+        }
+    }
+    // "jdk-21.0.2" / "java21" 之类：按非数字分隔后逐段比对
+    v.split(|c: char| !c.is_ascii_digit())
+        .any(|seg| !seg.is_empty() && seg == want)
+}
+
+/// java 路径是否可用：绝对/相对路径要真实存在（目录或 `bin\java.exe` 都算），
+/// 裸名字（`java` / `javaw`）交给后续的版本校验。
+fn java_path_is_usable(p: &str) -> bool {
+    let t = p.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if !t.contains('\\') && !t.contains('/') {
+        return true;
+    }
+    let path = Path::new(t);
+    if path.is_file() {
+        return true;
+    }
+    // 允许写成 JDK 目录（java_home）
+    path.join("bin").join("java.exe").is_file()
+}
+
+/// 提取/选定的 Java 路径实际能跑吗：取 `java -version` 首行解析主版本。
+/// 只用于展示与自动匹配的参考，失败返回 None（不阻断启动）。
+fn java_major_of_path(java: &str) -> Option<u32> {
+    if !java_path_is_usable(java) {
+        return None;
+    }
+    let text = java_version_text(java).ok()?;
+    parse_java_major(&text)
+}
+
+/// `if "%JVM_ARGS%"=="" ...` 这类判断行不是赋值，不能当参数行改掉。
+fn is_bat_jvm_empty_check(line: &str) -> bool {
+    let t = line.trim().to_lowercase();
+    t.contains("if ") && t.contains("%jvm")
+}
+
+/// 在 run.bat 原文里定位 JVM 参数所在行（`set "JVM_ARGS=..."` / `set JAVA_OPTS=...` 等）。
+fn find_bat_jvm_args_line(text: &str) -> Option<usize> {
+    let mut found: Option<usize> = None;
+    for (i, line) in text.lines().enumerate() {
+        let lower = line.to_lowercase();
+        if is_bat_jvm_empty_check(line) {
+            continue;
+        }
+        if lower.trim_start().starts_with("set ")
+            && (lower.contains("jvm_args")
+                || lower.contains("jvmargs")
+                || lower.contains("java_opts")
+                || lower.contains("java_args"))
+        {
+            found = Some(i);
+        }
+    }
+    found
+}
+
+/// 把 run.bat 原文里 JVM 参数那一行的值换成 `jvm`（保留 `set "` / `set` 写法与行尾风格）。
+fn replace_bat_jvm_args(text: &str, jvm: &str) -> Option<String> {
+    let idx = find_bat_jvm_args_line(text)?;
+    let mut out: Vec<String> = Vec::with_capacity(text.lines().count());
+    for (i, line) in text.lines().enumerate() {
+        if i != idx {
+            out.push(line.to_string());
+            continue;
+        }
+        let eol = if line.ends_with('\r') { "\r" } else { "" };
+        let body = line.trim_end_matches(['\r', '\n']);
+        let prefix_len = match body.find('=') {
+            Some(e) => e + 1,
+            None => return None,
+        };
+        let prefix = &body[..prefix_len];
+        // 值整体带引号（`set "K=V"`）时把收尾引号补回
+        let quoted = body.trim_start().starts_with("set \"") && body.trim_end().ends_with('"');
+        let mut new_line = format!("{prefix}{jvm}");
+        if quoted {
+            new_line.push('"');
+        }
+        new_line.push_str(eol);
+        out.push(new_line);
+    }
+    let mut joined = out.join("\n");
+    if text.ends_with('\n') {
+        joined.push('\n');
+    }
+    Some(joined)
+}
+
+/// 把 `java` 覆盖写进 run.bat 的 JAVA_PATH 行（改前由 `write_text_same_encoding` 备份原文件）。
+/// 返回是否真的改写了。
+fn rewrite_run_bat_java(bat: &Path, java: &str) -> Result<bool, String> {
+    if !bat.exists() {
+        return Ok(false);
+    }
+    let (text, meta) = read_text_for_edit(bat)?;
+    let dir = bat.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    let new_java = java_path_for_run_bat(java, &dir);
+    let mut changed = false;
+    let mut out: Vec<String> = Vec::with_capacity(text.lines().count());
+    for line in text.lines() {
+        let eol = if line.ends_with('\r') { "\r" } else { "" };
+        let body = line.trim_end_matches(['\r', '\n']);
+        let lower = body.to_lowercase();
+        let is_java_line = lower.trim_start().starts_with("set ")
+            && (lower.contains("java_path") || lower.contains("java_home"))
+            && body.contains('=');
+        if !is_java_line {
+            out.push(body.to_string());
+            continue;
+        }
+        let prefix_len = match body.find('=') {
+            Some(e) => e + 1,
+            None => {
+                out.push(body.to_string());
+                continue;
+            }
+        };
+        let prefix = &body[..prefix_len];
+        let quoted = body.trim_start().starts_with("set \"") && body.trim_end().ends_with('"');
+        let mut new_line = format!("{prefix}{new_java}");
+        if quoted {
+            new_line.push('"');
+        }
+        if new_line != body {
+            changed = true;
+        }
+        new_line.push_str(eol);
+        out.push(new_line);
+    }
+    if !changed {
+        return Ok(false);
+    }
+    let mut joined = out.join("\n");
+    if text.ends_with('\n') {
+        joined.push('\n');
+    }
+    write_text_same_encoding(bat, &joined, meta.enc, meta.crlf)?;
+    Ok(true)
+}
+
+/// 把 `jvm` 同步进 run.bat 的 JVM 参数行（脚本里没有该行时返回 Ok(false)，不新建）。
+fn sync_run_bat_jvm_args(bat: &Path, jvm: &str) -> Result<bool, String> {
+    if !bat.exists() {
+        return Ok(false);
+    }
+    let (text, meta) = read_text_for_edit(bat)?;
+    let Some(new_text) = replace_bat_jvm_args(&text, jvm) else {
+        return Ok(false);
+    };
+    if new_text == text {
+        return Ok(false);
+    }
+    write_text_same_encoding(bat, &new_text, meta.enc, meta.crlf)?;
+    Ok(true)
+}
+
+/// `generate_run_bat` 后刷新编辑器缓存，避免界面里的旧内容把刚生成的脚本覆盖回去。
+fn reload_run_bat_edit(runtimes: &mut [ServerRuntime], idx: usize, path: &Path) {
+    if let Some(rt) = runtimes.get_mut(idx) {
+        if let Ok((text, meta)) = read_text_for_edit(path) {
+            rt.run_bat_edit = Some(text);
+            rt.run_bat_meta = Some(meta);
+        }
+    }
+}
+
+/// 该服务器实际生效的 JVM 参数：服务器级 → 全局默认 → 按物理内存推荐
+/// （与启动路径用的是同一条链，保证写进 run.bat 的值就是真正会用的值）。
+fn resolve_jvm_for_server(cfg: &GlobalConfig, idx: usize) -> String {
+    if let Some(v) = cfg
+        .servers
+        .get(idx)
+        .and_then(|s| s.jvm_args.clone())
+        .filter(|s| !s.trim().is_empty())
+    {
+        return v;
+    }
+    let d = cfg.default_jvm_args.trim();
+    if !d.is_empty() {
+        return d.to_string();
+    }
+    recommended_jvm_args(physical_memory_gb())
 }
 
 /// 公式化启动：扫描服务器目录，自动识别 MC 服务端核�?jar�?
@@ -635,6 +951,7 @@ fn build_run_bat(java: &str, jvm_args: &str, core_jar: &str) -> String {
         core_jar.trim()
     };
     // JAVA_PATH 写成路径时用 if exist 检查；只写 java（PATH 上的）时用 where 检查
+    // （`where` 对裸名字仍然有效，所以保留；失败时多给一句怎么改的提示）
     let java_is_path = java.contains('\\') || java.contains('/') || java.contains(':');
     let mut s = String::new();
     s.push_str("@echo off\n");
@@ -667,6 +984,10 @@ fn build_run_bat(java: &str, jvm_args: &str, core_jar: &str) -> String {
         s.push_str("if errorlevel 1 (\n");
     }
     s.push_str("    echo [错误] 找不到 Java: %JAVA_PATH%\n");
+    if !java_is_path {
+        // 括号块里的 echo 不能出现半角括号（cmd 会当成块结束），所以这里只用全角括号
+        s.push_str("    echo [提示] 若 JAVA_PATH 是裸名 java，请确保它在 PATH 中；或在 XMST 的启动脚本 / Java 设置里指定 java.exe 的完整路径\n");
+    }
     s.push_str("    exit /b 1\n");
     s.push_str(")\n");
     s.push_str("rem 检查服务端核心\n");
@@ -706,6 +1027,28 @@ fn build_run_bat(java: &str, jvm_args: &str, core_jar: &str) -> String {
     s
 }
 
+/// 是否是"裸名字"（`java` / `javaw`，只能靠 PATH 解析），而不是带目录/盘符的路径。
+fn is_bare_java_name(v: &str) -> bool {
+    let t = v.trim();
+    !t.is_empty() && !t.contains('\\') && !t.contains('/') && !t.contains(':')
+}
+
+/// 在本进程 PATH 上找 java.exe（找不到返回 None）。
+/// 只用于「生成 run.bat 时优先写完整路径」：能写路径就不写裸名 java。
+fn java_exe_on_path() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for seg in std::env::split_paths(&path) {
+        if seg.as_os_str().is_empty() {
+            continue;
+        }
+        let cand = seg.join("java.exe");
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
 /// 生成/覆盖服务器目录下的 run.bat（GBK + CRLF、无 BOM）。
 /// 覆盖前由 write_text_same_encoding 把原文件备份成 run.bat.bak_<时间戳>。
 /// 必须按 GBK(CP_ACP) 写：cmd 按 ANSI 代码页解析 .bat，UTF-8 会让中文乱码、脚本解析失败。
@@ -715,8 +1058,15 @@ fn generate_run_bat(
     jvm_args: &str,
     core_jar: &str,
 ) -> Result<PathBuf, String> {
-    // JAVA_PATH 用实际解析出的 java：能落到服务器目录里就写成 .\Java21\bin\java.exe 这种相对写法
-    let java = java_path_for_run_bat(java, dir);
+    // JAVA_PATH 用实际解析出的 java：能落到服务器目录里就写成 .\Java21\bin\java.exe 这种相对写法。
+    // 解析不出真实文件、只剩裸名 java 时，先在**本进程 PATH** 上找一次 java.exe ——
+    // 生成出来的脚本优先写完整路径，脚本里的 Java 检查（if exist）才不会因为 PATH 差异扑空。
+    let mut java = java_path_for_run_bat(java, dir);
+    if is_bare_java_name(&java) {
+        if let Some(p) = java_exe_on_path() {
+            java = p.display().to_string();
+        }
+    }
     let content = build_run_bat(&java, jvm_args, core_jar);
     std::fs::create_dir_all(dir).map_err(|e| format!("创建服务器目录失败: {e}"))?;
     let path = dir.join("run.bat");
@@ -1756,6 +2106,9 @@ struct ServerRuntime {
     jvm_args_edit: Option<String>,
     /// user_jvm_args.txt 原编码与换行风格
     jvm_args_meta: Option<TextMeta>,
+    /// 最近一次**已同步进 run.bat** 的 JVM 参数（空串 = 还没同步过）。
+    /// 用于避免每帧写盘，只在值确实变化时改 run.bat。
+    jvm_synced: String,
     // server.properties 编辑状�? (键值对缓存, 高级文本缓冲, 是否高级模式)
     server_props_map: Option<std::collections::BTreeMap<String, String>>,
     server_props_text: Option<String>,
@@ -2031,6 +2384,7 @@ impl Default for ServerRuntime {
             run_bat_meta: None,
             jvm_args_edit: None,
             jvm_args_meta: None,
+            jvm_synced: String::new(),
             server_props_map: None,
             server_props_text: None,
             server_props_meta: None,
@@ -2472,8 +2826,6 @@ struct App {
     servers_collapsed: bool,
     /// 服务器列表侧栏折叠动画进度 (0=折叠, 1=展开)
     servers_anim: f32,
-    /// 仪表盘成就卡片：「查看全部」是否展开（展开后列出含未解锁的全部成就）
-    ach_show_all: bool,
     /// 服务器页签滑块动画进�?(0..3)
     tab_anim: f32,
     /// 备份到期扫描节流（后台轻量）
@@ -2521,6 +2873,8 @@ struct App {
     base_ppp: f32,
     /// 设置页字号滑杆的待应用值：拖动不生效，点「应用」才写入 cfg
     pending_font_scale: f32,
+    /// 设置页「UI」组的待应用参数（圆角 / 间距 / 高度 / 字号），点「应用」才整体生效
+    pending_ui: Option<UiTokens>,
     /// 窗口区域圆角缓存 (r_px, win_w, win_h)：仅在值变化时重设 SetWindowRgn
     last_win_rgn: (i32, i32, i32),
     /// 最近一次 theme::apply 返回的窗口圆角半径（点）：apply_bg 在应用 DWM accent 后
@@ -3429,6 +3783,7 @@ impl App {
             bg_edit_open: false,
             base_ppp,
             pending_font_scale: initial_font_scale,
+            pending_ui: None,
             last_win_rgn: (0, 0, 0),
             win_r_points: 0.0,
             backdrop: backdrop::BackdropCapture::default(),
@@ -3519,7 +3874,6 @@ impl App {
             nav_anim: 0.0,
             servers_collapsed: false,
             servers_anim: 1.0,
-            ach_show_all: false,
             tab_anim: 0.0,
             last_backup_check: std::time::Instant::now(),
             mem_risk_active: false,
@@ -3852,7 +4206,7 @@ impl App {
         {
             self.selected_server = Some(pos);
             self.save_config();
-            self.set_toast("该目录已在列表中，已为你选中".to_string());
+            self.set_toast("该目录已在列表中".to_string());
             return;
         }
         let name = dir
@@ -4259,7 +4613,7 @@ impl App {
     fn launch_spec(
         &mut self,
         idx: usize,
-        spec: LaunchSpec,
+        mut spec: LaunchSpec,
         watch: Option<FallbackWatch>,
         fallback: bool,
     ) {
@@ -4275,6 +4629,19 @@ impl App {
         let Some(sc) = self.cfg.servers.get(idx).cloned() else {
             return;
         };
+        // ★ PATH 修复（只走「启动服务器」这条路径，诊断/打开目录等其它子进程不受影响）：
+        // run.bat 里的 `where %JAVA_PATH%` 与直连 java 都只看**子进程** PATH，而工具进程自己
+        // 继承到的 PATH 可能不含 java（实录：java 在 E:\Games\Minecraft\Library\JDK\OpenJDK21\bin，
+        // 工具继承的 PATH 里没有它）→ bat 会在 1~3 秒内 exit /b 1，日志显示"CreateProcess 成功但
+        // 退出码=1、logs\latest.log 无变化"。这里把解析出的 java.exe 所在目录前置进本次子进程的
+        // PATH（与 TEMP/TMP 同一个 envs 列表，仅这一个子进程生效，不改工具自身环境）；
+        // 解析不到真实 java.exe 时保持原样。
+        let path_prefix = inject_java_dir_into_child_path(
+            &mut spec.envs,
+            &self.cfg,
+            &sc,
+            std::env::var("JAVA_HOME").ok().as_deref(),
+        );
         let dir = spec.dir.clone();
         let priv_tmp = spec.priv_tmp.clone();
         let tmp_warn = spec.tmp_warn.clone();
@@ -4305,10 +4672,13 @@ impl App {
         process::launch_log_ctx(
             &ctx,
             &format!(
-                "阶段=准备 分支={} 是否回退启动={} 注入环境={} 私有TEMP={} 私有TEMP探测={} 私有TEMP警告={}",
+                "阶段=准备 分支={} 是否回退启动={} 注入环境={} 注入PATH前缀={} 私有TEMP={} 私有TEMP探测={} 私有TEMP警告={}",
                 spec.kind,
                 fallback,
                 process::env_pairs_text(&spec.envs),
+                path_prefix
+                    .as_deref()
+                    .unwrap_or("（无：未解析到真实 java.exe，子进程 PATH 保持原样）"),
                 priv_tmp
                     .as_ref()
                     .map(|p| p.display().to_string())
@@ -10882,33 +11252,25 @@ impl App {
         }
     }
 
-    /// 成就事件入口：累加一次 → 判定新解锁 → 右下角工具内通知 + 工具日志（类别「成就」）。
+    /// 统计事件入口：累加一次（内部统计保留，供后续使用）。
+    /// 成就开关默认关闭（设置 → 测试功能），关闭时不做任何判定；**不做任何界面展示**。
     /// **只在事件真的成功时调用一次**，不得放进每帧渲染路径；启动成功同时记一次"今天有服务器在线"。
-    /// 之所以只弹工具内通知（不用 `notify`）：一次启动可能同时解开多项，系统级气泡会连着弹一串。
     fn stats_event(&mut self, kind: stats::StatKind, n: u64) {
+        if !features::is_enabled(&self.cfg.features, features::BETA_ACHIEVEMENTS) {
+            return;
+        }
         stats::bump(kind, n);
         if kind == stats::StatKind::Launches {
             stats::note_online_today();
         }
-        self.stats_announce(stats::evaluate());
     }
 
-    /// 服务器数量峰值入统计（新增服务器 / 建服完成时调用），并立即判定/通知新解锁
+    /// 服务器数量峰值入统计（新增服务器 / 建服完成时调用）
     fn stats_event_server_count(&mut self) {
-        stats::note_server_count(self.cfg.servers.len() as u64);
-        self.stats_announce(stats::evaluate());
-    }
-
-    /// 把本次新解锁的成就告诉用户：右下角通知 + 工具日志（类别「成就」）
-    fn stats_announce(&mut self, newly: Vec<stats::Achievement>) {
-        for a in newly {
-            self.push_toast("🏆 成就解锁", &format!("{}（{}）", a.name, a.desc));
-            toollog::tool_log(
-                toollog::ToolLevel::Info,
-                "成就",
-                format!("成就解锁：{}（{}）", a.name, a.desc),
-            );
+        if !features::is_enabled(&self.cfg.features, features::BETA_ACHIEVEMENTS) {
+            return;
         }
+        stats::note_server_count(self.cfg.servers.len() as u64);
     }
 
     /// 本次运行时长入统计：取走起点（每次运行只算一次），无运行记录时什么也不做。
@@ -11153,6 +11515,8 @@ $timer.Start(); \
         let text_w = (card_w - frame_pad - TOAST_BAR_W - TOAST_BAR_GAP).max(40.0);
         let gap = 8.0_f32;
         let anim = if self.cfg.ui_animations { 0.25_f32 } else { 0.001_f32 }; // 进出动画时长（秒）；关闭动效时近似瞬时
+        // 进出各自占 anim，滑出要在停留结束后走完，所以总时长 = 停留 + 2×动画
+        let hold = hold + anim;
         let total = hold + 2.0 * anim;
         // 逐条计算位置与透明度，渲染后移除过期项
         // (id, 标题, 正文, 取消按钮目标服务器, 倒计时秒数, 位置, 透明度, 实测卡片高度, 打开目录按钮目标, 查看启动日志目标)
@@ -11202,7 +11566,7 @@ $timer.Start(); \
                 // 待执行重启：通知要一直等用户处理，倒计时期间保持完全不透明（不能淡成透明只剩可点区域）
                 1.0
             } else if el > hold + anim {
-                (total - el) / anim
+                ((total - el) / anim).clamp(0.0, 1.0)
             } else {
                 1.0
             };
@@ -11219,22 +11583,21 @@ $timer.Start(); \
                 // 屏幕高度实在放不下：本条本帧不画也不丢，等上面的通知消失后自然出现
                 continue;
             }
-            let x = match style.as_str() {
-                "fade" => screen.right() - margin - card_w,
-                _ => {
-                    // slide：从右侧滑入 / 滑出（待执行重启期间保持停在原位）
-                    let k = if el < anim {
-                        el / anim
-                    } else if pending {
-                        1.0
-                    } else if el > hold + anim {
-                        (total - el) / anim
-                    } else {
-                        1.0
-                    };
-                    screen.right() - k * (card_w + margin)
-                }
+            // 统一进出动画：右侧滑入 → 停留 → 右侧滑出。
+            // k = 卡片在「屏幕内」的程度（0=完全在屏幕外，1=停在最终位置）。
+            // 为了让滑出能走完，下面把它并入停留时间（total），而不是在动画中途被移除。
+            let k = if el < anim {
+                el / anim
+            } else if pending {
+                1.0
+            } else if el > hold + anim {
+                ((total - el) / anim).clamp(0.0, 1.0)
+            } else {
+                1.0
             };
+            // 旧配置里的 "fade" 也统一成右侧滑入/滑出（不再有淡入淡出这一档）
+            let x = screen.right() - k * (card_w + margin);
+            let _ = style.as_str();
             render.push((
                 t.id,
                 t.title.clone(),
@@ -14092,7 +14455,7 @@ impl eframe::App for App {
         // 折叠/展开宽度做**动画插值**（此前是硬跳变，反馈"没有平滑效果"）。
         let target_w = if self.nav_collapsed { 56.0 } else { 170.0 };
         if self.cfg.ui_animations {
-            let sp = (0.25 * self.cfg.anim_speed.clamp(0.1, 2.0)).clamp(0.06, 0.6);
+            let sp = (0.25 * self.cfg.anim_speed.clamp(0.1, 20.0)).clamp(0.06, 0.6);
             self.nav_w_anim += (target_w - self.nav_w_anim) * sp;
             if (self.nav_w_anim - target_w).abs() < 0.4 {
                 self.nav_w_anim = target_w;
@@ -14333,7 +14696,7 @@ impl eframe::App for App {
                             scope
                         };
                         self.spawn_restore(idx, path, folders);
-                        self.set_toast("回退已开始（后台执行：关服 → 生成恢复前快照 → 恢复）".to_string());
+                        self.set_toast("回退已开始".to_string());
                     }
                 }
                 ConfirmAction::None => {}
@@ -14761,7 +15124,9 @@ fn advanced_fold(
         });
 }
 
-/// 仪表盘成就网格单元：图标 + 名称 + 进度条；未解锁灰显，hover 显示条件与当前进度。
+/// 成就网格单元：图标 + 名称 + 进度条；未解锁灰显，hover 显示条件与当前进度。
+/// 成就已从界面移除（不再有渲染入口），此处**保留供后续使用**。
+#[allow(dead_code)]
 fn ach_cell(ui: &mut egui::Ui, a: &stats::Achievement) {
     let hover = format!("{}\n进度：{} / {}", a.desc, a.cur, a.target);
     let (icon, txt) = if a.unlocked {
@@ -14806,6 +15171,45 @@ fn push_play_secs_evt(out: &mut Vec<(stats::StatKind, u64)>, rt: &mut ServerRunt
     }
 }
 
+/// 动画速度预设（1..6）：**预设 1 = 原来的默认值 2.0**，往上加更快档。
+/// 数值越大展开/折叠越快。
+const ANIM_SPEED_PRESET: [f32; 6] = [2.0, 2.4, 3.0, 3.8, 4.8, 6.0];
+
+/// 动画速度 → 滑块位置（1..=6，非线性：位置均分，速度按预设递增）
+fn anim_speed_to_preset_pos(speed: f32) -> f32 {
+let s = speed.clamp(ANIM_SPEED_PRESET[0], ANIM_SPEED_PRESET[5]);
+// 逐段线性插值到预设序号
+for i in 0..ANIM_SPEED_PRESET.len() - 1 {
+    let (a, b) = (ANIM_SPEED_PRESET[i], ANIM_SPEED_PRESET[i + 1]);
+    if s <= b {
+        let k = if (b - a).abs() < f32::EPSILON { 0.0 } else { (s - a) / (b - a) };
+        return (i as f32 + 1.0) + k;
+    }
+}
+ANIM_SPEED_PRESET.len() as f32
+}
+
+/// 滑块位置（1..=6）→ 动画速度
+fn anim_speed_from_preset_pos(pos: f32) -> f32 {
+let p = pos.clamp(1.0, ANIM_SPEED_PRESET.len() as f32);
+let i = (p.floor() as usize).saturating_sub(1).min(ANIM_SPEED_PRESET.len() - 2);
+let k = p - (i as f32 + 1.0);
+let (a, b) = (ANIM_SPEED_PRESET[i], ANIM_SPEED_PRESET[i + 1]);
+(a + (b - a) * k).clamp(0.1, 20.0)
+}
+
+/// 「UI」组待应用的界面参数（拖动只更新预览，点「应用」才写回配置）
+#[derive(Clone, Copy)]
+struct UiTokens {
+round_corners: bool,
+window_round_corners: bool,
+corner_scale: f32,
+window_corner_scale: f32,
+item_spacing: f32,
+ctl_h: f32,
+font_scale: f32,
+}
+
 impl App {
     fn ui_dashboard(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
@@ -14844,7 +15248,7 @@ impl App {
                 |ui| {
                     if ui
                         .add_sized([84.0, ui_ctl_h()], egui::Button::new("🔄 刷新"))
-                        .on_hover_text("立即重绘并重新采样运行状态")
+                        .on_hover_text("立即重绘并重新采样")
                         .clicked()
                     {
                         self.set_toast("已刷新运行状态".to_string());
@@ -14947,118 +15351,14 @@ impl App {
                     });
             }
             ui.add_space(10.0);
-            self.ui_achievements_card(ui);
         });
     }
 
     /// 仪表盘公告位（占位）：接入方式待定 —— 优先读本地公告文件 `data\announcement.md`，
     /// 联网拉取尚未决定（见 `docs\UI-审计表.md` §7.2 第 18 条 / §8.3）。
     /// **拍板前不写任何联网代码**；无公告时整块不显示（不占位、不留空白标题）。
+    /// 成就卡片整块已从仪表盘移除（成就系统挂到「设置 → 测试功能」的默认关闭项，界面不再展示成就）。
     fn announcement_area(&mut self, _ui: &mut egui::Ui) {}
-
-    /// 仪表盘「成就」卡片：标题 + 已解锁 X / Y + 网格（每行 3 个）+「查看全部」折叠 + 总开关。
-    /// 只读 `stats::snapshot()` 的内存克隆，不读文件；进度由事件累加时写入。
-    fn ui_achievements_card(&mut self, ui: &mut egui::Ui) {
-        let snap = stats::snapshot();
-        let list = stats::all();
-        let unlocked_n = list.iter().filter(|a| a.unlocked).count();
-        let total = list.len();
-        let mut want_enabled: Option<bool> = None;
-        egui::Frame::none()
-            .fill(Color32::from_rgba_unmultiplied(255, 190, 90, 14))
-            .stroke(egui::Stroke::new(
-                1.0,
-                Color32::from_rgba_unmultiplied(255, 190, 90, 60),
-            ))
-            .inner_margin(egui::Margin::same(10.0))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("🏆 成就").strong());
-                    ui.label(
-                        RichText::new(format!("已解锁 {unlocked_n} / {total}"))
-                            .weak()
-                            .small(),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let mut on = snap.enabled;
-                        if ui
-                            .checkbox(&mut on, "启用成就统计")
-                            .on_hover_text("关闭后不再累计与通知；已有数据保留")
-                            .changed()
-                        {
-                            want_enabled = Some(on);
-                        }
-                    });
-                });
-                ui.separator();
-                if !snap.enabled {
-                    ui.label(
-                        RichText::new("成就统计已关闭：不再记录进度，也不弹解锁通知（已有数据保留）")
-                            .weak()
-                            .small(),
-                    );
-                    return;
-                }
-                let today = Local::now().format("%Y-%m-%d").to_string();
-                let cur_streak = stats::current_streak(&snap.online_days, &today);
-                let mut show_all = self.ach_show_all;
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(format!(
-                            "在线天数：{} 天（当前连续 {cur_streak} 天）",
-                            snap.online_days.len()
-                        ))
-                        .weak()
-                        .small(),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .selectable_label(show_all, if show_all { "收起" } else { "查看全部" })
-                            .clicked()
-                        {
-                            show_all = !show_all;
-                        }
-                    });
-                });
-                self.ach_show_all = show_all;
-                // 网格：每行 3 个；「查看全部」关闭时只显示已解锁 + 进度最高的几个未解锁项
-                let shown: Vec<&stats::Achievement> = if show_all {
-                    list.iter().collect()
-                } else {
-                    let mut v: Vec<&stats::Achievement> =
-                        list.iter().filter(|a| a.unlocked).collect();
-                    let mut rest: Vec<&stats::Achievement> =
-                        list.iter().filter(|a| !a.unlocked).collect();
-                    rest.sort_by(|a, b| {
-                        b.progress
-                            .partial_cmp(&a.progress)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                    v.extend(rest.into_iter().take(6));
-                    v
-                };
-                ui.add_space(4.0);
-                egui::Grid::new("dash_achievements")
-                    .num_columns(3)
-                    .spacing([10.0, 8.0])
-                    .show(ui, |ui| {
-                        for (i, a) in shown.iter().enumerate() {
-                            ach_cell(ui, a);
-                            if i % 3 == 2 {
-                                ui.end_row();
-                            }
-                        }
-                    });
-            });
-        if let Some(v) = want_enabled {
-            stats::set_enabled(v);
-            self.set_toast(if v {
-                "已启用成就统计".to_string()
-            } else {
-                "已关闭成就统计（已有数据保留）".to_string()
-            });
-        }
-    }
 
     fn ui_servers(&mut self, ctx: &egui::Context) {
         // 侧栏折叠动画：0=折叠(仅图标)，1=展开
@@ -15131,7 +15431,7 @@ impl App {
                                 let star = if sc.favorited { "★" } else { "☆" };
                                 if ui
                                     .add(egui::Button::new(star).frame(false).small())
-                                    .on_hover_text("收藏 / 取消收藏（收藏的服务器置顶）")
+                                    .on_hover_text("收藏 / 取消收藏")
                                     .clicked()
                                 {
                                     toggle_fav = Some(i);
@@ -15405,7 +15705,7 @@ impl App {
             |tba| {
                 if tba
                     .add_sized([84.0, ui_ctl_h()], egui::Button::new("💾 保存"))
-                    .on_hover_text("立即把当前配置写入磁盘（平时自动保存）")
+                    .on_hover_text("立即把当前配置写入磁盘")
                     .clicked()
                 {
                     tb_save = true;
@@ -15632,11 +15932,243 @@ impl App {
         if name.is_empty() { None } else { Some(name) }
     }
 
+    /// 把当前生效的 JVM 参数同步进 run.bat 的 JVM 参数行（改前按既有规则备份原文件）。
+    /// 只在值确实变化时写盘；脚本里没有该行时不动它（手写脚本不硬改）。
+    fn sync_jvm_to_run_bat(&mut self, idx: usize, jvm: &str, dir: &Path, run_bat: &Path) {
+        if !run_bat.exists() {
+            return;
+        }
+        if self.runtimes[idx].jvm_synced == jvm {
+            return;
+        }
+        match sync_run_bat_jvm_args(run_bat, jvm) {
+            Ok(true) => {
+                reload_run_bat_edit(&mut self.runtimes, idx, run_bat);
+                self.runtimes[idx].jvm_synced = jvm.to_string();
+                self.set_toast("已同步 JVM 参数到 run.bat".to_string());
+            }
+            Ok(false) => {
+                // 脚本里没有 JVM 参数行：只在真正写过配置时提示一次，不反复打扰
+                self.runtimes[idx].jvm_synced = jvm.to_string();
+                let _ = dir;
+            }
+            Err(e) => self.set_toast(format!("同步 run.bat 失败：{e}")),
+        }
+    }
+
+    /// 控制台顶部的启动 / 停止操作行（含状态摘要与外部实例操作）。
+    /// 逻辑与原概览页的操作行一致，只是位置移到了控制台最上方。
+    fn ui_console_ops(&mut self, ui: &mut egui::Ui, idx: usize) {
+        let running = self
+            .runtimes
+            .get(idx)
+            .and_then(|r| r.proc.as_ref())
+            .map(|p| process::is_running(p))
+            .unwrap_or(false);
+        let stopping = self.runtimes.get(idx).map(|r| r.stopping).unwrap_or(false);
+        let adopted_pid = self.runtimes.get(idx).and_then(|r| r.adopted_pid);
+        let adopted = adopted_pid.is_some() && !running;
+        let external = if running || adopted {
+            None
+        } else {
+            self.runtimes.get(idx).and_then(|r| r.external.clone())
+        };
+        let adopted_mem = self.runtimes.get(idx).map(|r| r.adopted_mem_mb).unwrap_or(0.0);
+        let run_kind = if running {
+            RunKind::Managed
+        } else if adopted {
+            RunKind::Adopted
+        } else if external.is_some() {
+            RunKind::External
+        } else {
+            RunKind::Stopped
+        };
+        let fallback_started = self
+            .runtimes
+            .get(idx)
+            .map(|r| r.fallback_started)
+            .unwrap_or(false);
+        let start_phase = self.runtimes.get(idx).map(|r| r.start_phase).unwrap_or(StartPhase::Idle);
+        let stop_queued = self.runtimes.get(idx).map(|r| r.stop_after_ready).unwrap_or(false);
+        let starting = run_kind == RunKind::Managed && start_phase == StartPhase::Starting;
+        let busy = running || stopping || adopted;
+        let last_msg = self.runtimes.get(idx).map(|r| r.last_msg.clone()).unwrap_or_default();
+
+        ui.horizontal(|ui| {
+            let start_btn = ui.add_enabled(!busy, egui::Button::new(RichText::new("▶ 启动服务器").size(15.0)));
+            if start_btn.clicked() {
+                // 检测到外部实例时不要直接起第二个实例（会抢端口）：
+                // 先让用户选择"接管 / 结束 / 取消"，由 ui_external_dialogs 处理确认结果。
+                if external.is_some() {
+                    self.confirm_start_external = Some(idx);
+                } else {
+                    // 手动启动：重置崩溃重启状态（含熔断）
+                    if let Some(rt) = self.runtimes.get_mut(idx) {
+                        rt.crash_count = 0;
+                        rt.crash_first_at = None;
+                        rt.crash_restart_at = None;
+                    }
+                    self.start_server(idx);
+                }
+            }
+            // 「停止」按钮随启动阶段变形：启动中=排入停止（就绪后自动停），已排队=改为强制停止
+            let stop_label = if stop_queued {
+                "⏹ 强制停止"
+            } else if starting {
+                "⏹ 停止（启动后执行）"
+            } else {
+                "⏹ 停止 (stop)"
+            };
+            let stop_btn = ui.add_enabled(busy, egui::Button::new(RichText::new(stop_label).size(15.0)));
+            if stop_btn.clicked() {
+                if stop_queued {
+                    // 已在排队：这一下是"我不想等了" → 走既有强停流程（含既有二次确认）
+                    if features::is_enabled(&self.cfg.features, features::FEATURE_FORCE_STOP_CONFIRM) {
+                        self.request_force_stop(idx);
+                    } else {
+                        self.kill_server(idx);
+                    }
+                } else {
+                    self.stop_server(idx);
+                }
+            }
+            let kill_btn = ui.add_enabled(busy, egui::Button::new(RichText::new("⏹ 强制结束").size(15.0)));
+            if kill_btn.clicked() {
+                if features::is_enabled(&self.cfg.features, features::FEATURE_FORCE_STOP_CONFIRM) {
+                    // B3 强停二次确认：先弹确认（pid + 影响），确认后带一次性 token 强杀
+                    self.request_force_stop(idx);
+                } else {
+                    self.kill_server(idx);
+                }
+            }
+        });
+        // 状态摘要：状态判定与回退说明同源，放在按钮下方便于对上下文
+        let (label, col) = if stopping {
+            ("正在停止…".to_string(), Color32::from_rgb(240, 200, 120))
+        } else {
+            match run_kind {
+                RunKind::Managed => (
+                    if starting {
+                        if stop_queued {
+                            "启动中…（已排入停止）".to_string()
+                        } else {
+                            "启动中…".to_string()
+                        }
+                    } else if fallback_started {
+                        "运行中（回退启动：直连 java）".to_string()
+                    } else {
+                        "运行中".to_string()
+                    },
+                    if starting {
+                        if stop_queued {
+                            Color32::from_rgb(235, 165, 90)
+                        } else {
+                            Color32::from_rgb(230, 190, 110)
+                        }
+                    } else {
+                        Color32::from_rgb(80, 200, 120)
+                    },
+                ),
+                RunKind::Adopted => (
+                    "运行中（外部启动·已接管）".to_string(),
+                    Color32::from_rgb(230, 190, 110),
+                ),
+                RunKind::External => (
+                    "运行中（外部启动）".to_string(),
+                    Color32::from_rgb(240, 176, 96),
+                ),
+                RunKind::Stopped => ("已停止".to_string(), Color32::from_rgb(160, 160, 166)),
+            }
+        };
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(label).strong().color(col));
+            match run_kind {
+                RunKind::External => {
+                    if let Some(e) = &external {
+                        let pid_txt = if e.pid == 0 {
+                            "PID 未知".to_string()
+                        } else {
+                            format!("PID {}", e.pid)
+                        };
+                        ui.label(
+                            RichText::new(format!(
+                                "{pid_txt} ｜ 内存 {:.0} MB ｜ {}",
+                                e.mem_mb, e.exe
+                            ))
+                            .small()
+                            .weak(),
+                        );
+                    }
+                }
+                RunKind::Adopted => {
+                    if let Some(pid) = adopted_pid {
+                        ui.label(
+                            RichText::new(format!("PID {} ｜ 内存 {:.0} MB", pid, adopted_mem))
+                                .small()
+                                .weak(),
+                        );
+                    }
+                }
+                _ => {}
+            }
+            if !last_msg.is_empty() {
+                ui.label(RichText::new(&last_msg).small().weak());
+            }
+        });
+        // 外部实例专用操作行：接管（纳入运行时状态）/ 结束外部进程（二次确认）
+        if external.is_some() || adopted {
+            ui.horizontal_wrapped(|ui| {
+                if let RunKind::External = run_kind {
+                    if ui
+                        .add(egui::Button::new(RichText::new("🤝 接管").strong()))
+                        .on_hover_text("纳入工具管理：停止/崩溃检测/关服快照生效（无法发送控制台命令）")
+                        .clicked()
+                    {
+                        self.adopt_external(idx);
+                    }
+                    let pid = external.as_ref().map(|e| e.pid).unwrap_or(0);
+                    if ui
+                        .add(egui::Button::new(RichText::new("⛔ 结束外部进程")))
+                        .on_hover_text("结束该外部进程及其子进程（需二次确认）；会影响正在游戏的玩家")
+                        .clicked()
+                    {
+                        self.confirm_kill_external = Some((idx, pid));
+                    }
+                    ui.label(
+                        RichText::new("该服务器由工具之外启动：工具能看日志，但停止/崩溃判定需先接管")
+                            .small()
+                            .color(self.fg(Color32::from_rgb(240, 176, 96))),
+                    );
+                } else if adopted {
+                    ui.label(
+                        RichText::new("已接管外部实例：可直接用「停止 / 强制结束」")
+                            .small()
+                            .color(self.fg(Color32::from_rgb(230, 190, 110))),
+                    );
+                }
+            });
+        }
+        if !self.cfg.servers[idx].dir.exists() {
+            ui.label(RichText::new("⚠ 目录不存在").small().color(Color32::RED));
+        }
+        // 回退启动说明（需要时保留风险提示）
+        if fallback_started {
+            ui.label(
+                RichText::new(
+                    "本次为「回退启动」：run.bat 启动失败（自行退出且日志无变化），已自动改用直连 java；\
+                     可在「设置」把启动方式设为 java 以跳过 run.bat",
+                )
+                .small()
+                .color(Color32::from_rgb(240, 200, 120)),
+            );
+        }
+    }
+
     /// 控制台页：运行状态 / 性能条 + 服务器输出日志（含命令输入）+ 崩溃报告分析（默认折叠）。
     ///
     /// 来源：日志与命令输入原内嵌在概览页，性能与崩溃分析原在「服务器状态」页；
     /// 两处合并后 `ServerTab::Status` / `ui_status` 不再存在（审计表 §3.1）。
-    /// 日志渲染与滚动仍走 `show_colored_log`（自动贴底、点击聚焦命令输入），未重写。
+    /// 启动/停止等操作按需求置顶（原在概览页）。日志渲染与滚动仍走 `show_colored_log`（自动贴底、点击聚焦命令输入），未重写。
     fn ui_console(&mut self, ui: &mut egui::Ui, idx: usize) {
         let running = self
             .runtimes
@@ -15670,14 +16202,14 @@ impl App {
             |tba| {
                 if tba
                     .add_sized([104.0, ui_ctl_h()], egui::Button::new("🗑 清空输出"))
-                    .on_hover_text("清空本页输出缓冲（会先弹出二次确认）")
+                    .on_hover_text("清空本页输出缓冲")
                     .clicked()
                 {
                     tb_clear = true;
                 }
                 if tba
                     .add_sized([84.0, ui_ctl_h()], egui::Button::new("🔄 刷新"))
-                    .on_hover_text("重新读取崩溃来源与日志列表")
+                    .on_hover_text("重新读取崩溃来源与日志")
                     .clicked()
                 {
                     tb_refresh = true;
@@ -15692,14 +16224,18 @@ impl App {
             self.runtimes[idx].crash_list = collect_crash_sources(&sc.dir);
             self.runtimes[idx].crash_analysis = None;
         }
+        // ---------- 启动 / 停止等操作置顶（原在概览页，按需求移到控制台最上方） ----------
+        self.ui_console_ops(ui, idx);
         ui.add_space(UI_SPACE_Y);
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-        // ---------- 运行状态 + 性能条（原「服务器状态」页的性能段） ----------
-        ui.label(RichText::new("服务器状态").strong());
-        ui.separator();
+        // ---------- 运行状态 + 性能条（可折叠：默认展开，收起后不占高度） ----------
+        egui::CollapsingHeader::new(RichText::new("服务器状态").strong())
+            .id_salt(("console_status_group", idx))
+            .default_open(true)
+            .show(ui, |ui| {
         if !running {
             ui.label(RichText::new("服务器未运行，无性能数据").weak());
         } else {
@@ -15711,6 +16247,7 @@ impl App {
             ui.add_space(2.0);
             show_perf_bar(ui, &self.runtimes[idx], true);
         }
+            });
 
         // ---------- 崩溃报告分析（折叠分组，默认折叠） ----------
         // 离线可用，参考 PCL 的日志/报告模式匹配思路。
@@ -15801,7 +16338,7 @@ impl App {
             // 不可撤销（旧内容在本页不再回灌），因此先走二次确认。
             if ui
                 .button("清空日志")
-                .on_hover_text("清空本页日志缓冲（会先弹出二次确认）")
+                .on_hover_text("清空本页日志缓冲")
                 .clicked()
             {
                 self.confirm_clear_console = Some(idx);
@@ -16409,7 +16946,6 @@ impl App {
             .and_then(|r| r.proc.as_ref())
             .map(|p| process::is_running(p))
             .unwrap_or(false);
-        let stopping = self.runtimes.get(idx).map(|r| r.stopping).unwrap_or(false);
         // 外部实例 / 已接管实例：只要本工具没有托管进程，就按外部态处理
         let adopted_pid = self.runtimes.get(idx).and_then(|r| r.adopted_pid);
         let adopted = adopted_pid.is_some() && !running;
@@ -16418,7 +16954,6 @@ impl App {
         } else {
             self.runtimes.get(idx).and_then(|r| r.external.clone())
         };
-        let adopted_mem = self.runtimes.get(idx).map(|r| r.adopted_mem_mb).unwrap_or(0.0);
         let run_kind = if running {
             RunKind::Managed
         } else if adopted {
@@ -16428,17 +16963,6 @@ impl App {
         } else {
             RunKind::Stopped
         };
-        // 本次运行是否由「run.bat 失败自动回退直连 java」启动（状态卡片要能看出来）
-        let fallback_started = self
-            .runtimes
-            .get(idx)
-            .map(|r| r.fallback_started)
-            .unwrap_or(false);
-        // 启动阶段 + 是否已排入停止（启动中点停止后按钮/状态卡都要跟着变）
-        let start_phase = self.runtimes.get(idx).map(|r| r.start_phase).unwrap_or(StartPhase::Idle);
-        let stop_queued = self.runtimes.get(idx).map(|r| r.stop_after_ready).unwrap_or(false);
-        let starting = run_kind == RunKind::Managed && start_phase == StartPhase::Starting;
-        let busy = running || stopping || adopted;
         let last_msg = self.runtimes.get(idx).map(|r| r.last_msg.clone()).unwrap_or_default();
         // 预检结果摘要（失败数 / 警告数），用于按钮旁的提示
         let pre_summary: Option<(usize, usize)> = self.runtimes.get(idx).and_then(|r| {
@@ -16453,10 +16977,15 @@ impl App {
         });
 
         ui.add_space(6.0);
-        // ===== 头部：名称 + 目录/文件夹快捷入口 =====
+        // ===== 头部：名称 + 目录路径 =====
         ui.horizontal(|ui| {
             ui.label(RichText::new(&sc.name).size(18.0).strong());
-            ui.add_space(6.0);
+        });
+        ui.label(RichText::new(sc.dir.display().to_string()).weak().small());
+        ui.add_space(4.0);
+        // ===== 快捷方式：目录按钮收成一组（原先平铺在名称右侧） =====
+        ui.label(RichText::new("快捷方式").strong());
+        ui.horizontal_wrapped(|ui| {
             if ui.button("📂 服务器文件夹").clicked() {
                 self.open_folder(&sc.dir);
             }
@@ -16473,137 +17002,29 @@ impl App {
                 self.open_folder(&sc.dir.join("logs"));
             }
         });
-        ui.label(RichText::new(sc.dir.display().to_string()).weak().small());
-        // ===== 卡片流：状态 / 平台 / 目录 =====
-        // 原实现是把这些信息一行行平铺（信息密度低、重点不突出），改为卡片流。
+        ui.add_space(UI_SPACE_Y);
+        // ===== 服务器信息：平台 / 加载器 / 版本 / 模组与插件 / 各目录占用 =====
         // 平台识别走 3 秒 TTL 缓存：这里是每帧渲染路径，直接 detect 会每帧遍历目录（见任务"每帧重活"）。
         let pinfo = serverinfo::detect_cached(&sc.dir, std::time::Duration::from_secs(3));
-        let card_fill = self.theme_cur.widget_bg;
-        let card_stroke = egui::Stroke::new(1.0, self.theme_cur.stroke);
-        let make_card = |ui: &mut egui::Ui, title: &str, add: &mut dyn FnMut(&mut egui::Ui)| {
-            egui::Frame::none()
-                .fill(card_fill)
-                .stroke(card_stroke)
-                .rounding(8.0)
-                .inner_margin(egui::Margin::symmetric(12.0, 9.0))
-                .show(ui, |ui| {
-                    ui.set_width(230.0);
-                    ui.label(RichText::new(title).weak().small());
-                    ui.add_space(2.0);
-                    add(ui);
-                });
-        };
-        ui.add_space(4.0);
-        ui.horizontal_top(|ui| {
-            // 卡片 1：运行状态（区分"本工具拉起"与"外部启动"，后者用弱化提示色）
-            let (label, col) = if stopping {
-                ("正在停止…".to_string(), Color32::from_rgb(240, 200, 120))
-            } else {
-                match run_kind {
-                    RunKind::Managed => (
-                        if starting {
-                            if stop_queued {
-                                "启动中…（已排入停止）".to_string()
-                            } else {
-                                "启动中…".to_string()
-                            }
-                        } else if fallback_started {
-                            "运行中（回退启动：直连 java）".to_string()
-                        } else {
-                            "运行中".to_string()
-                        },
-                        if starting {
-                            if stop_queued {
-                                Color32::from_rgb(235, 165, 90)
-                            } else {
-                                Color32::from_rgb(230, 190, 110)
-                            }
-                        } else {
-                            Color32::from_rgb(80, 200, 120)
-                        },
-                    ),
-                    RunKind::Adopted => (
-                        "运行中（外部启动·已接管）".to_string(),
-                        Color32::from_rgb(230, 190, 110),
-                    ),
-                    RunKind::External => (
-                        "运行中（外部启动）".to_string(),
-                        Color32::from_rgb(240, 176, 96),
-                    ),
-                    RunKind::Stopped => ("已停止".to_string(), Color32::from_rgb(160, 160, 166)),
-                }
-            };
-            make_card(ui, "状态", &mut |ui| {
-                ui.label(RichText::new(label.clone()).size(16.0).strong().color(col));
-                match run_kind {
-                    RunKind::External => {
-                        if let Some(e) = &external {
-                            let pid_txt = if e.pid == 0 {
-                                "PID 未知".to_string()
-                            } else {
-                                format!("PID {}", e.pid)
-                            };
-                            ui.label(
-                                RichText::new(format!(
-                                    "{pid_txt} ｜ 内存 {:.0} MB ｜ {}",
-                                    e.mem_mb, e.exe
-                                ))
-                                .small()
-                                .color(self.fg(Color32::from_rgb(240, 176, 96))),
-                            );
-                            ui.label(RichText::new(&e.evidence).small().weak());
-                            if e.weak {
-                                ui.label(
-                                    RichText::new("（命令行不可读，按日志写入时间推断，可能误判）")
-                                        .small()
-                                        .weak(),
-                                );
-                            }
-                        }
-                    }
-                    RunKind::Adopted => {
-                        if let Some(pid) = adopted_pid {
-                            ui.label(
-                                RichText::new(format!("PID {} ｜ 内存 {:.0} MB", pid, adopted_mem))
-                                    .small()
-                                    .color(self.fg(Color32::from_rgb(230, 190, 110))),
-                            );
-                        }
-                        ui.label(
-                            RichText::new("已纳入运行时状态：停止/强停/崩溃检测/关服快照均对其生效")
-                                .small()
-                                .weak(),
-                        );
-                    }
-                    _ => {}
-                }
-                if !last_msg.is_empty() {
-                    ui.label(RichText::new(last_msg.clone()).small().weak());
-                }
-                if fallback_started {
-                    ui.label(
-                        RichText::new(
-                            "本次为「回退启动」：run.bat 启动失败（自行退出且日志无变化），已自动改用直连 java；\
-                             可在「启动脚本」把启动方式设为 java 以跳过 run.bat",
-                        )
-                        .small()
-                        .color(Color32::from_rgb(240, 200, 120)),
-                    );
-                }
-                if !sc.dir.exists() {
-                    ui.label(RichText::new("⚠ 目录不存在").small().color(Color32::RED));
-                }
-            });
-            // 卡片 2：服务端平台
-            make_card(ui, "🧩 服务端平台", &mut |ui| {
-                let color = if pinfo.kind.is_modded() {
+        ui.label(RichText::new("服务器信息").strong());
+        egui::Frame::none()
+            .fill(self.theme_cur.widget_bg)
+            .stroke(egui::Stroke::new(1.0, self.theme_cur.stroke))
+            .rounding(8.0)
+            .inner_margin(egui::Margin::symmetric(12.0, 9.0))
+            .show(ui, |ui| {
+                let plat_color = if pinfo.kind.is_modded() {
                     self.fg(Color32::from_rgb(120, 200, 255))
                 } else if pinfo.kind == serverinfo::PlatformKind::Vanilla {
                     Color32::from_rgb(240, 176, 96)
                 } else {
                     self.fg(Color32::from_rgb(160, 220, 180))
                 };
-                let r = ui.label(RichText::new(pinfo.summary()).strong().color(color));
+                let r = ui.label(
+                    RichText::new(format!("🧩 {}", pinfo.summary()))
+                        .strong()
+                        .color(plat_color),
+                );
                 if !pinfo.evidence.is_empty() {
                     r.on_hover_text(pinfo.evidence.join("\n"));
                 }
@@ -16611,110 +17032,38 @@ impl App {
                     ui.label(RichText::new(format!("加载器 {lv}")).small().weak());
                 }
                 ui.label(
-                    RichText::new(format!("模组 {} · 插件 {}", pinfo.mod_count, pinfo.plugin_count))
-                        .small()
-                        .weak(),
+                    RichText::new(format!(
+                        "模组 {} · 插件 {}",
+                        pinfo.mod_count, pinfo.plugin_count
+                    ))
+                    .small()
+                    .weak(),
                 );
-            });
-            // 卡片 3：目录与体积
-            make_card(ui, "📁 目录", &mut |ui| {
+                ui.separator();
                 let world = dir_size_mb(&sc.dir.join("world"));
                 let mods = dir_size_mb(&sc.dir.join("mods"));
+                let eula = sc.dir.join("eula.txt").exists();
+                ui.label(RichText::new("目录占用").small().weak());
                 ui.label(format!("world {world}"));
                 ui.label(format!("mods {mods}"));
-                let eula = sc.dir.join("eula.txt").exists();
                 ui.label(
                     RichText::new(if eula { "eula.txt 已生成" } else { "eula.txt 缺失" })
                         .small()
                         .weak(),
                 );
             });
-        });
+        ui.add_space(UI_SPACE_Y);
         ui.separator();
 
-        ui.horizontal(|ui| {
-            let start_btn = ui.add_enabled(!busy, egui::Button::new(RichText::new("▶ 启动服务器").size(15.0)));
-            if start_btn.clicked() {
-                // 检测到外部实例时不要直接起第二个实例（会抢端口）：
-                // 先让用户选择"接管 / 结束 / 取消"，由 ui_external_dialogs 处理确认结果。
-                if external.is_some() {
-                    self.confirm_start_external = Some(idx);
-                } else {
-                    // 手动启动：重置崩溃重启状态（含熔断）
-                    if let Some(rt) = self.runtimes.get_mut(idx) {
-                        rt.crash_count = 0;
-                        rt.crash_first_at = None;
-                        rt.crash_restart_at = None;
-                    }
-                    self.start_server(idx);
-                }
-            }
-            // 「停止」按钮随启动阶段变形：启动中=排入停止（就绪后自动停），已排队=改为强制停止
-            let stop_label = if stop_queued {
-                "⏹ 强制停止"
-            } else if starting {
-                "⏹ 停止（启动后执行）"
-            } else {
-                "⏹ 停止 (stop)"
-            };
-            let stop_btn = ui.add_enabled(busy, egui::Button::new(RichText::new(stop_label).size(15.0)));
-            if stop_btn.clicked() {
-                if stop_queued {
-                    // 已在排队：这一下是"我不想等了" → 走既有强停流程（含既有二次确认）
-                    if features::is_enabled(&self.cfg.features, features::FEATURE_FORCE_STOP_CONFIRM) {
-                        self.request_force_stop(idx);
-                    } else {
-                        self.kill_server(idx);
-                    }
-                } else {
-                    self.stop_server(idx);
-                }
-            }
-            let kill_btn = ui.add_enabled(busy, egui::Button::new(RichText::new("⏹ 强制结束").size(15.0)));
-            if kill_btn.clicked() {
-                if features::is_enabled(&self.cfg.features, features::FEATURE_FORCE_STOP_CONFIRM) {
-                    // B3 强停二次确认：先弹确认（pid + 影响），确认后带一次性 token 强杀
-                    self.request_force_stop(idx);
-                } else {
-                    self.kill_server(idx);
-                }
-            }
-        });
-        // 外部实例专用操作行：接管（纳入运行时状态）/ 结束外部进程（二次确认）
-        if external.is_some() || adopted {
-            ui.horizontal_wrapped(|ui| {
-                if let RunKind::External = run_kind {
-                    if ui
-                        .add(egui::Button::new(RichText::new("🤝 接管").strong()))
-                        .on_hover_text("纳入工具管理：停止/崩溃检测/关服快照生效（无法发送控制台命令）")
-                        .clicked()
-                    {
-                        self.adopt_external(idx);
-                    }
-                    let pid = external.as_ref().map(|e| e.pid).unwrap_or(0);
-                    if ui
-                        .add(egui::Button::new(RichText::new("⛔ 结束外部进程")))
-                        .on_hover_text("结束该外部进程及其子进程（需二次确认）；会影响正在游戏的玩家")
-                        .clicked()
-                    {
-                        self.confirm_kill_external = Some((idx, pid));
-                    }
-                    ui.label(
-                        RichText::new("该服务器由工具之外启动：工具能看日志，但停止/崩溃判定需先接管")
-                            .small()
-                            .color(self.fg(Color32::from_rgb(240, 176, 96))),
-                    );
-                } else if adopted {
-                    ui.label(
-                        RichText::new("已接管外部实例：可直接用「停止 / 强制结束」")
-                            .small()
-                            .color(self.fg(Color32::from_rgb(230, 190, 110))),
-                    );
-                }
-            });
-        }
+        // 启动/停止等操作已移至「控制台」页签顶部（本页只保留信息与排障入口）。
         let diag_dir = self.diag_last_dir.clone();
         let mut open_diag_dir = false;
+        // ===== 排障（默认折叠）：启动前检查 / 导出诊断包 / 启动诊断 / 打开启动日志 =====
+        // 展开状态由 egui 的记忆（id_salt）持久化，默认折叠
+        egui::CollapsingHeader::new(RichText::new("排障").strong())
+            .id_salt(("overview_troubleshoot", idx))
+            .default_open(false)
+            .show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             let pre_busy = self.runtimes.get(idx).map(|r| r.precheck_busy).unwrap_or(false);
             if ui
@@ -16753,7 +17102,7 @@ impl App {
             // 会短暂启动服务器（每种最多观察 12 秒，出现 Done / 日志有新内容会提前结束），因此服务器运行中禁用。
             if ui
                 .add_enabled(
-                    !self.launch_diag_busy && !busy,
+                    !self.launch_diag_busy && !running,
                     egui::Button::new("🧪 启动诊断"),
                 )
                 .on_hover_text(
@@ -16788,6 +17137,7 @@ impl App {
                 self.open_folder(&dir);
             }
         }
+        // 最后一条状态消息放在「排障」组内（状态判定与回退说明同源）
         if !last_msg.is_empty() {
             let msg_color = if last_msg.starts_with('✅') {
                 self.fg(Color32::from_rgb(255, 180, 80))
@@ -16796,12 +17146,13 @@ impl App {
             };
             ui.label(RichText::new(&last_msg).color(msg_color));
         }
-        // 日志与命令输入已并入「控制台」页签（审计表 §3.1）：概览只留一行指引，不再重复渲染日志
+        // 启动/停止等操作在「控制台」页签顶部；日志与命令输入同样在控制台
         ui.label(
-            RichText::new("服务器输出日志与命令输入已移至「控制台」页签")
+            RichText::new("启动、停止与服务器输出日志、命令输入都在「控制台」页签")
                 .weak()
                 .small(),
         );
+            });
         ui.add_space(CONTENT_EDGE_PAD);
             });
     }
@@ -16879,11 +17230,7 @@ impl App {
                     },
                 )
             });
-            let text = if text.is_empty() && !jvm_args.exists() {
-                recommended_jvm_args(physical_memory_gb()) + "\n"
-            } else {
-                text
-            };
+            // 只在文件确实存在时读取（Forge/NeoForge 自建；Fabric 走 run.bat，不显示本项）
             self.runtimes[idx].jvm_args_edit = Some(text);
             self.runtimes[idx].jvm_args_meta = Some(meta);
         }
@@ -16911,7 +17258,7 @@ impl App {
                     self.runtimes[idx].server_props_meta = Some(meta);
                 }
                 if !sp_path.exists() {
-                    ui.label(RichText::new("（服务器目录下暂存 server.properties，保存后自动创建").weak());
+                    ui.label(RichText::new("保存后在服务器目录创建 server.properties").weak());
                 }
                 let mut adv = self.runtimes[idx].server_props_advanced;
                 ui.horizontal(|ui| {
@@ -16979,55 +17326,9 @@ impl App {
                 }
             });
         ui.separator();
-        egui::CollapsingHeader::new("run.bat（点击展开编辑）")
-            .default_open(false)
-            .show(ui, |ui| {
-                let mut bat_content = self.runtimes[idx].run_bat_edit.clone().unwrap_or_default();
-                // 预览区（高度由下方分隔条拖动调整，允许拉倒最大显示全部脚本）
-                egui::ScrollArea::vertical()
-                    .id_salt("run_bat_preview")
-                    .max_height(self.run_bat_h)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        ui.add(
-                            TextEdit::multiline(&mut bat_content)
-                                .code_editor()
-                                .desired_width(f32::INFINITY)
-                                .desired_rows(10),
-                        );
-                    });
-                draggable_divider(ui, &mut self.run_bat_h, &mut self.run_bat_drag_start);
-                let run_meta = self.runtimes[idx].run_bat_meta.unwrap_or(TextMeta {
-                    enc: default_text_encoding(&run_bat),
-                    crlf: true,
-                });
-                ui.label(
-                    RichText::new(format!(
-                        "编码: {} · 换行: {}",
-                        run_meta.enc.label(),
-                        if run_meta.crlf { "CRLF" } else { "LF" }
-                    ))
-                    .weak()
-                    .small(),
-                );
-                if ui.button("💾 保存 run.bat").clicked() {
-                    let _ = std::fs::create_dir_all(&dir);
-                    let (enc, crlf) = (run_meta.enc, run_meta.crlf);
-                    match write_text_same_encoding(&run_bat, &bat_content, enc, crlf) {
-                        Ok(_) => self.set_toast(format!(
-                            "run.bat 已保存（{}，原文件已备份为 .bak_ 时间戳）",
-                            enc.label()
-                        )),
-                        Err(e) => self.set_toast(format!("保存失败: {e}")),
-                    }
-                }
-                self.runtimes[idx].run_bat_edit = Some(bat_content);
-            });
-        ui.separator();
 
-        // 分区三：启动脚本（run.bat / user_jvm_args / 自定义启动命令）
-        ui.label(RichText::new("启动脚本").strong());
-        ui.label("run.bat 存在且启动方式为 auto/bat 时优先执行脚本；启动方式为 java 时始终直连 java（按脚本解析出的 Java/JVM 参数/核心 jar）");
+        // 分区三：启动参数（启动方式 / run.bat / JVM 参数 / 自定义启动命令）
+        ui.label(RichText::new("🚀 启动参数").strong());
         ui.separator();
 
         // 启动方式（每服务器）：auto（默认）/ bat / java。解决"无控制台 GUI 进程经 cmd→bat→java
@@ -17075,42 +17376,169 @@ impl App {
         }
         ui.separator();
 
-        // 生成启动脚本：按当前 Java / JVM 参数 / 核心 jar 生成一份 run.bat
-        //（GBK + CRLF + 无 BOM；覆盖前自动备份为 run.bat.bak_<时间戳>）
+        // ===== run.bat（归入「启动参数」）=====
+        // 服务端目录里**确实没有** run.bat 时才提示导入/生成（有脚本时只提供编辑）
+        let bat_java_now = extract_java_from_bat(&run_bat);
+        if !run_bat.exists() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new("服务端内未找到 run.bat")
+                        .color(self.fg(Color32::from_rgb(255, 200, 80))),
+                );
+                if ui
+                    .button("🛠 生成")
+                    .on_hover_text("按当前 Java、JVM 参数与核心 jar 生成 run.bat（覆盖前自动备份）")
+                    .clicked()
+                {
+                    let cfg_now = self.cfg.clone();
+                    let java = resolve_java_for_server(&cfg_now, &sc);
+                    let jvm = resolve_jvm_for_server(&cfg_now, idx);
+                    let core = detect_core_jar(&dir);
+                    match generate_run_bat(&dir, &java, &jvm, &core) {
+                        Ok(p) => {
+                            reload_run_bat_edit(&mut self.runtimes, idx, &p);
+                            self.runtimes[idx].jvm_synced = jvm.clone();
+                            self.set_toast(format!("已生成 run.bat：{}", p.display()));
+                        }
+                        Err(e) => self.set_toast(format!("生成失败: {e}")),
+                    }
+                }
+                if ui
+                    .button("📥 导入…")
+                    .on_hover_text("选择一份 run.bat，复制进服务端目录并显示其内容")
+                    .clicked()
+                {
+                    if let Some(src) = rfd::FileDialog::new()
+                        .add_filter("批处理", &["bat", "cmd"])
+                        .set_title("选择 run.bat")
+                        .pick_file()
+                    {
+                        match std::fs::copy(&src, &run_bat) {
+                            Ok(_) => {
+                                reload_run_bat_edit(&mut self.runtimes, idx, &run_bat);
+                                self.set_toast(format!("已导入 run.bat：{}", src.display()));
+                            }
+                            Err(e) => self.set_toast(format!("导入失败：{e}")),
+                        }
+                    }
+                }
+            });
+        }
+        egui::CollapsingHeader::new("run.bat（点击展开编辑）")
+            .id_salt(("run_bat_group", idx))
+            .default_open(false)
+            .show(ui, |ui| {
+                let mut bat_content = self.runtimes[idx].run_bat_edit.clone().unwrap_or_default();
+                // 预览区（高度由下方分隔条拖动调整，允许拉倒最大显示全部脚本）
+                egui::ScrollArea::vertical()
+                    .id_salt("run_bat_preview")
+                    .max_height(self.run_bat_h)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.add(
+                            TextEdit::multiline(&mut bat_content)
+                                .code_editor()
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(10),
+                        );
+                    });
+                draggable_divider(ui, &mut self.run_bat_h, &mut self.run_bat_drag_start);
+                let run_meta = self.runtimes[idx].run_bat_meta.unwrap_or(TextMeta {
+                    enc: default_text_encoding(&run_bat),
+                    crlf: true,
+                });
+                ui.label(
+                    RichText::new(format!(
+                        "编码: {} · 换行: {}",
+                        run_meta.enc.label(),
+                        if run_meta.crlf { "CRLF" } else { "LF" }
+                    ))
+                    .weak()
+                    .small(),
+                );
+                if ui.button("💾 保存 run.bat").clicked() {
+                    let _ = std::fs::create_dir_all(&dir);
+                    let (enc, crlf) = (run_meta.enc, run_meta.crlf);
+                    match write_text_same_encoding(&run_bat, &bat_content, enc, crlf) {
+                        Ok(_) => self.set_toast(format!(
+                            "run.bat 已保存（{}，原文件已备份为 .bak_ 时间戳）",
+                            enc.label()
+                        )),
+                        Err(e) => self.set_toast(format!("保存失败: {e}")),
+                    }
+                }
+                self.runtimes[idx].run_bat_edit = Some(bat_content);
+            });
         ui.horizontal(|ui| {
             if ui
-                .button("🛠 生成 run.bat")
-                .on_hover_text(
-                    "按当前 Java、JVM 参数与核心 jar 生成 run.bat（覆盖前自动备份）",
-                )
+                .button("🛠 按当前设置重新生成 run.bat")
+                .on_hover_text("按当前 Java、JVM 参数与核心 jar 重新生成（覆盖前自动备份）")
                 .clicked()
             {
                 let cfg_now = self.cfg.clone();
                 let java = resolve_java_for_server(&cfg_now, &sc);
-                let jvm = self.cfg.servers[idx]
-                    .jvm_args
-                    .clone()
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or_else(|| self.cfg.default_jvm_args.clone());
+                let jvm = resolve_jvm_for_server(&cfg_now, idx);
                 let core = detect_core_jar(&dir);
                 match generate_run_bat(&dir, &java, &jvm, &core) {
                     Ok(p) => {
-                        // 同步刷新编辑器缓存，避免刚生成又被编辑器里的旧内容覆盖
-                        if let Ok((text, meta)) = read_text_for_edit(&p) {
-                            self.runtimes[idx].run_bat_edit = Some(text);
-                            self.runtimes[idx].run_bat_meta = Some(meta);
-                        }
+                        reload_run_bat_edit(&mut self.runtimes, idx, &p);
+                        self.runtimes[idx].jvm_synced = jvm.clone();
                         self.set_toast(format!("已生成 run.bat：{}", p.display()));
                     }
                     Err(e) => self.set_toast(format!("生成失败: {e}")),
                 }
             }
             ui.label(
-                RichText::new("GBK 编码 · 重启交给工具（MAX_RESTARTS=1）· 临时目录指向 tmp")
+                RichText::new("GBK 编码 · 临时目录指向 tmp")
                     .weak()
                     .small(),
             );
         });
+        ui.separator();
+
+        // 启动方式（每服务器）：auto（默认）/ bat / java。解决"无控制台 GUI 进程经 cmd→bat→java
+        // 起不来"的环境问题：auto 会在 run.bat 自行以非 0 退出且日志无变化时自动改用直连 java。
+        ui.label(RichText::new("启动方式").strong());
+        {
+            let mut mode_now = normalize_launch_mode(&self.cfg.servers[idx].launch_mode).to_string();
+            let mode_before = mode_now.clone();
+            egui::ComboBox::from_id_salt("launch_mode")
+                .selected_text(match mode_now.as_str() {
+                    "bat" => "bat：只使用 run.bat",
+                    "java" => "java：始终直连 java",
+                    _ => "auto：优先 run.bat，失败自动改用直连 java",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut mode_now,
+                        "auto".to_string(),
+                        "auto：优先 run.bat，失败自动改用直连 java",
+                    );
+                    ui.selectable_value(&mut mode_now, "bat".to_string(), "bat：只使用 run.bat");
+                    ui.selectable_value(
+                        &mut mode_now,
+                        "java".to_string(),
+                        "java：始终直连 java（跳过 run.bat）",
+                    );
+                });
+            ui.label(
+                RichText::new("auto：优先 run.bat，失败自动改用直连 java（推荐）")
+                    .weak()
+                    .small(),
+            );
+            if mode_now != mode_before {
+                self.cfg.servers[idx].launch_mode = mode_now.clone();
+                self.save_config();
+                self.set_toast(format!(
+                    "启动方式已设为 {}（下次启动生效）",
+                    match mode_now.as_str() {
+                        "bat" => "bat：只使用 run.bat",
+                        "java" => "java：始终直连 java",
+                        _ => "auto：优先 run.bat，失败自动改用直连 java",
+                    }
+                ));
+            }
+        }
         ui.separator();
 
         // JVM 参数（{jvm} 占位符展开值）：留空 = 跟随全局默认，全局也留空 = 按物理内存推荐
@@ -17123,10 +17551,15 @@ impl App {
                 .hint_text(format!("留空 = 全局默认；都为空则自动推荐：{rec_jvm}"))
                 .desired_width(f32::INFINITY),
         );
+        // 改 JVM 参数时同步更新 run.bat 里的 JVM_ARGS（原先只改配置，脚本还是旧参数）
+        let mut want_jvm_sync = false;
         if jvm_resp.changed() {
             let v = jvm_now.trim().to_string();
             self.cfg.servers[idx].jvm_args = if v.is_empty() { None } else { Some(v) };
             self.save_config();
+        }
+        if jvm_resp.lost_focus() {
+            want_jvm_sync = true;
         }
         ui.horizontal(|ui| {
             ui.label(
@@ -17137,49 +17570,57 @@ impl App {
             if ui.small_button("使用推荐值").clicked() {
                 self.cfg.servers[idx].jvm_args = Some(rec_jvm.clone());
                 self.save_config();
-                self.set_toast("已填入推荐 JVM 参数（{jvm} 展开为它）".to_string());
+                want_jvm_sync = true;
             }
         });
+        if want_jvm_sync {
+            let jvm = resolve_jvm_for_server(&self.cfg, idx);
+            self.sync_jvm_to_run_bat(idx, &jvm, &dir, &run_bat);
+        }
         ui.separator();
 
-        // user_jvm_args.txt（折叠）
-        egui::CollapsingHeader::new("user_jvm_args.txt（点击展开编辑）")
-            .default_open(true)
-            .show(ui, |ui| {
-                let mut jvm_content = self.runtimes[idx].jvm_args_edit.clone().unwrap_or_default();
-                ui.add(
-                    TextEdit::multiline(&mut jvm_content)
-                        .code_editor()
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(4),
-                );
-                let jvm_meta = self.runtimes[idx].jvm_args_meta.unwrap_or(TextMeta {
-                    enc: default_text_encoding(&jvm_args),
-                    crlf: true,
-                });
-                ui.label(
-                    RichText::new(format!(
-                        "编码: {} · 换行: {}",
-                        jvm_meta.enc.label(),
-                        if jvm_meta.crlf { "CRLF" } else { "LF" }
-                    ))
-                    .weak()
-                    .small(),
-                );
-                if ui.button("💾 保存 user_jvm_args.txt").clicked() {
-                    let _ = std::fs::create_dir_all(&dir);
-                    let (enc, crlf) = (jvm_meta.enc, jvm_meta.crlf);
-                    match write_text_same_encoding(&jvm_args, &jvm_content, enc, crlf) {
-                        Ok(_) => self.set_toast(format!(
-                            "user_jvm_args.txt 已保存（{}，原文件已备份为 .bak_ 时间戳）",
-                            enc.label()
-                        )),
-                        Err(e) => self.set_toast(format!("保存失败: {e}")),
+        // user_jvm_args.txt：**仅当服务端目录里确实存在**时显示
+        // （Forge/NeoForge 安装器会自己生成；Fabric 走 run.bat，不生成这个文件）
+        if jvm_args.exists() {
+            egui::CollapsingHeader::new("user_jvm_args.txt（点击展开编辑）")
+                .id_salt(("user_jvm_args_group", idx))
+                .default_open(true)
+                .show(ui, |ui| {
+                    let mut jvm_content = self.runtimes[idx].jvm_args_edit.clone().unwrap_or_default();
+                    ui.add(
+                        TextEdit::multiline(&mut jvm_content)
+                            .code_editor()
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(4),
+                    );
+                    let jvm_meta = self.runtimes[idx].jvm_args_meta.unwrap_or(TextMeta {
+                        enc: default_text_encoding(&jvm_args),
+                        crlf: true,
+                    });
+                    ui.label(
+                        RichText::new(format!(
+                            "编码: {} · 换行: {}",
+                            jvm_meta.enc.label(),
+                            if jvm_meta.crlf { "CRLF" } else { "LF" }
+                        ))
+                        .weak()
+                        .small(),
+                    );
+                    if ui.button("💾 保存 user_jvm_args.txt").clicked() {
+                        let _ = std::fs::create_dir_all(&dir);
+                        let (enc, crlf) = (jvm_meta.enc, jvm_meta.crlf);
+                        match write_text_same_encoding(&jvm_args, &jvm_content, enc, crlf) {
+                            Ok(_) => self.set_toast(format!(
+                                "user_jvm_args.txt 已保存（{}，原文件已备份为 .bak_ 时间戳）",
+                                enc.label()
+                            )),
+                            Err(e) => self.set_toast(format!("保存失败: {e}")),
+                        }
                     }
-                }
-                self.runtimes[idx].jvm_args_edit = Some(jvm_content);
-            });
-        ui.separator();
+                    self.runtimes[idx].jvm_args_edit = Some(jvm_content);
+                });
+            ui.separator();
+        }
 
         // launch_cmd 模板（run.bat 不存在时使用�?
         ui.label(RichText::new("自定义启动命令（未使用 run.bat 时使用）").strong());
@@ -17258,9 +17699,30 @@ impl App {
         }
         ui.separator();
 
-        // Java 设置：服务器�?MC 版本 + 指定全局列表�?
+        // Java 设置：run.bat 内的 Java 优先 → 按 MC 版本规则匹配 → 找不到时提示导入
         ui.label(RichText::new("Java 设置").strong());
-        ui.label("启动方式为 auto/bat 且有 run.bat 时以脚本内的 Java 为准；否则按下方解析链自动选择 Java");
+        {
+            let bat_java = bat_java_now.clone();
+            let want_major = java_major_for_mc(self.cfg.servers[idx].mc_version.as_deref());
+            if let Some(p) = bat_java.as_ref() {
+                let ok = java_path_is_usable(p);
+                ui.label(
+                    RichText::new(format!(
+                        "run.bat 内的 Java：{p}（{}）",
+                        if ok { "可用" } else { "路径不可用" }
+                    ))
+                    .small()
+                    .weak(),
+                );
+            }
+            if let Some(maj) = want_major {
+                ui.label(
+                    RichText::new(format!("按当前 MC 版本，应使用 Java {maj}"))
+                        .small()
+                        .weak(),
+                );
+            }
+        }
         ui.horizontal(|ui| {
             ui.label("MC 版本");
             let mut ver = self.cfg.servers[idx].mc_version.clone().unwrap_or_default();
@@ -17275,37 +17737,38 @@ impl App {
                 self.save_config();
             }
         });
+        let homes = self.cfg.java_homes.clone();
+        let sel_before = self.cfg.servers[idx].java_home_id.clone();
+        let sel_text = match &sel_before {
+            Some(id) => homes
+                .iter()
+                .find(|h| &h.name == id)
+                .map(|h| format!("{} ({})", h.name, h.path))
+                .unwrap_or_else(|| format!("{id} (已删除)")),
+            None => "自动（run.bat / 按版本 / 全局）".to_string(),
+        };
+        let mut sel_now = sel_before.clone();
         ui.horizontal(|ui| {
             ui.label("Java 来源");
-            let homes = self.cfg.java_homes.clone();
-            let sel = self.cfg.servers[idx].java_home_id.clone();
-            let sel_text = match &sel {
-                Some(id) => homes
-                    .iter()
-                    .find(|h| &h.name == id)
-                    .map(|h| format!("{} ({})", h.name, h.path))
-                    .unwrap_or_else(|| format!("{id} (已删除)")),
-                None => "自动（按版本匹配 / run.bat / 全局）".to_string(),
-            };
-            egui::ComboBox::from_label("")
+            egui::ComboBox::from_id_salt("server_java_source")
                 .selected_text(sel_text)
                 .show_ui(ui, |ui| {
                     ui.selectable_value(
-                        &mut self.cfg.servers[idx].java_home_id,
+                        &mut sel_now,
                         None,
-                        "自动（按版本匹配 / run.bat / 全局）",
+                        "自动（run.bat / 按版本 / 全局）",
                     );
                     for h in &homes {
                         ui.selectable_value(
-                            &mut self.cfg.servers[idx].java_home_id,
+                            &mut sel_now,
                             Some(h.name.clone()),
                             format!("{} ({})", h.name, h.path),
                         );
                     }
                 });
-            // 打开所�?Java 所在目录（便于核对位置�?
+            // 打开所选 Java 所在目录（便于核对位置）
             if ui.button("📂 打开所在目录").clicked() {
-                let p = sel
+                let p = sel_now
                     .as_ref()
                     .and_then(|id| homes.iter().find(|h| &h.name == id))
                     .map(|h| h.path.clone())
@@ -17315,10 +17778,65 @@ impl App {
                 }
             }
         });
-        // 解析结果预览（只读）
+        if sel_now != sel_before {
+            self.cfg.servers[idx].java_home_id = sel_now.clone();
+            self.save_config();
+            // 选定 Java 后覆盖并改写 run.bat 内的 java 路径（改前 write_text_same_encoding 已备份原文件）
+            if let Some(id) = sel_now.as_ref() {
+                let chosen = homes
+                    .iter()
+                    .find(|h| &h.name == id)
+                    .map(|h| h.path.clone())
+                    .unwrap_or_default();
+                match rewrite_run_bat_java(&run_bat, &chosen) {
+                    Ok(true) => {
+                        reload_run_bat_edit(&mut self.runtimes, idx, &run_bat);
+                        self.set_toast(format!(
+                            "已选定 {id}，run.bat 内的 Java 路径已同步改写（原文件已备份）"
+                        ));
+                    }
+                    Ok(false) => self.set_toast(format!("已选定 {id}（run.bat 无需改写）")),
+                    Err(e) => self.set_toast(format!("改写 run.bat 失败：{e}")),
+                }
+            } else {
+                self.set_toast("Java 来源已改为自动".to_string());
+            }
+        }
+        // 解析结果预览（只读）+ 可用性判断
         let cfg = self.cfg.clone();
         let resolved = resolve_java_for_server(&cfg, &sc);
-        ui.label(RichText::new(format!("当前解析: {resolved}")).weak());
+        let resolved_major = java_major_of_path(&resolved);
+        let want_major = java_major_for_mc(sc.mc_version.as_deref());
+        let mismatch = matches!((resolved_major, want_major), (Some(got), Some(want)) if got != want);
+        let unusable = resolved.contains('\\') || resolved.contains('/');
+        let usable = !unusable || java_path_is_usable(&resolved);
+        ui.label(
+            RichText::new(format!(
+                "当前解析: {resolved}{}",
+                match resolved_major {
+                    Some(m) => format!("（Java {m}）"),
+                    None => "（未能识别版本）".to_string(),
+                }
+            ))
+            .weak(),
+        );
+        if !usable {
+            ui.label(
+                RichText::new("未找到可用的 Java：请点上方「Java 来源」选择，或在「设置 → Java」里导入 Java")
+                    .small()
+                    .color(self.fg(Color32::from_rgb(255, 200, 80))),
+            );
+        } else if mismatch {
+            let want = want_major.unwrap_or(0);
+            ui.label(
+                RichText::new(format!(
+                    "该 MC 版本通常需要 Java {want}，当前解析到 Java {}：可点「Java 来源」改选，会自动改写 run.bat",
+                    resolved_major.map(|m| m.to_string()).unwrap_or_else(|| "?".to_string())
+                ))
+                .small()
+                .color(self.fg(Color32::from_rgb(255, 200, 80))),
+            );
+        }
         if run_bat.exists() {
             let mode = normalize_launch_mode(&sc.launch_mode);
             let text = match mode {
@@ -17396,7 +17914,7 @@ impl App {
             .id_salt(("crash_restart_group", idx))
             .default_open(false)
             .show(ui, |ui| {
-            ui.label("进程异常退出（崩溃/强杀/断电，非手动停止）时自动重新拉起；熔断窗口内连续崩溃达到上限后停止");
+            ui.label("进程异常退出（崩溃/强杀/断电，非手动停止）时自动重新拉起");
             // run.bat 自带的 MAX_RESTARTS 重启循环与工具自重启会**叠加**（表现为"一直重启很多次"）。
             // 处理方式是**静默同步**：以脚本为准，进入本页（或切换服务器）时读一次脚本，
             // 把工具的上限对齐成脚本的值，两者一致就不会双重启；只在数值确实不一致时落盘。
@@ -17452,7 +17970,7 @@ impl App {
                     if tool_max == bat_max {
                         ui.label(
                             RichText::new(format!(
-                                "已按 {bat} 同步：窗口内最大重启次数 = {tool_max}（与脚本一致，不会双重启）"
+                                "已按 {bat} 同步：窗口内最大重启次数 = {tool_max}"
                             ))
                             .weak()
                             .small(),
@@ -18415,18 +18933,6 @@ impl App {
                     }
                 }
                 tbf.add_space(4.0);
-                tbf.label("🔍");
-                tbf.add(
-                    TextEdit::singleline(&mut self.runtimes[idx].file_search)
-                        .frame(false)
-                        .hint_text("Search...")
-                        .desired_width(220.0),
-                );
-                if !self.runtimes[idx].file_search.is_empty()
-                    && tbf.small_button("清除").clicked()
-                {
-                    self.runtimes[idx].file_search.clear();
-                }
             },
             |tba| {
                 tba.horizontal(|ui| {
@@ -18535,6 +19041,18 @@ impl App {
                         ui.label(RichText::new(self.runtimes[idx].modupd_progress.clone()).small().weak());
                     }
                 }
+            }
+        });
+        // 搜索框贴着它过滤的文件列表（原在顶部工具条里，离列表太远）
+        ui.horizontal(|ui| {
+            ui.label("🔍");
+            ui.add(
+                TextEdit::singleline(&mut self.runtimes[idx].file_search)
+                    .hint_text("搜索当前目录的文件名")
+                    .desired_width(240.0),
+            );
+            if !self.runtimes[idx].file_search.is_empty() && ui.small_button("清除").clicked() {
+                self.runtimes[idx].file_search.clear();
             }
         });
         // mods 页：启用/禁用过滤（沿用页面的 selectable_label 小分段风格），
@@ -18783,7 +19301,7 @@ impl App {
                                                 .unwrap_or(false);
                                             let resp = ui
                                                 .selectable_label(sel, display_text)
-                                                .on_hover_text("单击预览目录信息，双击进入目录，右键更多操作");
+                                                .on_hover_text("单击预览，双击打开，右键更多操作");
                                             // 滚动定位：来自 Spark 分析页「📍 定位」跳转
                                             if self.runtimes[idx].file_scroll_to.as_deref() == Some(name.as_str()) {
                                                 resp.scroll_to_me(Some(egui::Align::Center));
@@ -19475,7 +19993,7 @@ impl App {
                 .id_salt(("backup_basic", idx))
                 .default_open(true)
                 .show(ui, |ui| {
-                ui.checkbox(&mut b.enabled, "启用自动备份（仅服务器运行时触发定时快照）");
+                ui.checkbox(&mut b.enabled, "启用自动备份");
                 ui.horizontal(|ui| {
                     ui.label("间隔(分钟):");
                     ui.add(egui::DragValue::new(&mut b.interval_min).range(1..=10080));
@@ -19869,7 +20387,7 @@ impl App {
                                         .on_hover_text(if pinned {
                                             "取消锁定标记（已实化的空间不会回收；该份此后可能被自动清理）"
                                         } else {
-                                            "把该快照实化为独立副本：不再随源文件变化、不会被自动清理（占用整份空间）"
+                                            "把该快照实化为独立副本：不再随源文件变化、不会被自动清理"
                                         })
                                         .clicked()
                                     {
@@ -20649,20 +21167,10 @@ impl App {
                 self.tunnel_highlight = None;
             }
         }
-        // 统一工具条：左侧关键字过滤，右侧主操作（创建隧道 / 刷新）
+        // 统一工具条：右侧主操作（创建隧道 / 刷新）；过滤框贴着下方隧道列表
         let mut tb_new = false;
         page_toolbar(ui, "📡 隧道管理").show(
             |tbf| {
-                tbf.label("🔍");
-                tbf.add(
-                    TextEdit::singleline(&mut self.tunnel_search)
-                        .frame(false)
-                        .hint_text("按备注 / 名称 / 端口过滤")
-                        .desired_width(240.0),
-                );
-                if !self.tunnel_search.is_empty() && tbf.small_button("清除").clicked() {
-                    self.tunnel_search.clear();
-                }
                 let n = self.cfg.tunnels.len();
                 tbf.label(RichText::new(format!("共 {n} 条")).weak().small());
             },
@@ -20686,6 +21194,18 @@ impl App {
         if tb_new {
             self.tunnel_side = TunnelSide::Create;
         }
+        // 过滤框贴着它作用的隧道列表
+        ui.horizontal(|ui| {
+            ui.label("🔍");
+            ui.add(
+                TextEdit::singleline(&mut self.tunnel_search)
+                    .hint_text("按备注 / 名称 / 端口过滤")
+                    .desired_width(240.0),
+            );
+            if !self.tunnel_search.is_empty() && ui.small_button("清除").clicked() {
+                self.tunnel_search.clear();
+            }
+        });
         ui.add_space(UI_SPACE_Y);
         if self.cfg.tunnels.is_empty() {
             ui.label("暂无穿透配置，点上方「➕ 创建隧道」添加一条");
@@ -20883,7 +21403,7 @@ impl App {
                     // 危险操作：删除隧道一律走二次确认（不再有 Shift 直删的绕过路径）
                     if ui
                         .button("🗑 删除")
-                        .on_hover_text("删除隧道（会先弹出二次确认）")
+                        .on_hover_text("删除隧道")
                         .clicked()
                     {
                         self.confirm_remove_tunnel = Some(i);
@@ -21381,7 +21901,7 @@ impl App {
                 ctx,
                 "清空服务器输出日志",
                 &format!("确定要清空「{name}」的输出日志吗？"),
-                "只清空本页显示缓冲；日志文件保留，但旧内容不会回灌到本页。",
+                "只清空本页显示；日志文件保留。",
                 "确认清空",
             ) {
                 ConfirmAction::Cancel => self.confirm_clear_console = None,
@@ -21412,7 +21932,8 @@ impl App {
         }
     }
 
-    /// 设置页可折叠区块：左侧折叠箭�?+ 平滑高度动画
+
+    /// 设置页可折叠区块：左侧折叠箭头 + 平滑高度动画
     /// 调用方需�?mem::take 移出 settings_sections，结束后放回，避免闭包与 self 借用冲突
     fn setting_section(
         ctx: &egui::Context,
@@ -21965,6 +22486,111 @@ impl App {
     }
 
     /// Settings page "界面" section: theme mode / presets / custom colors / background / corners.
+    /// 「UI」组：圆角 / 控件间距 / 控件高度 / 界面字号 合并为一个分组。
+    /// 拖动只更新预览（用 `pending_ui` 的临时值绘制），点「应用」才整组生效并落盘。
+    fn ui_ui_tokens(&mut self, ui: &mut egui::Ui) {
+        let mut p = self.pending_ui.unwrap_or(UiTokens {
+            round_corners: self.cfg.round_corners,
+            window_round_corners: self.cfg.window_round_corners,
+            corner_scale: self.cfg.corner_scale,
+            window_corner_scale: self.cfg.window_corner_scale,
+            item_spacing: self.cfg.ui_item_spacing,
+            ctl_h: self.cfg.ui_ctl_h,
+            font_scale: self.cfg.ui_font_scale,
+        });
+        ui.checkbox(&mut p.round_corners, "启用控件圆角");
+        ui.checkbox(&mut p.window_round_corners, "启用窗口圆角");
+        if p.round_corners {
+            ui.horizontal(|ui| {
+                ui.label("控件圆角幅度:");
+                ui.add(egui::Slider::new(&mut p.corner_scale, 0.0..=3.0).fixed_decimals(1));
+            });
+        }
+        if p.window_round_corners {
+            ui.horizontal(|ui| {
+                ui.label("窗口圆角幅度:");
+                ui.add(egui::Slider::new(&mut p.window_corner_scale, 0.0..=3.0).fixed_decimals(1));
+            });
+        }
+        ui.horizontal(|ui| {
+            ui.label("控件间距:");
+            ui.add(
+                egui::Slider::new(&mut p.item_spacing, 4.0..=16.0)
+                    .fixed_decimals(1)
+                    .suffix(" px"),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("控件高度:");
+            ui.add(
+                egui::Slider::new(&mut p.ctl_h, 18.0..=34.0)
+                    .fixed_decimals(1)
+                    .suffix(" px"),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("界面字号:");
+            ui.add(
+                egui::Slider::new(&mut p.font_scale, 11.0..=20.0)
+                    .fixed_decimals(1)
+                    .suffix(" px"),
+            );
+        });
+        // 预览栏：完全按 pending 值绘制，改值只影响这里
+        ui.add_space(4.0);
+        ui.label(RichText::new("预览").weak().small());
+        egui::Frame::none()
+            .fill(self.theme_cur.widget_bg)
+            .stroke(egui::Stroke::new(1.0, self.theme_cur.stroke))
+            .rounding(egui::Rounding::same(
+                if p.round_corners { 12.0 * p.corner_scale } else { 0.0 },
+            ))
+            .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+            .show(ui, |ui| {
+                ui.set_min_width(280.0);
+                ui.spacing_mut().item_spacing.x = p.item_spacing;
+                let k = p.font_scale / 14.0;
+                ui.add_sized(
+                    [96.0, p.ctl_h],
+                    egui::Button::new(RichText::new("按钮示例").size(theme::scaled_font(14.0 * k, 14.0))),
+                );
+                ui.add_sized(
+                    [160.0, p.ctl_h],
+                    egui::TextEdit::singleline(&mut String::new()).hint_text("输入框示例"),
+                );
+                ui.label(
+                    RichText::new("正文示例：改值只更新预览，点「应用」才整体生效")
+                        .size(theme::scaled_font(14.0 * k, 14.0)),
+                );
+            });
+        ui.horizontal(|ui| {
+            if ui.button("应用").clicked() {
+                self.cfg.round_corners = p.round_corners;
+                self.cfg.window_round_corners = p.window_round_corners;
+                self.cfg.corner_scale = p.corner_scale.clamp(0.0, 3.0);
+                self.cfg.window_corner_scale = p.window_corner_scale.clamp(0.0, 3.0);
+                self.cfg.ui_item_spacing = p.item_spacing.clamp(4.0, 16.0);
+                self.cfg.ui_ctl_h = p.ctl_h.clamp(18.0, 34.0);
+                self.cfg.ui_font_scale = p.font_scale.clamp(11.0, 20.0);
+                self.pending_font_scale = self.cfg.ui_font_scale;
+                self.save_config();
+                self.set_toast("界面参数已应用".to_string());
+            }
+            if ui.button("重置").clicked() {
+                p = UiTokens {
+                    round_corners: true,
+                    window_round_corners: true,
+                    corner_scale: 1.0,
+                    window_corner_scale: 1.0,
+                    item_spacing: 8.0,
+                    ctl_h: 18.0,
+                    font_scale: 14.0,
+                };
+            }
+        });
+        self.pending_ui = Some(p);
+    }
+
     fn ui_theme_settings(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.label(RichText::new("主题").strong());
@@ -22025,48 +22651,7 @@ impl App {
             });
             ui.label(RichText::new("配色修改实时生效并自动保存。").weak());
         }
-        // 界面字号：位于自定义配色下方（已从主题模式与配色之间移至此）
-        ui.label("界面字号:");
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                // 拖动只改待应用值，点「应用」才真正生效并落盘（避免实时缩放）。
-                ui.add(
-                    egui::Slider::new(&mut self.pending_font_scale, 11.0..=20.0)
-                        .fixed_decimals(1)
-                        .show_value(true),
-                );
-                ui.horizontal(|ui| {
-                    if ui.button("应用").clicked() {
-                        self.cfg.ui_font_scale = self.pending_font_scale.clamp(11.0, 20.0);
-                        self.save_config();
-                    }
-                    if ui.button("重置").clicked() {
-                        self.pending_font_scale = 14.0;
-                        self.cfg.ui_font_scale = 14.0;
-                        self.save_config();
-                    }
-                    ui.label(
-                        RichText::new("预览按当前滑杆值实时绘制")
-                            .weak()
-                            .small(),
-                    );
-                });
-            });
-            // 实时字号预览：直接按滑杆比例绘制，方便判断多大字号合适。
-            // 预览区的字号 = 基准字号 × 滑杆/默认，与真实界面同一换算（theme::scaled_font）。
-            let k = self.pending_font_scale.clamp(11.0, 20.0) / 14.0;
-            egui::Frame::none()
-                .fill(self.theme_cur.widget_bg)
-                .stroke(egui::Stroke::new(1.0, self.theme_cur.stroke))
-                .rounding(6.0)
-                .inner_margin(egui::Margin::symmetric(10.0, 8.0))
-                .show(ui, |ui| {
-                    ui.set_min_width(220.0);
-                    let base = 14.0 * k;
-                    ui.label(RichText::new("正文示例").size(theme::scaled_font(base, 14.0)));
-                });
-        });
-        ui.separator();
+        // 界面字号 / 圆角 / 间距 / 控件高度已合并到「UI」组（见 ui_ui_tokens）
         ui.label(RichText::new("背景图").strong());
         ui.horizontal(|ui| {
             if ui.button("选择背景图片...").clicked() {
@@ -22099,62 +22684,6 @@ impl App {
             ui.label(RichText::new("背景图仅显示在内容区；「编辑背景」可预览调整，ESC 退出。").weak());
         }
         ui.separator();
-        ui.label(RichText::new("圆角").strong());
-        if ui
-            .checkbox(&mut self.cfg.round_corners, "启用控件圆角")
-            .changed()
-        {
-            self.save_config();
-        }
-        if ui
-            .checkbox(&mut self.cfg.window_round_corners, "启用窗口圆角")
-            .changed()
-        {
-            self.save_config();
-        }
-        if self.cfg.round_corners {
-            ui.horizontal(|ui| {
-                ui.label("控件圆角幅度:");
-                if ui
-                    .add(egui::Slider::new(&mut self.cfg.corner_scale, 0.0..=3.0).fixed_decimals(1))
-                    .changed()
-                {
-                    self.save_config();
-                }
-            });
-        }
-        if self.cfg.window_round_corners {
-            ui.horizontal(|ui| {
-                ui.label("窗口圆角幅度:");
-                if ui
-                    .add(egui::Slider::new(&mut self.cfg.window_corner_scale, 0.0..=3.0).fixed_decimals(1))
-                    .changed()
-                {
-                    self.save_config();
-                }
-            });
-        }
-        // 全局间距与控件高度（与上面的圆角、字号同属"界面"统一令牌）
-        ui.horizontal(|ui| {
-            ui.label("控件间距:");
-            if ui
-                .add(egui::Slider::new(&mut self.cfg.ui_item_spacing, 4.0..=16.0).fixed_decimals(1).suffix(" px"))
-                .changed()
-            {
-                self.save_config();
-            }
-            ui.label(RichText::new("工具条与卡片内控件之间的横向间距").weak().small());
-        });
-        ui.horizontal(|ui| {
-            ui.label("控件高度:");
-            if ui
-                .add(egui::Slider::new(&mut self.cfg.ui_ctl_h, 18.0..=34.0).fixed_decimals(1).suffix(" px"))
-                .changed()
-            {
-                self.save_config();
-            }
-            ui.label(RichText::new("按钮与输入框的统一高度（工具条上两者同高）").weak().small());
-        });
         ui.label(RichText::new(HINT_SHORTCUT_SHOT).weak().small());
         // F1：窗口位置/大小记忆的重置入口。
         // 记忆功能一旦把「巨大尺寸」写进配置，用户需要一条明确的退路
@@ -22251,6 +22780,20 @@ impl App {
                         ui.add_space(4.0);
                         ui.label(RichText::new("设置").strong());
                         ui.separator();
+                        // 搜索框放在分区列表里：它搜的就是下面这些分区，命中后中央区会列出匹配分区
+                        ui.horizontal(|ui| {
+                            let r = ui.add(
+                                TextEdit::singleline(&mut self.settings_search)
+                                    .hint_text("搜索设置项")
+                                    .desired_width(f32::INFINITY),
+                            );
+                            let _ = r;
+                            if !self.settings_search.is_empty() && ui.small_button("清除").clicked()
+                            {
+                                self.settings_search.clear();
+                            }
+                        });
+                        ui.add_space(2.0);
                         // ★ 条目数量与 `SettingsSide` 变体绑定：增删分区要同时改这里、
                         // 下面的搜索关键字数组与 `match self.settings_side` 的分支。
                         let items: [(&str, SettingsSide, &str); 5] = [
@@ -22290,23 +22833,11 @@ impl App {
             );
             _inner.set_width(_w);
             let ui = &mut _inner;
-            // 统一工具条：左侧关键字搜索（命中会提示跳转分组），右侧保存配置
-            let mut settings_q = self.settings_search.clone();
-            let mut tb_clear = false;
+            // 工具条只留标题与保存：搜索框已移到左侧分区导航里（搜的就是那些分区，
+            // 见 settings_side；"搜什么就放在被搜索对象旁边"，不再用顶栏搜索）。
             let mut tb_save = false;
             page_toolbar(ui, "⚙ 设置").show(
-                |tbf| {
-                    tbf.label("🔍");
-                    tbf.add(
-                        TextEdit::singleline(&mut settings_q)
-                            .frame(false)
-                            .hint_text("搜索设置项，如 JVM / 通知 / 主题")
-                            .desired_width(260.0),
-                    );
-                    if !settings_q.is_empty() && tbf.small_button("清除").clicked() {
-                        tb_clear = true;
-                    }
-                },
+                |_tbf| {},
                 |tba| {
                     if tba
                         .add_sized([110.0, ui_ctl_h()], egui::Button::new("💾 保存配置"))
@@ -22317,10 +22848,6 @@ impl App {
                     }
                 },
             );
-            if tb_clear {
-                settings_q.clear();
-            }
-            self.settings_search = settings_q.clone();
             if tb_save {
                 self.save_config();
                 self.set_toast("设置已保存".to_string());
@@ -22628,121 +23155,95 @@ impl App {
                             let sections = Self::setting_section(ctx, ui, sections, "ui", "界面", None, true, use_anim, self.cfg.anim_speed, |ui| {
                                 ui.label("语言:");
                                 ui.horizontal(|ui| {
+                                    // 仅中文（英文界面未实现，选项禁用）
                                     ui.radio_value(&mut self.cfg.lang, "zh".to_string(), "中文");
-                                    ui.radio_value(&mut self.cfg.lang, "en".to_string(), "English");
+                                    ui.add_enabled(
+                                        false,
+                                        egui::RadioButton::new(self.cfg.lang == "en", "English"),
+                                    )
+                                    .on_disabled_hover_text("英文界面尚未实现");
                                 });
                                 ui.checkbox(&mut self.cfg.ui_animations, "启用切换动效（导航页签 / 折叠 / 按钮过渡）");
-                                // 说明：原先此处另有一个「设置页内平滑动画」开关，已并入上面的总开关
-                                // （反馈：两个开关语义重复且设置页看起来"没有动效"）。
                                 ui.label(RichText::new("关闭后过渡立即完成，后台刷新率降到最低").weak().small());
                                 ui.label("平滑动画速度:");
+                                // 旧配置里的值（1.0 及以下）收敛到新预设下限，避免滑块停在档位之外
+                                if self.cfg.anim_speed < ANIM_SPEED_PRESET[0] {
+                                    self.cfg.anim_speed = ANIM_SPEED_PRESET[0];
+                                    self.save_config();
+                                }
+                                let presets: [(&str, f32); 6] = [
+                                    ("预设 1（原默认）", ANIM_SPEED_PRESET[0]),
+                                    ("预设 2", ANIM_SPEED_PRESET[1]),
+                                    ("预设 3", ANIM_SPEED_PRESET[2]),
+                                    ("预设 4", ANIM_SPEED_PRESET[3]),
+                                    ("预设 5", ANIM_SPEED_PRESET[4]),
+                                    ("预设 6", ANIM_SPEED_PRESET[5]),
+                                ];
                                 ui.horizontal(|ui| {
-                                    ui.add(egui::Slider::new(&mut self.cfg.anim_speed, 0.1..=2.0).logarithmic(true).fixed_decimals(2).show_value(true));
-                                    if ui.button("重置").clicked() {
-                                        self.cfg.anim_speed = 1.0;
+                                    for (label, v) in presets {
+                                        if ui
+                                            .selectable_label(
+                                                (self.cfg.anim_speed - v).abs() < 0.01,
+                                                label,
+                                            )
+                                            .clicked()
+                                        {
+                                            self.cfg.anim_speed = v;
+                                            self.save_config();
+                                        }
                                     }
                                 });
-                                ui.label(RichText::new("数值越大展开/折叠越快，越小越平滑；关闭动效时此项不生效").weak().small());
-                                // Stage 6：主题系统 UI（模式/预设/自定义/背景图/圆角）
+                                // 非线性滑块：横轴位置按预设序号均分（1..6），因此数值越大档位跨度越大。
+                                // 原先是 0.1..=2.0 均分，低档挤在一起、高档变化不明显，观感反直觉。
+                                ui.horizontal(|ui| {
+                                    let mut pos = anim_speed_to_preset_pos(self.cfg.anim_speed);
+                                    if ui
+                                        .add(
+                                            egui::Slider::new(&mut pos, 1.0..=6.0)
+                                                .fixed_decimals(2)
+                                                .show_value(false),
+                                        )
+                                        .changed()
+                                    {
+                                        self.cfg.anim_speed = anim_speed_from_preset_pos(pos);
+                                        self.save_config();
+                                    }
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{:.2}（预设 {}）",
+                                            self.cfg.anim_speed,
+                                            (pos.round() as i32).clamp(1, 6)
+                                        ))
+                                        .weak()
+                                        .small(),
+                                    );
+                                    if ui.button("重置").clicked() {
+                                        self.cfg.anim_speed = ANIM_SPEED_PRESET[0];
+                                        self.save_config();
+                                    }
+                                });
+                                ui.label(RichText::new("越往右越快、越往左越平滑；关闭动效时此项不生效").weak().small());
+                            });
+                            self.settings_sections = sections;
+
+                            // Stage 6：主题系统 UI（模式/预设/自定义/背景图）
+                            let sections = std::mem::take(&mut self.settings_sections);
+                            let sections = Self::setting_section(ctx, ui, sections, "theme", "主题", None, true, use_anim, self.cfg.anim_speed, |ui| {
                                 self.ui_theme_settings(ui);
                             });
                             self.settings_sections = sections;
 
-                            // 翻译术语表（模组简介 / 更新日志翻译时优先采用用户译法）
+                            // 「UI」组：圆角 / 控件间距 / 控件高度 / 字号 合并为一组，带预览；
+                            // 改动只更新预览，点「应用」才整体生效并落盘。
                             let sections = std::mem::take(&mut self.settings_sections);
-                            // 高级（审计表 §4）：长词条列表，默认展开会把界面拉得很长
-                            let sections = Self::setting_section(ctx, ui, sections, "glossary", "翻译术语", Some("模组简介与更新日志翻译时按你的译法处理（长词优先匹配）"), false, use_anim, self.cfg.anim_speed, |ui| {
-                                // 导入 / 导出 / 搜索
-                                ui.horizontal(|ui| {
-                                    if ui.button("📥 导入…").on_hover_text("从 JSON 文件导入词条（追加合并）").clicked() {
-                                        if let Some(p) = rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file() {
-                                            if let Ok(s) = std::fs::read_to_string(&p) {
-                                                match serde_json::from_str::<Vec<(String, String)>>(&s) {
-                                                    Ok(v) => {
-                                                        let mut add = 0;
-                                                        for (a, b) in v {
-                                                            if !a.trim().is_empty() && !self.cfg.translate_glossary.iter().any(|(x, _)| x == &a) {
-                                                                self.cfg.translate_glossary.push((a, b));
-                                                                add += 1;
-                                                            }
-                                                        }
-                                                        self.save_config();
-                                                        self.set_toast(format!("已导入 {add} 条词条"));
-                                                    }
-                                                    Err(e) => self.set_toast(format!("导入失败：JSON 应为 [[\"原文\",\"译法\"], …]（{e}）")),
-                                                }
-                                            }
-                                        }
-                                    }
-                                    if ui.button("📤 导出…").clicked() {
-                                        if let Some(p) = rfd::FileDialog::new().set_file_name("xmst_glossary.json").save_file() {
-                                            match serde_json::to_string_pretty(&self.cfg.translate_glossary) {
-                                                Ok(s) => match std::fs::write(&p, s) {
-                                                    Ok(_) => self.set_toast(format!("已导出到 {}", p.display())),
-                                                    Err(e) => self.set_toast(format!("导出失败：{e}")),
-                                                },
-                                                Err(e) => self.set_toast(format!("序列化失败：{e}")),
-                                            }
-                                        }
-                                    }
-                                    ui.label("搜索");
-                                    ui.add(egui::TextEdit::singleline(&mut self.glossary_query).hint_text("筛选词条…").desired_width(160.0));
-                                });
-                                let mut remove: Option<usize> = None;
-                                let mut edited = false;
-                                let n = self.cfg.translate_glossary.len();
-                                let q = self.glossary_query.trim().to_lowercase();
-                                for i in 0..n {
-                                    if !q.is_empty() {
-                                        let (a, b) = &self.cfg.translate_glossary[i];
-                                        if !a.to_lowercase().contains(&q) && !b.to_lowercase().contains(&q) {
-                                            continue;
-                                        }
-                                    }
-                                    ui.horizontal(|ui| {
-                                        let (mut a, mut b) = self.cfg.translate_glossary[i].clone();
-                                        let ra = ui.add(
-                                            egui::TextEdit::singleline(&mut a)
-                                                .hint_text(egui::RichText::new("原文，如 Create").color(self.theme_cur.weak.gamma_multiply(0.55)))
-                                                .desired_width(200.0),
-                                        );
-                                        ui.label("→");
-                                        let rb = ui.add(
-                                            egui::TextEdit::singleline(&mut b)
-                                                .hint_text(egui::RichText::new("译法，如 机械动力").color(self.theme_cur.weak.gamma_multiply(0.55)))
-                                                .desired_width(200.0),
-                                        );
-                                        if ui.button("🗑").on_hover_text("删除该词条").clicked() {
-                                            remove = Some(i);
-                                        }
-                                        if ra.changed() || rb.changed() {
-                                            self.cfg.translate_glossary[i] = (a, b);
-                                            edited = true;
-                                        }
-                                    });
-                                }
-                                if let Some(i) = remove {
-                                    self.cfg.translate_glossary.remove(i);
-                                    edited = true;
-                                }
-                                ui.horizontal(|ui| {
-                                    if ui.button("➕ 添加词条").clicked() {
-                                        self.cfg.translate_glossary
-                                            .push((String::new(), String::new()));
-                                        edited = true;
-                                    }
-                                    if !self.cfg.translate_glossary.is_empty()
-                                        && ui.button("清空").clicked()
-                                    {
-                                        self.cfg.translate_glossary.clear();
-                                        edited = true;
-                                    }
-                                });
-                                if edited {
-                                    self.save_config();
-                                }
+                            let sections = Self::setting_section(ctx, ui, sections, "ui_tokens", "UI", Some("圆角 / 间距 / 高度 / 字号（带预览，点应用生效）"), false, use_anim, self.cfg.anim_speed, |ui| {
+                                self.ui_ui_tokens(ui);
                             });
                             self.settings_sections = sections;
+                        }
+                        SettingsSide::Java => {
+                            let sections = std::mem::take(&mut self.settings_sections);
+                            
                         }
                         SettingsSide::Java => {
                             let sections = std::mem::take(&mut self.settings_sections);
@@ -26223,32 +26724,9 @@ impl App {
                 let mut tb_refresh = false;
                 page_toolbar(ui, "📋 日志").show(
                     |tbf| {
-                        tbf.label("🔍");
-                        tbf.add(
-                            egui::TextEdit::singleline(&mut query)
-                                .hint_text("搜索关键字（消息或类别）")
-                                .desired_width(200.0),
+                        tbf.label(
+                            RichText::new("工具自身运行事件").weak().small(),
                         );
-                        tbf.label("级别");
-                        egui::ComboBox::from_id_salt("tool_log_level")
-                            .selected_text(level.clone())
-                            .width(80.0)
-                            .show_ui(tbf, |ui| {
-                                for l in ["全部", "信息", "警告", "错误"] {
-                                    ui.selectable_value(&mut level, l.to_string(), l);
-                                }
-                            });
-                        tbf.label("类别");
-                        egui::ComboBox::from_id_salt("tool_log_cat")
-                            .selected_text(cat.clone())
-                            .width(110.0)
-                            .show_ui(tbf, |ui| {
-                                ui.selectable_value(&mut cat, "全部".to_string(), "全部");
-                                for c in &cats {
-                                    ui.selectable_value(&mut cat, c.clone(), c);
-                                }
-                            });
-                        tbf.checkbox(&mut follow, "自动跟随最新");
                     },
                     |tba| {
                         if tba
@@ -26260,7 +26738,7 @@ impl App {
                         }
                         if tba
                             .add_sized([92.0, ui_ctl_h()], egui::Button::new("🗑 清空"))
-                            .on_hover_text("清空本页显示缓冲（会先弹出二次确认；不删除 data\\tool.log 文件）")
+                            .on_hover_text("清空本页显示缓冲；不删除 data\\tool.log 文件")
                             .clicked()
                         {
                             ask_clear_view = true;
@@ -26312,8 +26790,41 @@ impl App {
                     }
                 });
                 ui.add_space(6.0);
-                // ---- 过滤栏已收进页面顶部工具条 ----
-                // ---- 列表（等宽、级别着色、长消息截断 + hover 看全文、点击复制）----                // 底部留白同其它页（CONTENT_EDGE_PAD），并按下方设置行的高度扣减，避免最后一行被裁
+                // ---- 过滤栏（搜索 / 级别 / 类别 / 跟随）贴着它作用的列表 ----
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("🔍");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut query)
+                            .hint_text("搜索关键字（消息或类别）")
+                            .desired_width(220.0),
+                    );
+                    if !query.is_empty() && ui.small_button("清除").clicked() {
+                        query.clear();
+                    }
+                    ui.label("级别");
+                    egui::ComboBox::from_id_salt("tool_log_level")
+                        .selected_text(level.clone())
+                        .width(80.0)
+                        .show_ui(ui, |ui| {
+                            for l in ["全部", "信息", "警告", "错误"] {
+                                ui.selectable_value(&mut level, l.to_string(), l);
+                            }
+                        });
+                    ui.label("类别");
+                    egui::ComboBox::from_id_salt("tool_log_cat")
+                        .selected_text(cat.clone())
+                        .width(110.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut cat, "全部".to_string(), "全部");
+                            for c in &cats {
+                                ui.selectable_value(&mut cat, c.clone(), c);
+                            }
+                        });
+                    ui.checkbox(&mut follow, "自动跟随最新");
+                });
+                ui.separator();
+                // ---- 列表（等宽、级别着色、长消息截断 + hover 看全文、点击复制）----
+                // 底部留白同其它页（CONTENT_EDGE_PAD），并按下方设置行的高度扣减，避免最后一行被裁
                 let logs_max_h = (ui.available_height() - 40.0 - CONTENT_EDGE_PAD).max(80.0);
                 let show_cap = max_show.clamp(100, toollog::RING_CAP).min(rows.len());
                 if rows.is_empty() {
@@ -31268,6 +31779,59 @@ mod encoding_selfcheck {
             java_path_for_run_bat(&out.display().to_string(), &d),
             out.display().to_string()
         );
+    }
+
+    #[test]
+    fn child_path_env_gets_java_dir_prepended() {
+        // 服务器目录里的 java.exe：解析出的路径真实存在 → 它的目录被前置进子进程 PATH
+        let d = tmp_dir("pathinject");
+        let bin = d.join("Java21").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join("java.exe");
+        std::fs::write(&exe, b"stub").unwrap();
+        let cfg = GlobalConfig::default();
+        let mut sc = ServerConfig::default();
+        sc.dir = d.clone();
+        sc.java_path = Some(exe.display().to_string());
+        let mut envs: Vec<(String, String)> = vec![("TEMP".to_string(), "X".to_string())];
+        let injected =
+            inject_java_dir_into_child_path(&mut envs, &cfg, &sc, None).expect("应注入 PATH");
+        assert_eq!(injected, bin.display().to_string());
+        assert!(envs.iter().any(|(k, v)| k == "TEMP" && v == "X"), "TEMP 不能被顶掉");
+        let paths: Vec<&(String, String)> = envs
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+            .collect();
+        assert_eq!(paths.len(), 1, "PATH 只能有一项");
+        assert!(
+            paths[0].1.starts_with(&format!("{};", bin.display())),
+            "PATH 前面必须是 java 目录：{}",
+            paths[0].1
+        );
+
+        // 解析结果只是裸名 java、又没有 JAVA_HOME → 不动 envs（子进程 PATH 保持原样）
+        let mut sc2 = ServerConfig::default();
+        sc2.dir = tmp_dir("pathinject_none");
+        sc2.java_path = Some("java".to_string());
+        let mut envs2: Vec<(String, String)> = vec![("TEMP".to_string(), "Y".to_string())];
+        assert!(inject_java_dir_into_child_path(&mut envs2, &cfg, &sc2, None).is_none());
+        assert_eq!(envs2.len(), 1);
+
+        // 裸名 java + JAVA_HOME 兜底 → 用 JAVA_HOME\bin\java.exe 的目录
+        // （JAVA_HOME 指向 JDK 根目录，与机器上的 E:\...\JDK\OpenJDK21 一致）
+        let java_home = d.join("Java21");
+        let mut envs3: Vec<(String, String)> = Vec::new();
+        let injected3 = inject_java_dir_into_child_path(
+            &mut envs3,
+            &cfg,
+            &sc2,
+            Some(&java_home.display().to_string()),
+        )
+        .expect("JAVA_HOME 兜底应注入");
+        assert_eq!(injected3, bin.display().to_string());
+        assert!(is_bare_java_name("java") && is_bare_java_name("javaw"));
+        assert!(!is_bare_java_name(".\\Java21\\bin\\java.exe"));
+        assert!(!is_bare_java_name("E:\\JDK\\bin\\java.exe"));
     }
 
     #[test]

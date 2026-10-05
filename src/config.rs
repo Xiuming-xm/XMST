@@ -196,7 +196,8 @@ fn default_ui_settings_anim() -> bool {
 }
 
 fn default_anim_speed() -> f32 {
-    1.0
+    // 预设 1（原默认档）：界面把 1..6 档映射到 2.0..6.0，默认取第一档
+    2.0
 }
 
 fn default_theme_mode() -> String {
@@ -325,7 +326,7 @@ impl Default for GlobalConfig {
             frp_token: String::new(),
             ui_animations: true,
             ui_settings_anim: false,
-            anim_speed: 1.0,
+            anim_speed: 2.0,
             theme_mode: "dark".to_string(),
             theme_preset: "default".to_string(),
             ui_font_scale: 14.0,

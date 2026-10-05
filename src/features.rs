@@ -113,6 +113,8 @@ pub const BETA_REMOTE_BACKUP: &str = "beta.server.remote_backup"; // 备份远�
 pub const BETA_SPECIAL: &str = "beta.server.special"; // 特殊功能（Spark 分析）总开关【2026-10-02 移回测试功能，默认禁用】
 pub const FEATURE_SPARK: &str = "server.special.spark"; // Spark 分析子开关【随总开关 BETA_SPECIAL 显示】
 pub const BETA_MOD_UPDATE: &str = "beta.server.mod_update"; // 模组检查更新（SHA1 指纹 + modid 兜底尚未完成，默认禁用）
+/// 成就统计（保留内部统计代码，界面不展示任何成就；仅本地累计，不联网）
+pub const BETA_ACHIEVEMENTS: &str = "beta.tool.achievements";
 
 /// ===== 阶段 3 新功能 ID（默认启用，普通功能开关） =====
 
@@ -459,6 +461,15 @@ pub const REGISTRY: &[FeatureMeta] = &[
         order: 91,
     },
     FeatureMeta {
+        id: BETA_ACHIEVEMENTS,
+        name: "成就统计",
+        desc: "仅在本机累计启动/在线/备份/下载等计数（保留供后续使用），界面不展示成就，也不弹解锁通知。",
+        group: FeatureGroup::Beta,
+        default_enabled: false,
+        restart_required: false,
+        order: 95,
+    },
+    FeatureMeta {
         id: FEATURE_SPARK,
         name: "Spark 分析",
         desc: "解析 Spark 报告，定位卡顿的模组、维度与实体。",
@@ -526,6 +537,7 @@ pub fn entry_hint(id: &str) -> &'static str {
         BETA_REMOTE_BACKUP => "入口：服务器 → 自动功能 → 存储与远程（远端备份目标 / 账号 / 重试次数），快照列表里的「转存」按钮",
         BETA_SPECIAL => "入口：服务器顶部页签「特殊功能」（首次开启后需切换到该页签）",
         BETA_MOD_UPDATE => "入口：服务器 → 文件浏览 → mods 页（工具栏「🔄 检查更新」与每个模组行的「🔄 更新」）",
+        BETA_ACHIEVEMENTS => "入口：无界面入口（只在本机累计统计，界面上不展示成就）",
         BETA_DOWNLOAD => "入口：左侧导航「下载」；文件浏览 → mods 页的「⬇️ 下载模组」",
         BETA_PLAYERS => "入口：服务器顶部页签「玩家管理」（在线 / 白名单 / 封禁 / OP / 属性）",
         BETA_PLUGINS => "入口：左侧导航「插件」（插件管理页与背景效果设置）",
@@ -606,6 +618,7 @@ mod registry_selfcheck {
             BETA_REMOTE_BACKUP,
             BETA_SPECIAL,
             BETA_MOD_UPDATE,
+            BETA_ACHIEVEMENTS,
             FEATURE_SPARK,
             FEATURE_FORCE_STOP_CONFIRM,
         ] {

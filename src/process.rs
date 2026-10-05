@@ -166,12 +166,17 @@ fn truncate_chars(s: &str, max: usize) -> String {
     t
 }
 
-/// 注入环境变量列表 → `[TEMP=..; TMP=..]`（供 main.rs 在"准备"记录里复用同一格式）
+/// 注入环境变量列表 → `[TEMP=..; TMP=..]`（供 main.rs 在"准备"记录里复用同一格式）。
+/// 值过长的（如前置了 java 目录的 PATH）与 `继承环境_*` 一样按字符截断，
+/// 否则一行日志会有几 KB —— 前缀部分始终保留，正好是启动时要看的关键信息。
 pub fn env_pairs_text(envs: &[(String, String)]) -> String {
     if envs.is_empty() {
         return "[]".to_string();
     }
-    let items: Vec<String> = envs.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let items: Vec<String> = envs
+        .iter()
+        .map(|(k, v)| format!("{k}={}", truncate_chars(v, ENV_SNIPPET_CHARS)))
+        .collect();
     format!("[{}]", items.join("; "))
 }
 

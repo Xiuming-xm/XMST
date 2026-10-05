@@ -215,6 +215,12 @@ egui 的 `ui_*` 每帧执行。曾出现（已修/部分修）：
     - ★ **混合分隔符**：`SNAPSHOTS_DIR` 原为 `.mcsrv_backups/snapshots`（正斜杠），于是快照路径全是 `D:\...\.mcsrv_backups/snapshots\<时间戳>`。文件 API 能接受，**`explorer.exe` 不能** —— 解析失败后它退化成打开「文档」（`open_diag.log` 实录：目标 exists=true、`explorer.exe spawn OK`、`COM Explore Some(0)`，用户看到的却是文档）。现常量统一反斜杠，`abs_path` 再做一次分隔符归一（兜用户手填的 `/`）。
     - ★ **按钮被挤出可视区**：备份列表每行"长详情 + 5 个按钮"排在同一 `ui.horizontal`，超过 1100px 内容宽度（`page_center_1100`）后按钮画在可视区外 → 表现就是"删除/解锁点了没反应"。现拆两行：信息行用 `horizontal_wrapped`，按钮独占一行。手动删除补了工具日志（成功/失败各一条），便于下次定位。
     - 另有 `backup.rs` 新增 2 个回归测试（`ui_flow_probe`：`delete_backup` 接列表给出的路径、`pin→is_pinned→unpin` 闭环）——两条后端链路实测都是好的，所以上述"删不掉/解不开"根因在 UI 层。
+34. **界面重排 + 设置改造**（2026-10-05 第二批，用户 10 条清单）：概览拆成「快捷方式 + 服务器信息 + 折叠的排障组」（启停移出）；控制台把 `启动/停止/强制结束` 置顶、「服务器状态（CPU/内存采样）」改折叠分组、删 TPS/MSPT 占位；成就卡片与通知从界面移除、成就系统挂到 `features::BETA_ACHIEVEMENTS`（默认关，打开也只累计不展示）；服务器设置把 `run.bat`/启动方式/JVM 参数/`user_jvm_args.txt` 归入「🚀 启动参数」，run.bat 缺失时才给生成/导入，`user_jvm_args.txt` 仅在存在时显示，**改 JVM 参数会同步写进 run.bat**（`jvm_synced`）；Java 选择＝run.bat 里的路径优先 → 按 MC 版本自动匹配（1.20.5–1.21.11→21 / 1.17–1.20.4→17 / ≤1.16.5→8 / 26.1+→25）→ 全局兜底，选定后**覆盖写回 run.bat 的 `JAVA_PATH`**；设置-界面把 圆角/间距/高度/字号 合成「UI」组（拖动只预览、点「应用」才生效），英文选项禁用，动画速度改 6 档预设（**预设 1 = 旧的默认 2.0**，滑块非线性）；工具内通知统一 右侧滑入→停留→右侧滑出；取消"顶栏搜索"（设置搜索移进左侧分区导航、日志过滤贴着列表、下载页重复搜索框删除）；删除解释工具内部机制的补充文案。
+35. **"XMST 拉起 run.bat 必失败"取证结论**（2026-10-05，`dist\data\launch.log` 实录 + 复现实验）：
+    - 事实链：`cmd /c run.bat` **确实跑起来了**（stdout 首行是 bat 自己的 `====` 横幅，说明 `where java` 检查已通过）→ ~3 秒后 cmd 自己 `退出码=1`、**stderr 空**、`logs\latest.log` 大小/mtime **无变化**（说明 java 从未走到日志初始化）→ auto 模式下的回退没生效，因为当时解析出的直连 java 不存在（`<服务器目录>\java\bin\java.exe`）。
+    - 交叉验证：同一台机器上 `where java`（`E:\Games\Minecraft\Library\JDK\OpenJDK21`）、`java -version`、以及模板那行 `call "java" %JVM_ARGS% -version`（含 `"-Djava.io.tmpdir=…"` 引号写法）**在带控制台时全部成功**（含 `-Xms1G -Xmx15G -XX:+UseG1GC`）。
+    - 因此剩余差异只剩**工具的启动形态**：`CREATE_NO_WINDOW` + stdin/stdout/stderr 全管道。java 静默退出、无 stderr、无 latest.log，指向"无控制台句柄下 java/MC 侧提前结束"，而不是 bat 写法或 PATH 问题。
+    - **下一步（已内置工具）**：用「🧪 启动诊断」一次跑 4 组（① 生产组合 ② 去掉 Job ③ 去掉 CREATE_NO_WINDOW ④ 绕过 cmd/bat 直接 java），结果写 `data\launch.log`；哪一组能出 `Done` 就是根因所在。本轮已先由"新的 Java 解析/自动匹配 + 直连 java 回退"兜底：`JAVA_PATH=java` 这种裸写法不再解析失败，run.bat 失败后能自动改用直连 java 把服务器拉起来。
 
 ### 6.2 仍待办（按建议优先级）
 
