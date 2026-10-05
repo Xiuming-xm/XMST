@@ -166,6 +166,7 @@ egui 的 `ui_*` 每帧执行。曾出现（已修/部分修）：
 | `XMST_CRASHSCAN=<服务器目录>` | 同上 | 只跑崩溃分析并打印结论后退出 |
 | `XMST_SHOT=<x.bmp>`（+`XMST_SHOT_EXIT`） | 同上 | 截图到文件后退出（自动化取 UI 快照） |
 | `XMST_OPEN_PAGE=<页面> [帧数]` | 设环境变量后启动 exe（页面名：`dashboard`/`servers`/`tunnel`/`logs`/`settings`/`download`/`plugins`/`tools`，另有服务器页签别名 `files`/`console`/`backup`/`players`/`special`） | **无头复现 / 回归**：切到指定页面渲染 N 帧后自动退出；门控未开启或配置里没有服务器时，stderr 会打印「页签会回落到概览」等提示。★ 自动化入口（本变量与 `XMST_SHOT`/`XMST_OPEN_TEST`/`XMST_CRASHSCAN`）**不参与单实例检查**，程序已在运行时也照常跑 |
+| `XMST_FLICKER_DIAG=1` | 设环境变量后启动 exe（普通窗口，不切换页面） | **闪屏 / 卡顿诊断**：逐帧写 `<exe 目录>\data\flicker.log`（`frame=` / `theme_diff=` / `ppp=` / `screen=`），并对"整窗重绘类动作"打 `★` 行：`setWindowRgn` / `setPixelsPerPoint` / `setStyle`。★ 行密集 = 就是它们在闪（见 §6.1 第 38 条）；该变量同样跳过单实例检查 |
 | `tools\run_with_capture.ps1` | 启动 exe 并把 **stderr** 重定向到文件 | 抓"闪退且无日志"的最后输出（栈溢出/`panic` 前的 stderr，见 §9.2） |
 | 应用内 `F12` | 运行中按键 | 截图 |
 | `diag/data/bg_debug.log` | 运行时自动写 | 材质：`captures=`、`tex=WxH`、`cap_ms=`、`opacity=`、`accent_ok=`、`ppp=` |
@@ -228,6 +229,16 @@ egui 的 `ui_*` 每帧执行。曾出现（已修/部分修）：
     - ③ 修 **「设置 → Java」整页空白**：`match self.settings_side` 里出现**重复的 `SettingsSide::Java` 分支**，第一个空分支让真正的 `java_jvm` / `java_list` 分组成为不可达代码（编译期只有 warning，界面上一片空白）。**合并/大改之后务必用 `cargo check` 的 `unreachable pattern` 警告自查一遍。**
     - ④ 成就统计的**启动初始化与退出落盘**也挂到 `BETA_ACHIEVEMENTS`（关闭时连 `stats.json` 都不创建、不写「成就」日志）。
     - ⑤ 再清一批机制解释文案：`已锁定为独立归档（不再随源文件变化）…`、`已转存快照 X（本次复制 Y）`、`正在后台清理超出保留策略的快照…`、`快照已开始在后台生成（完成后提示）`、`关闭后过渡立即完成，后台刷新率降到最低`、Java/JVM 与 Java 列表两个分组的机制 hint、`服务器控制台日志在 服务器 → 控制台；穿透日志在…`、`（暂存 Java 条目）`。
+38. **★ 界面闪屏（2026-10-05 第三批，用 `XMST_FLICKER_DIAG` 逐帧诊断定位）**：诊断入口见 §5。实测（2560×1440 / 系统缩放 125%）：
+    - ★ **启动时 DPI 拉扯**：`App::new` 里 `base_ppp = ctx.pixels_per_point()` 拿到的是 egui 当时的默认值，而 **eframe 会在启动头几帧陆续送来系统原生缩放** → 程序把 125% 显示器强行按 100% 渲染：`pixels_per_point` 1.25 → 1.0、客户区 2048×1152 → 2560×1440，`SetWindowRgn` + 字体/布局整体重算各来一次 ⇒ **肉眼就是"启动闪一下"**（顺带界面比系统缩放小 20%）。修法：基线改成**系统原生缩放**（`viewport().native_pixels_per_point`），且**连续 3 帧不变**后才应用字号缩放（`ppp_stable_frames`）。修后：**0 次 setPixelsPerPoint**。
+    - ★ **`SetWindowRgn` 每帧重设**：该 API 会让整窗重绘一次；拖动缩放/最大化时 `w/h` 每帧都变 ⇒ 缩放全过程持续闪。修法：几何变化后**稳定 250ms** 再一次性重设（`geom_changed_at` + `request_repaint_after(260ms)` 保证空闲时也能补上圆角）。修后：启动到空闲**只有 1 次 SetWindowRgn**（改前 2 次）。
+    - `ctx.set_style` 改为只在「控件间距 / 控件高度」真的变化时调用（原先每帧克隆整个 `Style` 并替换 `Arc<Style>`）。
+    - **诊断法**：`$env:XMST_FLICKER_DIAG=1` 启动 → `data\flicker.log` 逐帧记录 `frame=/theme_diff=/ppp=/screen=`，并对三类"整窗重绘类动作"打 `★` 行；`★` 行密集 = 就是它们在闪。
+39. **Java 选择按服务端版本自动取 + run.bat 双向同步（2026-10-05 第三批）**：
+    - MC 版本在「服务器 → 设置 → Java 设置」里**从服务端目录自动识别**（`serverinfo::detect_cached`，只在 `mc_version` 为空时自动写入，识别不出才回落输入框），旁边「重新识别」按钮用 1ms TTL 强制重跑一次。
+    - 「Java 来源」下拉：按服务器 MC 版本匹配的条目标注 `✓ 匹配`，自动模式下直接显示"自动（按 MC 版本用 Java 21）→ <会选中的条目>"，用户不用猜。
+    - 全局 Java 列表的「版本」从手填改成 **Java 8 / 17 / 21 / 25 下拉** + 「识别」按钮（`java_major_of_path()` 跑一次 `java -version`），名称留空时按版本自动命名。
+    - **run.bat → 工具** 反向同步：保存 run.bat 时用 `extract_bat_jvm_args()` 把 `set "JVM_ARGS=…"`（兼容 `JAVA_OPTS`）回填到本服务器「JVM 参数」。★ **引号规则必须与 `replace_bat_jvm_args` 同源**：模板的值自带引号（`"-Djava.io.tmpdir=%~dp0tmp"`），只剥 `set` 自己的那一个收尾引号。回归测试 `bat_jvm_args_extract` 覆盖"写出→读回"往返。
 
 ### 6.2 仍待办（按建议优先级）
 

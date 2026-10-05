@@ -349,6 +349,23 @@ fn find_bat_jvm_args_line(text: &str) -> Option<usize> {
     found
 }
 
+/// 从 run.bat 原文里**取出** JVM 参数值（`set "JVM_ARGS=..."` → 值部分）。
+/// 找不到该行返回 None（手写脚本不回填、不改动）。
+///
+/// ★ 与 `replace_bat_jvm_args` 同一套引号规则：`set "K=V"` 的值可能**自带引号**
+/// （模板里就有 `"‑Djava.io.tmpdir=%~dp0tmp"`），所以只剥掉 set 自己的那一个收尾引号。
+fn extract_bat_jvm_args(text: &str) -> Option<String> {
+    let idx = find_bat_jvm_args_line(text)?;
+    let line = text.lines().nth(idx)?;
+    let body = line.trim_end_matches(['\r', '\n']);
+    let eq = body.find('=')?;
+    let mut val = body[eq + 1..].trim().to_string();
+    if body.trim_start().starts_with("set \"") && val.ends_with('"') {
+        val.pop();
+    }
+    Some(val.trim().to_string())
+}
+
 /// 把 run.bat 原文里 JVM 参数那一行的值换成 `jvm`（保留 `set "` / `set` 写法与行尾风格）。
 fn replace_bat_jvm_args(text: &str, jvm: &str) -> Option<String> {
     let idx = find_bat_jvm_args_line(text)?;
@@ -2871,6 +2888,12 @@ struct App {
     bg_edit_open: bool,
     /// 界面字号基线：启动时系统 DPI 的 pixels_per_point（ui_font_scale 以此为基准缩放）
     base_ppp: f32,
+    /// 系统原生缩放已经连续多少帧没变（eframe 会在启动后的头几帧里陆续送来 DPI：
+    /// 拿到稳定值之前不动 pixels_per_point，否则会与 eframe 的 DPI 校正互相拉扯，
+    /// 每拉一次都是一次整窗重排 —— 肉眼就是"启动闪一下"）
+    ppp_stable_frames: u32,
+    /// 窗口几何最后一次变化的时间（缩放/最大化期间不动 SetWindowRgn，稳定后再一次性重设）
+    geom_changed_at: Option<std::time::Instant>,
     /// 设置页字号滑杆的待应用值：拖动不生效，点「应用」才写入 cfg
     pending_font_scale: f32,
     /// 设置页「UI」组的待应用参数（圆角 / 间距 / 高度 / 字号），点「应用」才整体生效
@@ -3783,6 +3806,8 @@ impl App {
             plugin_cfg_new_key: String::new(),
             bg_edit_open: false,
             base_ppp,
+            ppp_stable_frames: 0,
+            geom_changed_at: None,
             pending_font_scale: initial_font_scale,
             pending_ui: None,
             last_win_rgn: (0, 0, 0),
@@ -13255,7 +13280,7 @@ fn main() -> eframe::Result {
     // 自动化入口（XMST_OPEN_PAGE / XMST_SHOT / XMST_OPEN_TEST / XMST_CRASHSCAN）**不参与单实例检查**：
     // 否则程序已在运行（多数情况停在托盘里）时，诊断实例会走"唤醒已有窗口并静默 exit(0)"，
     // 表现为「exit=0 但一帧没渲染、没有 stderr、没有截图」——最坏会把无头回归误判成通过。
-    let automated = ["XMST_OPEN_PAGE", "XMST_SHOT", "XMST_OPEN_TEST", "XMST_CRASHSCAN"]
+    let automated = ["XMST_OPEN_PAGE", "XMST_SHOT", "XMST_OPEN_TEST", "XMST_CRASHSCAN", "XMST_FLICKER_DIAG"]
         .iter()
         .any(|k| std::env::var(k).is_ok());
     if !automated && !single_instance_check() {
@@ -15023,6 +15048,75 @@ const UI_TOOLBAR_MIN_H: f32 = 18.0;
 /// 渲染只读，天然与 `style.spacing.interact_size.y` 相同。
 static UI_CTL_H_PT: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new((UI_TOOLBAR_MIN_H * 100.0) as u32);
+
+// ── 闪屏/卡顿诊断（`XMST_FLICKER_DIAG=1` 时启用，结果写 `<exe 目录>\data\flicker.log`）──
+// 把"界面时不时在闪"落到可测量的动作上：逐帧记录帧号 / 主题插值残差 / ppp / 客户区尺寸，
+// 并在**整窗重绘类动作**发生时单独记一行 —— ① `SetWindowRgn`（内部整窗重绘）
+// ② `set_pixels_per_point`（字体与布局整体重算）③ `set_style`（换掉 Arc<Style>）。
+// 用法：`$env:XMST_FLICKER_DIAG=1; .\XMST.exe`，然后看 data\flicker.log 里的 `★` 行密度。
+static DIAG_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIAG_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static DIAG_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+static DIAG_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+fn flicker_diag_enabled() -> bool {
+    *DIAG_ON.get_or_init(|| std::env::var("XMST_FLICKER_DIAG").is_ok())
+}
+
+fn flicker_diag_path() -> &'static std::path::Path {
+    DIAG_PATH.get_or_init(|| {
+        let dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_default()
+            .join("data");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("flicker.log")
+    })
+}
+
+fn flicker_diag_line(msg: &str) {
+    if !flicker_diag_enabled() {
+        return;
+    }
+    let t0 = DIAG_T0.get_or_init(std::time::Instant::now);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(flicker_diag_path())
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{:>8.2}s {msg}", t0.elapsed().as_secs_f32());
+    }
+}
+
+fn flicker_diag_note(which: u8) {
+    if !flicker_diag_enabled() {
+        return;
+    }
+    flicker_diag_line(match which {
+        1 => "★ setWindowRgn（整窗重绘）",
+        2 => "★ setPixelsPerPoint",
+        _ => "★ setStyle",
+    });
+}
+
+fn flicker_diag_tick(ctx: &egui::Context, theme_diff: u8) {
+    if !flicker_diag_enabled() {
+        return;
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    let n = DIAG_FRAMES.fetch_add(1, Relaxed) + 1;
+    if n <= 240 || n % 120 == 0 {
+        let sz = ctx.screen_rect().size();
+        flicker_diag_line(&format!(
+            "frame={n} theme_diff={theme_diff} ppp={:.4} screen={:.0}x{:.0}",
+            ctx.pixels_per_point(),
+            sz.x,
+            sz.y
+        ));
+    }
+}
 
 /// 读当前全局控件高度（pt）
 #[inline]
@@ -17433,10 +17527,27 @@ impl App {
                     let _ = std::fs::create_dir_all(&dir);
                     let (enc, crlf) = (run_meta.enc, run_meta.crlf);
                     match write_text_same_encoding(&run_bat, &bat_content, enc, crlf) {
-                        Ok(_) => self.set_toast(format!(
-                            "run.bat 已保存（{}，原文件已备份为 .bak_ 时间戳）",
-                            enc.label()
-                        )),
+                        Ok(_) => {
+                            // ★ run.bat → 工具 的反向同步：脚本里写了 JVM 参数就回填到本服务器的
+                            //   「JVM 参数」，否则界面上的值与脚本实际生效的值会各说各话。
+                            let mut extra = String::new();
+                            if let Some(v) = extract_bat_jvm_args(&bat_content) {
+                                let cur = self.cfg.servers[idx]
+                                    .jvm_args
+                                    .clone()
+                                    .unwrap_or_default();
+                                if cur.trim() != v.trim() {
+                                    self.cfg.servers[idx].jvm_args = Some(v.clone());
+                                    self.save_config();
+                                    extra = "；JVM 参数已按脚本同步".to_string();
+                                }
+                                self.runtimes[idx].jvm_synced = v;
+                            }
+                            self.set_toast(format!(
+                                "run.bat 已保存（{}，原文件已备份）{extra}",
+                                enc.label()
+                            ));
+                        }
                         Err(e) => self.set_toast(format!("保存失败: {e}")),
                     }
                 }
@@ -17696,29 +17807,81 @@ impl App {
                 );
             }
         }
+        // ★ MC 版本：**从服务端目录自动识别**（如 Fabric1.21.11 → 1.21.11），不再让用户手填；
+        //   识别不出（目录里没有可判定的加载器/版本）时才退回输入框。
+        if self.cfg.servers[idx].mc_version.is_none() {
+            let detected = serverinfo::detect_cached(&sc.dir, std::time::Duration::from_secs(3))
+                .mc_version
+                .clone();
+            if detected.is_some() {
+                self.cfg.servers[idx].mc_version = detected;
+                self.save_config();
+            }
+        }
+        let mc_now = self.cfg.servers[idx].mc_version.clone().unwrap_or_default();
         ui.horizontal(|ui| {
             ui.label("MC 版本");
-            let mut ver = self.cfg.servers[idx].mc_version.clone().unwrap_or_default();
-            let resp = ui.add(
-                TextEdit::singleline(&mut ver)
-                    .hint_text("如 1.21.1")
-                    .desired_width(120.0),
-            );
-            if resp.changed() {
-                let v = ver.trim().to_string();
-                self.cfg.servers[idx].mc_version = if v.is_empty() { None } else { Some(v) };
-                self.save_config();
+            if mc_now.is_empty() {
+                let mut ver = String::new();
+                let resp = ui.add(
+                    TextEdit::singleline(&mut ver)
+                        .hint_text("未能自动识别，请填如 1.21.1")
+                        .desired_width(160.0),
+                );
+                if resp.changed() {
+                    let v = ver.trim().to_string();
+                    self.cfg.servers[idx].mc_version = if v.is_empty() { None } else { Some(v) };
+                    self.save_config();
+                }
+            } else {
+                ui.label(RichText::new(&mc_now).strong());
+                ui.label(RichText::new("（自动识别）").weak().small());
+            }
+            if ui
+                .small_button("重新识别")
+                .on_hover_text("按服务端目录里的加载器与 jar 名字重新判定版本")
+                .clicked()
+            {
+                // TTL 传 1ms ⇒ 强制重新识别一次（只在这一下点击里跑）
+                let d = serverinfo::detect_cached(&sc.dir, std::time::Duration::from_millis(1));
+                match d.mc_version.clone() {
+                    Some(v) => {
+                        self.cfg.servers[idx].mc_version = Some(v.clone());
+                        self.save_config();
+                        self.set_toast(format!("已识别为 MC {v}"));
+                    }
+                    None => self.set_toast("没能识别出版本，保留当前值".to_string()),
+                }
             }
         });
         let homes = self.cfg.java_homes.clone();
         let sel_before = self.cfg.servers[idx].java_home_id.clone();
+        // 「自动」到底会挑哪个：按服务器 MC 版本 → 全局列表里版本匹配的那一项
+        let want_major = java_major_for_mc(self.cfg.servers[idx].mc_version.as_deref());
+        let want_txt = want_major.map(|m| m.to_string());
+        let auto_label = match &want_txt {
+            Some(m) => format!("自动（按 MC 版本用 Java {m}）"),
+            None => "自动（run.bat / 全局列表 / PATH）".to_string(),
+        };
+        let auto_pick = want_txt.as_ref().and_then(|m| {
+            homes
+                .iter()
+                .find(|h| java_home_matches_major(h, m))
+                .map(|h| h.name.clone())
+        });
         let sel_text = match &sel_before {
             Some(id) => homes
                 .iter()
                 .find(|h| &h.name == id)
-                .map(|h| format!("{} ({})", h.name, h.path))
+                .map(|h| match &want_txt {
+                    Some(m) if java_home_matches_major(h, m) => format!("{} ({}) ✓", h.name, h.path),
+                    _ => format!("{} ({})", h.name, h.path),
+                })
                 .unwrap_or_else(|| format!("{id} (已删除)")),
-            None => "自动（run.bat / 按版本 / 全局）".to_string(),
+            None => match &auto_pick {
+                Some(n) => format!("{auto_label} → {n}"),
+                None => auto_label.clone(),
+            },
         };
         let mut sel_now = sel_before.clone();
         ui.horizontal(|ui| {
@@ -17726,17 +17889,20 @@ impl App {
             egui::ComboBox::from_id_salt("server_java_source")
                 .selected_text(sel_text)
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut sel_now,
-                        None,
-                        "自动（run.bat / 按版本 / 全局）",
-                    );
+                    ui.selectable_value(&mut sel_now, None, auto_label.clone());
                     for h in &homes {
-                        ui.selectable_value(
-                            &mut sel_now,
-                            Some(h.name.clone()),
-                            format!("{} ({})", h.name, h.path),
-                        );
+                        let hit = want_txt
+                            .as_ref()
+                            .map(|m| java_home_matches_major(h, m))
+                            .unwrap_or(false);
+                        let label = if hit {
+                            format!("{} [Java {}] {} ✓ 匹配", h.name, h.version, h.path)
+                        } else if h.version.trim().is_empty() {
+                            format!("{} {}", h.name, h.path)
+                        } else {
+                            format!("{} [Java {}] {}", h.name, h.version, h.path)
+                        };
+                        ui.selectable_value(&mut sel_now, Some(h.name.clone()), label);
                     }
                 });
             // 打开所选 Java 所在目录（便于核对位置）
@@ -22097,29 +22263,61 @@ impl App {
         self.win_r_points = win_r;
         self.apply_window_round_region(ctx, win_r);
         // 全局间距 / 控件高度：与圆角（theme::apply 的 corner_scale）、字号（下面的
-        // ui_font_scale）同属"界面"统一令牌，在设置 → 界面里各暴露一项；此处每帧写回，
-        // 只覆盖 spacing 的两个字段，不动主题的其它样式。
+        // ui_font_scale）同属"界面"统一令牌，在设置 → 界面里各暴露一项。
+        // ★ 只在值真的变化时 `set_style`：旧实现每帧都克隆一整个 Style 并替换
+        //   （`Context::set_style` 会换掉 `Arc<Style>`，所有依赖样式的东西每帧失效），
+        //   属于无谓的每帧 churn。
         {
             let sp = self.cfg.ui_item_spacing.clamp(4.0, 16.0);
             let ch = self.cfg.ui_ctl_h.clamp(18.0, 34.0);
-            let mut style = (*ctx.style()).clone();
-            style.spacing.item_spacing.x = sp;
-            // 纵向间距与按钮内边距**跟随控件高度缓慢增长**：批 3 用的是 `sp*0.75` 与
-            // `(ch-20)*0.5`，在默认值下把行距从 3 抬到 6、按钮上下各再厚 3pt —— 观感是
-            // "所有区域都变大/变厚"。这里两个系数都调回与旧观感一致的档位（8→3、18→1）。
-            style.spacing.item_spacing.y = (sp * 0.375).max(2.0);
-            style.spacing.interact_size.y = ch;
-            style.spacing.button_padding.y = ((ch - 18.0) * 0.25).max(1.0);
             // 工具条与固定尺寸按钮读这个值（见 ui_ctl_h()）：两边同源，避免"配置调小、
             // 工具条仍按旧高度绘制"的脱钩。
             UI_CTL_H_PT.store((ch * 100.0) as u32, std::sync::atomic::Ordering::Relaxed);
-            ctx.set_style(style);
+            let cur = ctx.style();
+            let same = (cur.spacing.item_spacing.x - sp).abs() < 0.01
+                && (cur.spacing.interact_size.y - ch).abs() < 0.01;
+            if !same {
+                let mut style = (*cur).clone();
+                style.spacing.item_spacing.x = sp;
+                // 纵向间距与按钮内边距**跟随控件高度缓慢增长**：批 3 用的是 `sp*0.75` 与
+                // `(ch-20)*0.5`，在默认值下把行距从 3 抬到 6、按钮上下各再厚 3pt —— 观感是
+                // "所有区域都变大/变厚"。这里两个系数都调回与旧观感一致的档位（8→3、18→1）。
+                style.spacing.item_spacing.y = (sp * 0.375).max(2.0);
+                style.spacing.interact_size.y = ch;
+                style.spacing.button_padding.y = ((ch - 18.0) * 0.25).max(1.0);
+                ctx.set_style(style);
+                flicker_diag_note(3);
+            }
         }
-        // 界面字号：以启动时系统 DPI 为基线，按 scaled_font(1.0, ui_font_scale) 缩放
+        // 界面字号：以系统原生缩放的**稳定值**为基线，按 scaled_font(1.0, ui_font_scale) 缩放
         // （统一辅助函数，11.0..=20.0 钳制与字号比例定义集中在 theme::scaled_font）。
+        //
+        // ★ 只在这两个条件都成立时才改 `pixels_per_point`：
+        //   ① 系统原生缩放已连续 ≥3 帧不变（eframe 启动头几帧会陆续送来 DPI，例如先 1.0
+        //      再 1.25；此时抢着设 ppp 会触发一次整窗重排，用户看到的就是"启动闪一下"）；
+        //   ② 目标值与当前值确实不同（= 用户调过界面字号）。
+        let native = ctx.input(|i| i.viewport().native_pixels_per_point);
+        match native {
+            Some(n) if n > 0.01 => {
+                if (n - self.base_ppp).abs() > 0.001 {
+                    self.base_ppp = n;
+                    self.ppp_stable_frames = 0;
+                } else {
+                    self.ppp_stable_frames = self.ppp_stable_frames.saturating_add(1);
+                }
+            }
+            _ => {
+                self.ppp_stable_frames = self.ppp_stable_frames.saturating_add(1);
+            }
+        }
         let want_ppp = self.base_ppp * theme::scaled_font(1.0, self.cfg.ui_font_scale);
-        if (ctx.pixels_per_point() - want_ppp).abs() > 0.01 {
+        if self.ppp_stable_frames >= 3 && (ctx.pixels_per_point() - want_ppp).abs() > 0.01 {
             ctx.set_pixels_per_point(want_ppp);
+            flicker_diag_note(2);
+        }
+        // 临时诊断（XMST_FLICKER_DIAG=1）：每秒汇总一次"整窗重绘/缩放/样式替换"次数
+        if std::env::var("XMST_FLICKER_DIAG").is_ok() {
+            flicker_diag_tick(ctx, self.theme_cur.max_diff(&self.theme_target));
         }
         // Keep repainting at 16ms while the transition is still visible.
         if self.theme_cur.max_diff(&self.theme_target) > 1 {
@@ -22152,7 +22350,11 @@ impl App {
             let w = rc.right - rc.left;
             let h = rc.bottom - rc.top;
             // 供桌面捕获使用（物理像素矩形）
+            let prev_rect = self.win_rect_px;
             self.win_rect_px = (rc.left, rc.top, w, h);
+            if prev_rect != (rc.left, rc.top, w, h) {
+                self.geom_changed_at = Some(std::time::Instant::now());
+            }
             let r_px = (r_points * ctx.pixels_per_point()).round() as i32;
             // F1：窗口位置/大小记忆 —— 几何变化后延迟 ~800ms 落盘（避免拖动过程中每帧写配置）。
             //
@@ -22199,6 +22401,17 @@ impl App {
             } else {
                 self.win_save_at = None;
             }
+            // ★ 缩放/最大化过程中 `w/h` 每帧都在变，而 `SetWindowRgn` 内部会**整窗重绘一次**
+            //   —— 每帧都调用就是"拖动缩放时界面一直在闪"。改成几何稳定 250ms 后再一次性重设，
+            //   并主动请求一帧，保证停止拖动后圆角一定会补上（否则空闲时不再有帧来补）。
+            let geom_settled = self
+                .geom_changed_at
+                .map(|t| t.elapsed().as_millis() >= 250)
+                .unwrap_or(true);
+            if !geom_settled {
+                ctx.request_repaint_after(std::time::Duration::from_millis(260));
+                return;
+            }
             if self.last_win_rgn == (r_px, w, h) {
                 return;
             }
@@ -22210,6 +22423,7 @@ impl App {
             };
             // SetWindowRgn takes ownership of rgn on success; on failure we simply
             // drop it (negligible, and this path is practically unreachable).
+            flicker_diag_note(1);
             SetWindowRgn(hwnd, rgn, 1);
         }
     }
@@ -23257,12 +23471,41 @@ impl App {
                                             .hint_text("如 Java21")
                                             .desired_width(100.0),
                                     );
-                                    ui.label("版本:");
-                                    ui.add(
-                                        TextEdit::singleline(&mut self.add_java_version)
-                                            .hint_text("如 21 / 1.21.1")
-                                            .desired_width(90.0),
-                                    );
+                                    ui.label("Java 版本:");
+                                    egui::ComboBox::from_id_salt("add_java_major")
+                                        .selected_text(if self.add_java_version.is_empty() {
+                                            "（选择）".to_string()
+                                        } else {
+                                            format!("Java {}", self.add_java_version)
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            for m in ["8", "17", "21", "25"] {
+                                                ui.selectable_value(
+                                                    &mut self.add_java_version,
+                                                    m.to_string(),
+                                                    format!("Java {m}"),
+                                                );
+                                            }
+                                        });
+                                    if ui
+                                        .small_button("识别")
+                                        .on_hover_text("用该路径的 java.exe 跑一次 -version，自动填主版本与名称")
+                                        .clicked()
+                                    {
+                                        let p = self.add_java_path.trim().to_string();
+                                        match java_major_of_path(&p) {
+                                            Some(m) => {
+                                                self.add_java_version = m.to_string();
+                                                if self.add_java_name.trim().is_empty() {
+                                                    self.add_java_name = format!("Java{m}");
+                                                }
+                                                self.set_toast(format!("已识别为 Java {m}"));
+                                            }
+                                            None => self.set_toast(
+                                                "无法识别：请确认路径指向 java.exe（或 JDK 目录）".to_string(),
+                                            ),
+                                        }
+                                    }
                                 });
                                 ui.horizontal(|ui| {
                                     ui.label("路径:");
@@ -23277,22 +23520,19 @@ impl App {
                                         }
                                     }
                                     if ui.button("➕ 添加").clicked() {
-                                        let name = self.add_java_name.trim().to_string();
+                                        let mut name = self.add_java_name.trim().to_string();
                                         let path = self.add_java_path.trim().to_string();
+                                        let version = self.add_java_version.trim().to_string();
+                                        // 名称留空时按版本自动起名（如 Java21），少让用户填一项
+                                        if name.is_empty() && !version.is_empty() {
+                                            name = format!("Java{version}");
+                                        }
                                         if name.is_empty() || path.is_empty() {
                                             self.set_toast("名称和路径不能为空".to_string());
                                         } else {
-                                            let version = {
-                                                let v = self.add_java_version.trim().to_string();
-                                                if v.is_empty() {
-                                                    None
-                                                } else {
-                                                    Some(v)
-                                                }
-                                            };
                                             self.cfg.java_homes.push(JavaHome {
                                                 name,
-                                                version: version.unwrap_or_default(),
+                                                version,
                                                 path,
                                             });
                                             self.add_java_name.clear();
@@ -31392,6 +31632,43 @@ mod mod_env_selfcheck {
 #[cfg(test)]
 mod finishing_batch_selfcheck {
     use super::*;
+
+    /// run.bat → 工具 的 JVM 参数反向同步（用户报"改 run.bat 不会同步 JVM 参数"）：
+    /// 模板里 `set "JVM_ARGS=-Xms1G … "-Djava.io.tmpdir=%~dp0tmp""` 的值**自带引号**，
+    /// 只能剥掉 set 自己的那一个收尾引号，否则会把 -D 参数的引号吃掉。
+    #[test]
+    fn bat_jvm_args_extract() {
+        let templ = "set \"JVM_ARGS=-Xms1G -Xmx15G \"-Djava.io.tmpdir=%~dp0tmp\"\"\r\n";
+        assert_eq!(
+            extract_bat_jvm_args(templ).as_deref(),
+            Some("-Xms1G -Xmx15G \"-Djava.io.tmpdir=%~dp0tmp\"")
+        );
+        // 不带引号的写法 / 别名（JAVA_OPTS）
+        assert_eq!(
+            extract_bat_jvm_args("set JVM_ARGS=-Xms2G -Xmx4G\n").as_deref(),
+            Some("-Xms2G -Xmx4G")
+        );
+        assert_eq!(
+            extract_bat_jvm_args("set JAVA_OPTS=-Xss4M\n").as_deref(),
+            Some("-Xss4M")
+        );
+        // 手写脚本没有该行 → None（不回填、不改动）
+        assert_eq!(
+            extract_bat_jvm_args("@echo off\njava -jar server.jar nogui\n"),
+            None
+        );
+        // `if "%JVM_ARGS%"=="" …` 是判断行，不是赋值行
+        assert_eq!(
+            extract_bat_jvm_args("if \"%JVM_ARGS%\"==\"\" set JVM_ARGS=-Xms1G\n"),
+            None
+        );
+        // 写出 → 读回：值里带引号也必须原样往返
+        let wrote = replace_bat_jvm_args(templ, "-Xms3G \"-Djava.io.tmpdir=C:\\t\"").unwrap();
+        assert_eq!(
+            extract_bat_jvm_args(&wrote).as_deref(),
+            Some("-Xms3G \"-Djava.io.tmpdir=C:\\t\"")
+        );
+    }
 
     /// -Xmx 解析：GB/M/G、纯数字、缺单位全角字符都不能 panic
     #[test]
