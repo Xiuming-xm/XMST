@@ -3618,18 +3618,19 @@ impl App {
             ),
         );
         let mut cfg = load_config(&config_path);
-        // 成就统计：与工具日志同目录（`data\stats.json`），先建立内存缓存并记一次服务器数峰值
-        //（老用户已有的服务器数量在第一次运行时就能对上，删除服务器不回退）
-        stats::init(&exe_dir.join("data"));
-        stats::note_server_count(cfg.servers.len() as u64);
-        // 启动时先判一次：老用户已有数据（服务器数等）立刻解锁，避免"进度满格但仍灰显"；
-        // 这里还没有 App，只能记工具日志，不能弹通知（通知在事件路径上发）
-        for a in stats::evaluate() {
-            toollog::tool_log(
-                toollog::ToolLevel::Info,
-                "成就",
-                format!("成就解锁：{}（{}）", a.name, a.desc),
-            );
+        // 成就统计：与工具日志同目录（`data\stats.json`）。
+        // ★ 整块挂在「设置 → 测试功能」的 `BETA_ACHIEVEMENTS`（默认关闭）下：关闭时
+        //   不初始化、不落盘、不判解锁、也不写工具日志 —— 界面与日志里都不会出现"成就"。
+        if features::is_enabled(&cfg.features, features::BETA_ACHIEVEMENTS) {
+            stats::init(&exe_dir.join("data"));
+            stats::note_server_count(cfg.servers.len() as u64);
+            for a in stats::evaluate() {
+                toollog::tool_log(
+                    toollog::ToolLevel::Info,
+                    "成就",
+                    format!("成就解锁：{}（{}）", a.name, a.desc),
+                );
+            }
         }
         let nav_collapsed_init = cfg.nav_collapsed;
         // 老配置兼容：admin_port 缺失时统一为 7400，重新编号避免端口冲突
@@ -6647,9 +6648,8 @@ impl App {
                     self.backup_stats_cache = None;
                     match res {
                         Ok(n) => {
-                            self.set_toast(format!(
-                                "已锁定为独立归档（不再随源文件变化）：{dir_name}（实化 {n} 个文件）"
-                            ));
+                            let _ = n;
+                            self.set_toast(format!("已锁定 {dir_name}"));
                             toollog::tool_log(
                                 toollog::ToolLevel::Info,
                                 "备份",
@@ -6673,10 +6673,8 @@ impl App {
                     }
                     match res {
                         Ok(n) => {
-                            self.set_toast(format!(
-                                "已转存快照 {dir_name}（本次复制 {}）",
-                                fmt_size(n)
-                            ));
+                            let _ = n;
+                            self.set_toast(format!("已转存快照 {dir_name}"));
                             toollog::tool_log(
                                 toollog::ToolLevel::Info,
                                 "备份",
@@ -7366,9 +7364,11 @@ impl App {
 
     /// 处理关闭请求：返�?true 表示放行关闭（退出程序），false 表示已拦�?
     fn handle_close_request(&mut self, ctx: &egui::Context) -> bool {
-        // 关闭前把去抖中的配置立刻落盘（避免丢改动）；成就统计同样兜一次（累加时已写，幂等）
+        // 关闭前把去抖中的配置立刻落盘（避免丢改动）；成就统计关闭时不落盘
         self.flush_config();
-        stats::save();
+        if features::is_enabled(&self.cfg.features, features::BETA_ACHIEVEMENTS) {
+            stats::save();
+        }
         // 无头回归（XMST_OPEN_PAGE 等）：没有人能点确认弹窗，确认类弹窗直接按
         // 「不阻塞退出」处理 —— 关闭确认不询问、也不按"最小化到托盘"拦住关闭。
         // 这里刻意提前返回，绕过下面 ctx_close_pending 分支里的
@@ -15171,33 +15171,6 @@ fn push_play_secs_evt(out: &mut Vec<(stats::StatKind, u64)>, rt: &mut ServerRunt
     }
 }
 
-/// 动画速度预设（1..6）：**预设 1 = 原来的默认值 2.0**，往上加更快档。
-/// 数值越大展开/折叠越快。
-const ANIM_SPEED_PRESET: [f32; 6] = [2.0, 2.4, 3.0, 3.8, 4.8, 6.0];
-
-/// 动画速度 → 滑块位置（1..=6，非线性：位置均分，速度按预设递增）
-fn anim_speed_to_preset_pos(speed: f32) -> f32 {
-let s = speed.clamp(ANIM_SPEED_PRESET[0], ANIM_SPEED_PRESET[5]);
-// 逐段线性插值到预设序号
-for i in 0..ANIM_SPEED_PRESET.len() - 1 {
-    let (a, b) = (ANIM_SPEED_PRESET[i], ANIM_SPEED_PRESET[i + 1]);
-    if s <= b {
-        let k = if (b - a).abs() < f32::EPSILON { 0.0 } else { (s - a) / (b - a) };
-        return (i as f32 + 1.0) + k;
-    }
-}
-ANIM_SPEED_PRESET.len() as f32
-}
-
-/// 滑块位置（1..=6）→ 动画速度
-fn anim_speed_from_preset_pos(pos: f32) -> f32 {
-let p = pos.clamp(1.0, ANIM_SPEED_PRESET.len() as f32);
-let i = (p.floor() as usize).saturating_sub(1).min(ANIM_SPEED_PRESET.len() - 2);
-let k = p - (i as f32 + 1.0);
-let (a, b) = (ANIM_SPEED_PRESET[i], ANIM_SPEED_PRESET[i + 1]);
-(a + (b - a) * k).clamp(0.1, 20.0)
-}
-
 /// 「UI」组待应用的界面参数（拖动只更新预览，点「应用」才写回配置）
 #[derive(Clone, Copy)]
 struct UiTokens {
@@ -19979,11 +19952,11 @@ impl App {
         }
         if tb_retention {
             self.spawn_retention(idx);
-            self.set_toast("正在后台清理超出保留策略的快照…".to_string());
+            self.set_toast("正在清理快照…".to_string());
         }
         if tb_backup {
             self.spawn_backup(idx, backup::BackupReason::Manual, true);
-            self.set_toast("快照已开始在后台生成（完成后提示）".to_string());
+            self.set_toast("已开始生成快照".to_string());
         }
         ui.add_space(UI_SPACE_Y);
 
@@ -21636,7 +21609,7 @@ impl App {
                 ui.label(RichText::new("1️⃣ 准备 frpc.exe").strong().color(self.fg(Color32::from_rgb(255, 220, 130))));
                 ui.label("在「仪表盘」点「⬇ 下载 frpc.exe」自动获取（观察日志进度），也可「导入 frpc.exe」使用自备文件；「检查更新」可升级");
                 ui.label(RichText::new("2️⃣ 创建隧道（两种方式）").strong().color(self.fg(Color32::from_rgb(255, 220, 130))));
-                ui.label("在「创建隧道」填写备注名。简易模式直接填服务器地址/端口/token/映射端口即可；高级模式可直接编辑 frpc.toml 配置文件，或点「导入文件」导入你自己的 frpc.toml（工具会复制一份到配置目录，原文件不受影响）");
+                ui.label("在「创建隧道」填写备注名。简易模式直接填服务器地址/端口/token/映射端口即可；高级模式可直接编辑 frpc.toml 配置文件，或点「导入文件」导入你自己的 frpc.toml");
                 ui.label(RichText::new("3️⃣ 启动隧道").strong().color(self.fg(Color32::from_rgb(255, 220, 130))));
                 ui.label("在「隧道管理」点「▶ 启动」运行；隧道运行时修改配置需要重启才能生效");
                 ui.label(RichText::new("✅ 完成后别人访问 服务器IP:remotePort 即可进入你本地的服务器").strong().color(self.fg(Color32::from_rgb(140, 220, 140))));
@@ -22539,20 +22512,39 @@ impl App {
         // 预览栏：完全按 pending 值绘制，改值只影响这里
         ui.add_space(4.0);
         ui.label(RichText::new("预览").weak().small());
+        // ★ 字号：真正生效的字号 = 14pt × (界面字号/14) × DPI，而 DPI 本身也随界面字号走，
+        //   所以预览只能按"待应用 ÷ 当前生效"的**比例**缩放。原先写成
+        //   `theme::scaled_font(14.0 * k, 14.0)`（k 已经是倍率）等于把倍率乘了两次，
+        //   预览字比实际大一圈 —— 这就是"UI 预览显示不正确"的来源。
+        let font_ratio = (p.font_scale / self.cfg.ui_font_scale.max(1.0)).clamp(0.5, 2.0);
+        // ★ 圆角：控件圆角真值是 `4.0 × 圆角幅度`（见 theme::apply 的 cr(4.0)），
+        //   窗口/容器是 `6.0 × 窗口圆角幅度`。原先固定按 12.0× 幅度画，看起来圆一倍。
+        let win_round = if p.window_round_corners {
+            6.0 * p.window_corner_scale
+        } else {
+            0.0
+        };
+        let ctl_round = if p.round_corners { 4.0 * p.corner_scale } else { 0.0 };
         egui::Frame::none()
             .fill(self.theme_cur.widget_bg)
             .stroke(egui::Stroke::new(1.0, self.theme_cur.stroke))
-            .rounding(egui::Rounding::same(
-                if p.round_corners { 12.0 * p.corner_scale } else { 0.0 },
-            ))
+            .rounding(egui::Rounding::same(win_round))
             .inner_margin(egui::Margin::symmetric(10.0, 8.0))
             .show(ui, |ui| {
                 ui.set_min_width(280.0);
                 ui.spacing_mut().item_spacing.x = p.item_spacing;
-                let k = p.font_scale / 14.0;
+                // 示例控件也要按待应用的圆角绘制，否则预览里还是旧圆角
+                {
+                    let vis = &mut ui.style_mut().visuals.widgets;
+                    vis.noninteractive.rounding = egui::Rounding::same(ctl_round);
+                    vis.inactive.rounding = egui::Rounding::same(ctl_round);
+                    vis.hovered.rounding = egui::Rounding::same(ctl_round);
+                    vis.active.rounding = egui::Rounding::same(ctl_round);
+                    vis.open.rounding = egui::Rounding::same(ctl_round);
+                }
                 ui.add_sized(
                     [96.0, p.ctl_h],
-                    egui::Button::new(RichText::new("按钮示例").size(theme::scaled_font(14.0 * k, 14.0))),
+                    egui::Button::new(RichText::new("按钮示例").size(14.0 * font_ratio)),
                 );
                 ui.add_sized(
                     [160.0, p.ctl_h],
@@ -22560,7 +22552,7 @@ impl App {
                 );
                 ui.label(
                     RichText::new("正文示例：改值只更新预览，点「应用」才整体生效")
-                        .size(theme::scaled_font(14.0 * k, 14.0)),
+                        .size(14.0 * font_ratio),
                 );
             });
         ui.horizontal(|ui| {
@@ -23164,65 +23156,30 @@ impl App {
                                     .on_disabled_hover_text("英文界面尚未实现");
                                 });
                                 ui.checkbox(&mut self.cfg.ui_animations, "启用切换动效（导航页签 / 折叠 / 按钮过渡）");
-                                ui.label(RichText::new("关闭后过渡立即完成，后台刷新率降到最低").weak().small());
                                 ui.label("平滑动画速度:");
-                                // 旧配置里的值（1.0 及以下）收敛到新预设下限，避免滑块停在档位之外
-                                if self.cfg.anim_speed < ANIM_SPEED_PRESET[0] {
-                                    self.cfg.anim_speed = ANIM_SPEED_PRESET[0];
+                                // 滑块 1～3 线性、数值即倍率（2 = 默认手感）：不再用"预设档位"，
+                                // 旧配置里被写成档位值（>3）的一律收敛回 3，低于 1 的收敛回 1。
+                                if self.cfg.anim_speed < 1.0 || self.cfg.anim_speed > 3.0 {
+                                    self.cfg.anim_speed = self.cfg.anim_speed.clamp(1.0, 3.0);
                                     self.save_config();
                                 }
-                                let presets: [(&str, f32); 6] = [
-                                    ("预设 1（原默认）", ANIM_SPEED_PRESET[0]),
-                                    ("预设 2", ANIM_SPEED_PRESET[1]),
-                                    ("预设 3", ANIM_SPEED_PRESET[2]),
-                                    ("预设 4", ANIM_SPEED_PRESET[3]),
-                                    ("预设 5", ANIM_SPEED_PRESET[4]),
-                                    ("预设 6", ANIM_SPEED_PRESET[5]),
-                                ];
                                 ui.horizontal(|ui| {
-                                    for (label, v) in presets {
-                                        if ui
-                                            .selectable_label(
-                                                (self.cfg.anim_speed - v).abs() < 0.01,
-                                                label,
-                                            )
-                                            .clicked()
-                                        {
-                                            self.cfg.anim_speed = v;
-                                            self.save_config();
-                                        }
-                                    }
-                                });
-                                // 非线性滑块：横轴位置按预设序号均分（1..6），因此数值越大档位跨度越大。
-                                // 原先是 0.1..=2.0 均分，低档挤在一起、高档变化不明显，观感反直觉。
-                                ui.horizontal(|ui| {
-                                    let mut pos = anim_speed_to_preset_pos(self.cfg.anim_speed);
                                     if ui
                                         .add(
-                                            egui::Slider::new(&mut pos, 1.0..=6.0)
+                                            egui::Slider::new(&mut self.cfg.anim_speed, 1.0..=3.0)
                                                 .fixed_decimals(2)
-                                                .show_value(false),
+                                                .suffix(" ×"),
                                         )
                                         .changed()
                                     {
-                                        self.cfg.anim_speed = anim_speed_from_preset_pos(pos);
                                         self.save_config();
                                     }
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "{:.2}（预设 {}）",
-                                            self.cfg.anim_speed,
-                                            (pos.round() as i32).clamp(1, 6)
-                                        ))
-                                        .weak()
-                                        .small(),
-                                    );
                                     if ui.button("重置").clicked() {
-                                        self.cfg.anim_speed = ANIM_SPEED_PRESET[0];
+                                        self.cfg.anim_speed = 2.0;
                                         self.save_config();
                                     }
                                 });
-                                ui.label(RichText::new("越往右越快、越往左越平滑；关闭动效时此项不生效").weak().small());
+                                ui.label(RichText::new("1 最平滑、2 默认、3 最快；关闭动效时此项不生效").weak().small());
                             });
                             self.settings_sections = sections;
 
@@ -23243,11 +23200,7 @@ impl App {
                         }
                         SettingsSide::Java => {
                             let sections = std::mem::take(&mut self.settings_sections);
-                            
-                        }
-                        SettingsSide::Java => {
-                            let sections = std::mem::take(&mut self.settings_sections);
-                            let sections = Self::setting_section(ctx, ui, sections, "java_jvm", "Java 和 JVM", Some("使用 run.bat 的服务器启动时直接执行 run.bat，Java 以脚本内为准；下面两项仅用于「无 run.bat」的服务器"), true, use_anim, self.cfg.anim_speed, |ui| {
+                            let sections = Self::setting_section(ctx, ui, sections, "java_jvm", "Java 和 JVM", None, true, use_anim, self.cfg.anim_speed, |ui| {
                                 ui.horizontal(|ui| {
                                     ui.label("Java 兜底路径 (留空使用 PATH):");
                                     ui.add(TextEdit::singleline(&mut self.cfg.java_path).desired_width(300.0));
@@ -23276,7 +23229,7 @@ impl App {
                             self.settings_sections = sections;
 
                             let sections = std::mem::take(&mut self.settings_sections);
-                            let sections = Self::setting_section(ctx, ui, sections, "java_list", "全局 Java 列表（按服务器 MC 版本自动匹配）", Some("使用 run.bat 且服务器未指定 Java 时，按服务器 MC 版本从列表自动选用；也可在服务器「启动脚本」页手动指定"), true, use_anim, self.cfg.anim_speed, |ui| {
+                            let sections = Self::setting_section(ctx, ui, sections, "java_list", "全局 Java 列表（按服务器 MC 版本自动匹配）", None, true, use_anim, self.cfg.anim_speed, |ui| {
                                 for (i, h) in self.cfg.java_homes.clone().iter().enumerate() {
                                     ui.horizontal(|ui| {
                                         let ver = if h.version.trim().is_empty() {
@@ -23295,7 +23248,7 @@ impl App {
                                     });
                                 }
                                 if self.cfg.java_homes.is_empty() {
-                                    ui.label(RichText::new("（暂存 Java 条目）").weak());
+                                    ui.label(RichText::new("暂无 Java 条目").weak());
                                 }
                                 ui.horizontal(|ui| {
                                     ui.label("名称:");
@@ -26757,11 +26710,6 @@ impl App {
                     self.tool_log_rev = 0;
                     self.tool_log_filter_key = (String::new(), String::new(), String::new());
                 }
-                ui.label(
-                    RichText::new("服务器控制台日志在 服务器 → 控制台；穿透日志在 内网穿透 → 隧道日志")
-                        .weak()
-                        .small(),
-                );
                 ui.add_space(UI_SPACE_Y);
                 // ---- 统计卡 ----
                 ui.horizontal_wrapped(|ui| {

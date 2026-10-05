@@ -220,7 +220,14 @@ egui 的 `ui_*` 每帧执行。曾出现（已修/部分修）：
     - 事实链：`cmd /c run.bat` **确实跑起来了**（stdout 首行是 bat 自己的 `====` 横幅，说明 `where java` 检查已通过）→ ~3 秒后 cmd 自己 `退出码=1`、**stderr 空**、`logs\latest.log` 大小/mtime **无变化**（说明 java 从未走到日志初始化）→ auto 模式下的回退没生效，因为当时解析出的直连 java 不存在（`<服务器目录>\java\bin\java.exe`）。
     - 交叉验证：同一台机器上 `where java`（`E:\Games\Minecraft\Library\JDK\OpenJDK21`）、`java -version`、以及模板那行 `call "java" %JVM_ARGS% -version`（含 `"-Djava.io.tmpdir=…"` 引号写法）**在带控制台时全部成功**（含 `-Xms1G -Xmx15G -XX:+UseG1GC`）。
     - 因此剩余差异只剩**工具的启动形态**：`CREATE_NO_WINDOW` + stdin/stdout/stderr 全管道。java 静默退出、无 stderr、无 latest.log，指向"无控制台句柄下 java/MC 侧提前结束"，而不是 bat 写法或 PATH 问题。
-    - **下一步（已内置工具）**：用「🧪 启动诊断」一次跑 4 组（① 生产组合 ② 去掉 Job ③ 去掉 CREATE_NO_WINDOW ④ 绕过 cmd/bat 直接 java），结果写 `data\launch.log`；哪一组能出 `Done` 就是根因所在。本轮已先由"新的 Java 解析/自动匹配 + 直连 java 回退"兜底：`JAVA_PATH=java` 这种裸写法不再解析失败，run.bat 失败后能自动改用直连 java 把服务器拉起来。
+    - **下一步（已内置工具）**：用「🧪 启动诊断」一次跑 4 组（① 生产组合 ② 去掉 Job ③ 去掉 CREATE_NO_WINDOW ④ 绕过 cmd/bat 直接 java），结果写 `data\launch.log`；哪一组能出 `Done` 就是根因所在。
+36. **★ run.bat 必失败的最终根因（2026-10-05 已修，取代第 35 条的推测）**：`process.rs` 里读子进程输出的线程用 `read_line` 读 stdout/stderr，**遇到 GBK/非 UTF-8 字节就返回 Err 并结束线程** → 读端被关闭 → 子进程管道破裂 → `cmd`（及 bat 里的 `call "java"`）以**退出码 1** 提前结束，且 stderr 空、`logs\latest.log` 大小/mtime 无变化 —— 与第 35 条取证到的现象完全吻合（bat 的 `echo` 中文横幅就是第一处非 UTF-8 字节）。修法：4 处读取线程统一改 `read_line_lossy`（`read_until` + `from_utf8_lossy`），并把 stdout/stderr 前 5 + 末 10 行与标准句柄组合写进 `launch.log`（提交 `dc799bb`）。**教训：GUI 进程读子进程输出必须按字节读 + 容错解码，不能因为"某行不是 UTF-8"就终止读取线程。**
+37. **界面细节修复**（2026-10-05 第三批）：
+    - ① 「设置 → 界面」的平滑动画速度改回 **1–3 线性滑块（默认 2 = 原默认手感）**，删掉"预设 1–6"档位与非线性映射；越界旧值（>3 / <1）自动收敛进区间。
+    - ② 修 **UI 预览显示不正确**：预览字号曾把倍率乘了两次（`scaled_font(14.0 * k, 14.0)`，k 已是倍率）→ 预览字比真实界面大一圈；圆角曾固定按 `12 × 幅度` 画，而真实控件是 `4 × 幅度`、容器 `6 × 窗口幅度`。现按"待应用 ÷ 当前生效"的比例缩放字号，圆角与 `theme::apply` 同源，示例按钮/输入框也用待应用圆角绘制。
+    - ③ 修 **「设置 → Java」整页空白**：`match self.settings_side` 里出现**重复的 `SettingsSide::Java` 分支**，第一个空分支让真正的 `java_jvm` / `java_list` 分组成为不可达代码（编译期只有 warning，界面上一片空白）。**合并/大改之后务必用 `cargo check` 的 `unreachable pattern` 警告自查一遍。**
+    - ④ 成就统计的**启动初始化与退出落盘**也挂到 `BETA_ACHIEVEMENTS`（关闭时连 `stats.json` 都不创建、不写「成就」日志）。
+    - ⑤ 再清一批机制解释文案：`已锁定为独立归档（不再随源文件变化）…`、`已转存快照 X（本次复制 Y）`、`正在后台清理超出保留策略的快照…`、`快照已开始在后台生成（完成后提示）`、`关闭后过渡立即完成，后台刷新率降到最低`、Java/JVM 与 Java 列表两个分组的机制 hint、`服务器控制台日志在 服务器 → 控制台；穿透日志在…`、`（暂存 Java 条目）`。
 
 ### 6.2 仍待办（按建议优先级）
 
