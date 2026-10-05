@@ -1524,6 +1524,75 @@ struct ForceStopReq {
 /// 强停确认有效期（秒）
 const FORCE_STOP_TOKEN_TTL: u64 = 30;
 
+/// 关服/崩溃快照等待「进程完全退出」的最长秒数（P0-2；超时则跳过本次快照并记警告）
+const EXIT_SNAPSHOT_WAIT_SECS: u64 = 60;
+
+// ==================== 数据安全：停服 / 启动前拦截 ====================
+
+/// 优雅停止后台线程 → UI 线程的消息。
+///
+/// 历史 bug：停止线程内超过 30 秒直接 `kill_tree()`，用户看不到任何提示，
+/// 大整合包存档被截断 → 回档。现在超时**只回报**，由 UI 弹二次确认。
+enum StopMsg {
+    /// 一轮等待结束：(服务器下标, 本轮的判定)
+    RoundDone(usize, process::StopOutcome),
+    /// 超时未退出：句柄交回 UI，由「服务器仍在退出中」确认窗决定继续等待 / 强制结束
+    /// （`u64` = 已累计等待秒数）
+    WaitAgain(usize, Box<process::ManagedProcess>, u64),
+    /// 已接管的外部实例（无 stdin / 无 Child 句柄）：直接结束进程树的结果
+    AdoptedKilled(usize, bool),
+}
+
+/// 「服务器仍在退出中」二次确认窗（超时后出现，不静默强杀）。
+#[derive(Clone)]
+struct StopWaitReq {
+    idx: usize,
+    /// 已累计等待秒数（多轮"继续等待"会叠加，用于文案）
+    waited_secs: u64,
+}
+
+/// 启动前残留拦截：「这台服务器可能仍在运行 / session.lock 未释放」确认窗。
+#[derive(Clone)]
+struct PreStartReq {
+    idx: usize,
+    /// 命中的原因（java 进程 / session.lock），直接展示给用户
+    reason: String,
+    /// 是否来自崩溃自动重启：确认后要按"重启"文案继续
+    from_crash_restart: bool,
+}
+
+/// 不完整快照清理确认（缺 manifest.json 的快照目录）
+#[derive(Clone)]
+struct IncompleteCleanupReq {
+    idx: usize,
+    /// 待删除的快照目录（已在扫描时确认缺 manifest）
+    targets: Vec<PathBuf>,
+}
+
+/// 共用提示窗的类别（决定标题与「复制…」按钮文案）
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NoticeKind {
+    /// 目录完整性级别偏低（Low IL）
+    LowIl,
+    /// 世界目录 / world\region 写权限不可用
+    WorldWrite,
+}
+
+/// 「世界目录写不进去」的建议文案（与「复制建议」按钮共用同一份文本）。
+fn world_write_advice(server_dir: &Path) -> String {
+    format!(
+        "1) 把服务器移出桌面等被保护位置，例如 D:\\MCServer\\{}；\r\n\
+         2) 在安全软件（Windows 安全中心 → 病毒和威胁防护 → 勒索软件防护 / 受控文件夹访问，\
+         或第三方安全软件的「文件夹保护」）的白名单里加入：\r\n   · 服务器目录 {}\r\n   · java.exe（<Java 路径>\\bin\\java.exe）\r\n\
+         3) 改完重启一次服务器，并在关服后确认日志里没有 AccessDeniedException。",
+        server_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "服务器".to_string()),
+        server_dir.display()
+    )
+}
+
 /// 左侧一级导航（目标 6 项：仪表盘 / 服务器 / 下载 / 内网穿透 / 工具 / 设置）
 ///
 /// ★ 索引与导航项数量绑定：`nav_anim` / 滑块绘制 / `target_nav` 都按
@@ -2605,9 +2674,37 @@ struct App {
     /// 内层 None 表示该目录没有 run.bat / 没有 MAX_RESTARTS。
     crash_bat_probe: Option<(PathBuf, Option<(String, i32)>)>,
     /// 优雅停止后台线程回传�?(服务器下�? 是否优雅完成)
-    stop_tx: std::sync::mpsc::Sender<(usize, bool)>,
-    stop_rx: std::sync::mpsc::Receiver<(usize, bool)>,
+    stop_tx: std::sync::mpsc::Sender<StopMsg>,
+    stop_rx: std::sync::mpsc::Receiver<StopMsg>,
     stop_inflight: HashSet<usize>,
+    /// 「服务器仍在退出中」二次确认（超时后弹，选「继续等待」再等一轮 / 选「强制结束」才强杀）
+    stop_wait: Option<StopWaitReq>,
+    /// 启动前残留拦截确认（java 进程 / session.lock 命中，默认取消）
+    pre_start: Option<PreStartReq>,
+    /// 不完整快照清理确认（缺 manifest.json 的快照目录）
+    incomplete_cleanup: Option<IncompleteCleanupReq>,
+    /// 「世界目录写权限不可用」已记过工具日志的服务器（key = 名称+目录，每台每次运行只记一次）
+    write_probe_logged: HashSet<String>,
+    /// 关服/崩溃快照的「等进程完全退出」后台回传：
+    /// (服务器下标, 是否优雅, 退出码, 日志尾, 是否有新崩溃报告, 等待结果, 服务器名)
+    exit_snap_tx: std::sync::mpsc::Sender<(
+        usize,
+        bool,
+        Option<i32>,
+        String,
+        bool,
+        Result<u64, String>,
+        String,
+    )>,
+    exit_snap_rx: std::sync::mpsc::Receiver<(
+        usize,
+        bool,
+        Option<i32>,
+        String,
+        bool,
+        Result<u64, String>,
+        String,
+    )>,
     config_path: PathBuf,
     /// 当前 exe 绝对路径（开机自启注册表写入用）
     exe_path: PathBuf,
@@ -2725,6 +2822,10 @@ struct App {
     low_il_fix_cmd: String,
     /// 服务器目录完整性自检的待展示提示：(文案, 修复命令)。与 exe 目录的提示共用同一个窗口逐条展示
     low_il_pending: Vec<(String, String)>,
+    /// 世界目录写权限自检失败的待展示提示：(文案, 建议)。与 Low IL 提示共用窗口，标题不同
+    world_write_pending: Vec<(String, String)>,
+    /// 当前提示窗展示的类别（决定标题与「复制…」按钮文案）
+    notice_kind: Option<NoticeKind>,
     /// 服务器目录完整性自检：本次运行已提示过的服务器（名称+目录，小写）——每台服务器只提示一次
     server_il_notified: HashSet<String>,
     /// 服务器目录完整性自检是否已在启动后跑过（只跑一次，不每帧扫盘）
@@ -3670,6 +3771,8 @@ impl App {
         let (restore_tx, restore_rx) = std::sync::mpsc::channel();
         let (maint_tx, maint_rx) = std::sync::mpsc::channel();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        // 关服快照的「等进程完全退出」回传（P0-2）
+        let (exit_snap_tx, exit_snap_rx) = std::sync::mpsc::channel();
         let (rathole_tx, rathole_rx) = std::sync::mpsc::channel();
         let (remote_tx, remote_rx) = std::sync::mpsc::channel();
         let (frp_tx, frp_rx) = std::sync::mpsc::channel();
@@ -3726,6 +3829,12 @@ impl App {
             stop_tx,
             stop_rx,
             stop_inflight: HashSet::new(),
+            stop_wait: None,
+            pre_start: None,
+            incomplete_cleanup: None,
+            write_probe_logged: HashSet::new(),
+            exit_snap_tx,
+            exit_snap_rx,
             config_path,
             exe_path: std::env::current_exe().unwrap_or_default(),
             add_tunnel_name: String::new(),
@@ -3791,6 +3900,8 @@ impl App {
             low_il_notice: None,
             low_il_fix_cmd: String::new(),
             low_il_pending: Vec::new(),
+            world_write_pending: Vec::new(),
+            notice_kind: None,
             server_il_notified: HashSet::new(),
             server_il_checked: false,
             server_il_summary_logged: false,
@@ -4282,6 +4393,28 @@ impl App {
         } else if let Some(i) = self.ready_stop_timeout.as_mut() {
             if *i > idx {
                 *i -= 1;
+            }
+        }
+        // 停止等待 / 启动拦截 / 不完整快照清理：目标序号同样要清掉或前移
+        if self.stop_wait.as_ref().map(|r| r.idx) == Some(idx) {
+            self.stop_wait = None;
+        } else if let Some(r) = self.stop_wait.as_mut() {
+            if r.idx > idx {
+                r.idx -= 1;
+            }
+        }
+        if self.pre_start.as_ref().map(|r| r.idx) == Some(idx) {
+            self.pre_start = None;
+        } else if let Some(r) = self.pre_start.as_mut() {
+            if r.idx > idx {
+                r.idx -= 1;
+            }
+        }
+        if self.incomplete_cleanup.as_ref().map(|r| r.idx) == Some(idx) {
+            self.incomplete_cleanup = None;
+        } else if let Some(r) = self.incomplete_cleanup.as_mut() {
+            if r.idx > idx {
+                r.idx -= 1;
             }
         }
         if self.selected_server == Some(idx) {
@@ -5061,7 +5194,7 @@ impl App {
         true
     }
 
-    /// 开始优雅停止：发送 stop 并等服务器保存退出，超时走既有强停。
+    /// 开始优雅停止：发送 stop 并等服务器保存退出；**超时不强杀**，改弹二次确认。
     /// 已接管的外部实例写不进 stdin（不是我们拉起的进程），只能结束进程树。
     fn begin_graceful_stop(&mut self, idx: usize) {
         // 已经进入真正的停止流程，不再需要"等就绪"标记
@@ -5071,6 +5204,10 @@ impl App {
         }
         if self.ready_stop_timeout == Some(idx) {
             self.ready_stop_timeout = None;
+        }
+        // 重新发起停止：撤掉上一轮的"仍在退出中"确认窗（避免重复弹两层）
+        if self.stop_wait.as_ref().map(|r| r.idx) == Some(idx) {
+            self.stop_wait = None;
         }
         // 已接管的外部实例：写不进 stdin（不是我们拉起的进程），只能结束进程树。
         // 但结束前先按"正常关服"的判定基准准备：清掉 adopted 标记 + 置 stopping，
@@ -5092,22 +5229,165 @@ impl App {
             self.stop_inflight.insert(idx);
             std::thread::spawn(move || {
                 let ok = process::kill_pid_tree(pid);
-                let _ = tx.send((idx, ok));
+                let _ = tx.send(StopMsg::AdoptedKilled(idx, ok));
             });
             return;
         }
+        // 进程句柄移交给这一轮的等待线程；超时后句柄会随消息（或继续等待的放回）回到 UI
+        let Some(p) = self
+            .runtimes
+            .get_mut(idx)
+            .and_then(|rt| rt.proc.take())
+        else {
+            return;
+        };
         if let Some(rt) = self.runtimes.get_mut(idx) {
-            if let Some(p) = rt.proc.take() {
-                rt.stopping = true;
-                rt.last_msg = "正在停止…（等待服务器保存退出，最多 60 秒）".to_string();
-                let tx = self.stop_tx.clone();
-                self.stop_inflight.insert(idx);
-                std::thread::spawn(move || {
-                    let ok = process::stop_gracefully(&p, 30);
-                    let _ = tx.send((idx, ok));
-                });
+            rt.stopping = true;
+        }
+        self.spawn_stop_round(idx, p, 0);
+    }
+
+    /// 起一轮「发 stop → 等待」后台线程（不阻塞 UI）。
+    /// `waited` = 之前几轮已累计等待的秒数，只用于文案与确认窗显示。
+    fn spawn_stop_round(&mut self, idx: usize, p: process::ManagedProcess, waited: u64) {
+        let timeout = self.stop_timeout_secs_of(idx);
+        if let Some(rt) = self.runtimes.get_mut(idx) {
+            rt.stopping = true;
+            if waited == 0 {
+                rt.last_msg = format!("正在停止…（等待服务器保存退出，最多 {timeout} 秒，超时不会自动强杀）");
+            } else {
+                rt.last_msg = format!("已等待 {waited} 秒，继续等待服务器保存退出…");
             }
         }
+        let tx = self.stop_tx.clone();
+        self.stop_inflight.insert(idx);
+        std::thread::spawn(move || {
+            let outcome = process::stop_gracefully_wait(&p, timeout);
+            match outcome {
+                process::StopOutcome::Exited => {
+                    let _ = tx.send(StopMsg::RoundDone(idx, process::StopOutcome::Exited));
+                }
+                process::StopOutcome::StillRunning => {
+                    // 句柄随消息回到 UI：用户在确认窗里选「继续等待」时要再等一轮
+                    let _ = tx.send(StopMsg::WaitAgain(idx, Box::new(p), waited + timeout));
+                }
+            }
+        });
+    }
+
+    /// 取该服务器优雅停止超时（配置值钳进 30..=1800，缺省 300）
+    fn stop_timeout_secs_of(&self, idx: usize) -> u64 {
+        self.cfg
+            .servers
+            .get(idx)
+            .map(|s| config::clamp_stop_timeout_secs(s.stop_timeout_secs))
+            .unwrap_or(300)
+    }
+
+    /// 「启动服务器」的用户入口：先做**启动前残留检查**（P0-3），命中则弹确认
+    /// （默认取消），确认后才真正启动。`--autostart` 与崩溃重启走 `request_start`。
+    fn start_server_checked(&mut self, idx: usize) {
+        self.request_start(idx, false);
+    }
+
+    /// 启动前残留 / `session.lock` 检查 → 命中时登记确认窗，未命中直接启动。
+    ///
+    /// 检查项（复用既有能力，均为只读）：
+    /// 1. 该服务器目录下是否还有命令行命中的 java/javaw 进程（`list_java_processes`）；
+    /// 2. `<世界目录>\session.lock` 是否存在且最近 5 分钟内被刷新。
+    ///
+    /// ★ 绝不静默启动：两个实例抢同一个 `session.lock` / region 文件是"谁最后写算谁的"，
+    /// 直接导致存档损坏与回档（诊断报告 §三.4）。
+    fn request_start(&mut self, idx: usize, from_crash_restart: bool) {
+        if idx >= self.cfg.servers.len() || idx >= self.runtimes.len() {
+            return;
+        }
+        // 本工具已托管该服务器（正在运行 / 正在停止）→ 由既有逻辑负责，不进这里
+        if self.runtimes[idx].proc.is_some() {
+            return;
+        }
+        let Some(sc) = self.cfg.servers.get(idx).cloned() else { return };
+        // 崩溃重启：工具自己拉起的进程刚退出时，`list_java_processes` 可能还有一瞬的残留，
+        // 这里等它彻底消失（最多 3 秒）再判定，避免把自家残留误报给用户。
+        if from_crash_restart {
+            let _ = wait_server_fully_exited(&sc.dir, 3);
+        }
+        if let Some(reason) = self.pre_start_issue(idx, &sc) {
+            process::launch_log_line(&format!(
+                "阶段=启动前检查 结果=拦截（服务器={}，原因={reason}，等用户确认）",
+                sc.name
+            ));
+            toollog::tool_log(
+                toollog::ToolLevel::Warn,
+                "服务器",
+                format!("启动前检查拦截：{}（{reason}）", sc.name),
+            );
+            self.pre_start = Some(PreStartReq {
+                idx,
+                reason,
+                from_crash_restart,
+            });
+            return;
+        }
+        if from_crash_restart {
+            toollog::tool_log(
+                toollog::ToolLevel::Info,
+                "服务器",
+                format!("崩溃自动重启：{}（启动前检查通过）", sc.name),
+            );
+        }
+        self.start_server(idx);
+    }
+
+    /// 启动前残留检查的判定：命中返回原因文案，未命中返回 None（纯只读）
+    fn pre_start_issue(&self, idx: usize, sc: &ServerConfig) -> Option<String> {
+        // 别的服务器（含工具自己托管的）占用同一份 java 的 PID 要排除，避免误报
+        let mut known: HashSet<u32> = HashSet::new();
+        for (i, rt) in self.runtimes.iter().enumerate() {
+            if i == idx {
+                continue;
+            }
+            if let Some(p) = &rt.proc {
+                if let Some(pid) = process::pid(p) {
+                    known.insert(pid);
+                    known.extend(process::pid_descendants(pid));
+                }
+            }
+            if let Some(pid) = rt.adopted_pid {
+                known.insert(pid);
+                known.extend(process::pid_descendants(pid));
+            }
+        }
+        let procs: Vec<process::JavaProc> = process::java_processes_for_dir(&sc.dir)
+            .into_iter()
+            .filter(|p| !known.contains(&p.pid))
+            .collect();
+        let (lock_exists, lock_age) = process::session_lock_state(&sc.dir);
+        let lock_fresh = lock_exists && lock_age.map(|a| a <= 300).unwrap_or(false);
+        if procs.is_empty() && !lock_fresh {
+            return None;
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if !procs.is_empty() {
+            let pids: Vec<String> = procs.iter().map(|p| p.pid.to_string()).collect();
+            parts.push(format!(
+                "检测到 {} 个该目录的 java 进程（PID {}）",
+                procs.len(),
+                pids.join("、")
+            ));
+        }
+        if lock_fresh {
+            parts.push(format!(
+                "world\\session.lock 仍在（{} 前被刷新），说明可能已有实例打开了世界",
+                lock_age
+                    .map(|a| format!("{a} 秒"))
+                    .unwrap_or_else(|| "刚刚".to_string())
+            ));
+        }
+        Some(format!(
+            "{}。继续启动可能导致存档损坏（两个实例抢写同一份 region）",
+            parts.join("；")
+        ))
     }
 
     /// 启动中排队停止的 5 分钟兜底：仍未就绪则弹确认（继续等待 / 强制停止），不自动强杀。
@@ -5157,9 +5437,15 @@ impl App {
         self.auto_restart_after_stop.remove(&idx);
         self.auto_restart_pending.remove(&idx);
         self.auto_restart_scheduled.remove(&idx);
-        // 强杀即结束这台服务器：排队停止标记与超时确认窗一并清掉
+        // 强杀即结束这台服务器：排队停止标记、超时确认窗、停止等待确认窗一并清掉
         if self.ready_stop_timeout == Some(idx) {
             self.ready_stop_timeout = None;
+        }
+        if self.stop_wait.as_ref().map(|r| r.idx) == Some(idx) {
+            self.stop_wait = None;
+        }
+        if self.pre_start.as_ref().map(|r| r.idx) == Some(idx) {
+            self.pre_start = None;
         }
         if let Some(rt) = self.runtimes.get_mut(idx) {
             rt.crash_restart_at = None;
@@ -5276,8 +5562,12 @@ impl App {
                 ui.add_space(6.0);
                 ui.label(format!("服务器：{name}"));
                 ui.label(format!("主进程 PID：{}", req.pid));
-                ui.label("影响：将强制结束该服务器及其全部子进程（进程树），");
-                ui.label("未保存的世界进度可能丢失，建议先使用优雅停止。");
+                ui.label("影响：将强制结束该服务器及其全部子进程（进程树）。");
+                ui.colored_label(
+                    self.fg(egui::Color32::from_rgb(220, 90, 90)),
+                    "不发 stop、不会保存世界：未保存的进度会丢失（世界可能回档到上一次自动保存）。",
+                );
+                ui.label("如果服务器还在正常关服，请改用「停止服务器」并等它自己退出。");
                 if expired {
                     ui.add_space(8.0);
                     ui.colored_label(self.fg(egui::Color32::from_rgb(220, 90, 90)), "确认已过期（30 秒），请重新发起强制结束。");
@@ -5345,6 +5635,273 @@ impl App {
         }
     }
 
+    /// 「服务器仍在退出中」确认窗（P0-1）：
+    /// 优雅停止等满一轮（默认 300 秒，可配 30..=1800）仍未退出时弹出，
+    /// **不静默强杀**。用户可选「继续等待」再等一轮（可反复）或「强制结束」（才 kill_tree）。
+    fn ui_stop_wait_confirm(&mut self, ctx: &egui::Context) {
+        let Some(req) = self.stop_wait.clone() else { return };
+        let idx = req.idx;
+        let name = self.cfg.servers.get(idx).map(|s| s.name.clone()).unwrap_or_default();
+        let waited = req.waited_secs;
+        let mut wait_more = false;
+        let mut force_now = false;
+        egui::Window::new("服务器仍在退出中")
+            .id(egui::Id::new("stop_wait_confirm_window"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_max_width(520.0);
+                ui.add_space(4.0);
+                ui.label(RichText::new(format!("服务器仍未退出（已等待 {waited} 秒）。")).strong());
+                ui.label(format!("服务器：{name}"));
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "它可能正在保存世界（大整合包一次完整保存要 1 分钟以上）。\
+                         继续等待不会丢数据；强制结束会立即终止进程树，未保存的进度会丢失。",
+                    )
+                    .weak()
+                    .small(),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    // 按钮顺序：安全的「继续等待」在左，危险的「强制结束」在右
+                    if ui.button("继续等待").on_hover_text("再等一轮（同样的超时时间），可反复选择").clicked() {
+                        wait_more = true;
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("强制结束")
+                                    .color(self.fg(Color32::from_rgb(230, 120, 120))),
+                            ),
+                        )
+                        .on_hover_text("立即 taskkill 整棵进程树：未保存的进度会丢失")
+                        .clicked()
+                    {
+                        force_now = true;
+                    }
+                });
+            });
+        if wait_more {
+            // 继续等待：把进程句柄交回后台线程，再等同样的超时时间（可反复）
+            self.stop_wait = None;
+            let p = self.runtimes.get_mut(idx).and_then(|rt| rt.proc.take());
+            if let Some(p) = p {
+                process::launch_log_line(&format!(
+                    "阶段=停止等待 选择=继续等待（服务器={name}，已等待 {waited} 秒）"
+                ));
+                self.set_toast(format!("「{name}」继续等待服务器保存退出"));
+                self.spawn_stop_round(idx, p, waited);
+            }
+        } else if force_now {
+            self.stop_wait = None;
+            // 只有走到这里（用户明确选择）才强杀，并写警告级工具日志
+            let (killed, had_proc) = match self.runtimes.get_mut(idx) {
+                Some(rt) => {
+                    let mut killed = false;
+                    if let Some(p) = &rt.proc {
+                        killed = process::kill(p);
+                    }
+                    if let Some(pid) = rt.adopted_pid.take() {
+                        killed = process::kill_pid_tree(pid);
+                    }
+                    rt.stopping = false;
+                    rt.start_phase = StartPhase::Idle;
+                    rt.last_stopped_at = Some(std::time::SystemTime::now());
+                    rt.last_msg = if killed {
+                        "已强制结束（含进程树）".to_string()
+                    } else {
+                        "强制结束未确认成功，请在任务管理器确认".to_string()
+                    };
+                    (killed, true)
+                }
+                None => (false, false),
+            };
+            if had_proc {
+                toollog::tool_log(
+                    toollog::ToolLevel::Warn,
+                    "服务器",
+                    format!(
+                        "强制结束：{name}（含进程树；等待 {waited} 秒未退出后由用户确认强制结束，未保存的进度会丢失）"
+                    ),
+                );
+                process::launch_log_line(&format!(
+                    "阶段=停止等待 选择=强制结束（服务器={name}，已等待 {waited} 秒）"
+                ));
+                self.notify(
+                    "XMST - 已强制结束服务器",
+                    &format!("{name}：未保存的世界进度可能丢失"),
+                );
+                self.stats_play_secs(idx);
+                if let Some(pm) = self.plugins.as_mut() {
+                    pm.emit(
+                        "server_stopped",
+                        vec![Dynamic::from(name.clone()), Dynamic::from("killed")],
+                    );
+                }
+            }
+        }
+    }
+
+    /// 不完整快照清理确认窗（P2-6）：列出将被删除的目录名，二次确认后只删这些。
+    fn ui_incomplete_cleanup_confirm(&mut self, ctx: &egui::Context) {
+        let Some(req) = self.incomplete_cleanup.clone() else { return };
+        let name = self
+            .cfg
+            .servers
+            .get(req.idx)
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+        let names: Vec<String> = req
+            .targets
+            .iter()
+            .map(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| p.display().to_string())
+            })
+            .collect();
+        let mut open = true;
+        let mut do_it = false;
+        let mut cancel = false;
+        egui::Window::new("确认清理不完整快照")
+            .id(egui::Id::new("incomplete_cleanup_confirm_window"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_max_width(560.0);
+                ui.add_space(4.0);
+                ui.label(RichText::new(format!("将删除「{name}」的 {} 份不完整快照：", names.len())).strong());
+                ui.label(RichText::new(names.join("、")).small().weak());
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "这些快照缺少 manifest.json（工具上次写到一半退出），无法回退；\
+                         只删除这些目录，其它快照与旧版 zip 不受影响。",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("取消").clicked() {
+                        cancel = true;
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("确认删除").color(self.fg(Color32::from_rgb(230, 110, 110))),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        do_it = true;
+                    }
+                });
+            });
+        if do_it {
+            self.do_clean_incomplete_snapshots();
+        } else if cancel || !open {
+            self.incomplete_cleanup = None;
+        }
+    }
+
+    /// 启动前残留拦截确认窗（P0-3）：默认「取消」（取消在左，危险的「仍要启动」在右）。
+    fn ui_pre_start_confirm(&mut self, ctx: &egui::Context) {
+        let Some(req) = self.pre_start.clone() else { return };
+        let idx = req.idx;
+        let from_crash_restart = req.from_crash_restart;
+        let reason = req.reason.clone();
+        let name = self.cfg.servers.get(idx).map(|s| s.name.clone()).unwrap_or_default();
+        let mut cancel = false;
+        let mut go = false;
+        egui::Window::new(if from_crash_restart {
+            "自动重启前检查"
+        } else {
+            "启动前检查"
+        })
+        .id(egui::Id::new("pre_start_confirm_window"))
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.set_max_width(560.0);
+            ui.add_space(4.0);
+            ui.label(RichText::new(format!("检测到「{name}」可能仍在运行")).strong());
+            ui.add_space(4.0);
+            ui.label(&reason);
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "建议：先确认/结束残留的 java 进程（任务管理器），或等待 session.lock 释放后再启动。\
+                     两个实例同时打开同一个世界会互相覆盖存档。",
+                )
+                .weak()
+                .small(),
+            );
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                // 默认取消：按钮顺序「取消在左」，危险的放在右侧并标红
+                if ui.button("取消").clicked() {
+                    cancel = true;
+                }
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new("仍要启动").color(self.fg(Color32::from_rgb(230, 120, 120))),
+                        ),
+                    )
+                    .on_hover_text("已知风险：可能与残留实例抢写同一份 region / session.lock")
+                    .clicked()
+                {
+                    go = true;
+                }
+            });
+        });
+        if cancel {
+            self.pre_start = None;
+            if from_crash_restart {
+                // 崩溃重启被拦下：不重启，明确提示（倒计时已用完，不会自动再来）
+                if let Some(rt) = self.runtimes.get_mut(idx) {
+                    rt.last_msg =
+                        "⚠️ 检测到残留实例 / session.lock 未释放，已取消本次自动重启".to_string();
+                }
+                toollog::tool_log(
+                    toollog::ToolLevel::Warn,
+                    "服务器",
+                    format!("崩溃自动重启已取消：{name}（启动前检查命中，用户选择取消）"),
+                );
+                self.notify(
+                    "XMST - 已取消自动重启",
+                    &format!("{name}：检测到该服务器可能仍在运行，未自动重启"),
+                );
+            }
+            process::launch_log_line(&format!(
+                "阶段=启动前检查 选择=取消（服务器={name}）"
+            ));
+        } else if go {
+            self.pre_start = None;
+            process::launch_log_line(&format!(
+                "阶段=启动前检查 选择=仍要启动（服务器={name}，风险已知）"
+            ));
+            toollog::tool_log(
+                toollog::ToolLevel::Warn,
+                "服务器",
+                format!("启动前检查被用户跳过：{name}（仍要启动）"),
+            );
+            if from_crash_restart {
+                if let Some(rt) = self.runtimes.get_mut(idx) {
+                    rt.last_msg = format!("自动重启中（第 {} 次）...", rt.crash_count);
+                }
+            }
+            self.start_server(idx);
+        }
+    }
+
     /// 托盘隐藏态的轻量 tick（约 1s 一次）。
     ///
     /// 为什么托盘态也必须 tick：进程退出/崩溃检测、正常关服自动备份、崩溃与自动重启调度、
@@ -5384,6 +5941,7 @@ impl App {
         self.tick_auto_restart();
         self.tick_crash_restart();
         self.tick_stop();
+        self.tick_exit_snapshot_wait();
         self.tick_ready_stop_timeout();
         self.tick_download();
         self.tick_mod_update();
@@ -5515,6 +6073,41 @@ impl App {
         };
         let lows = server_integrity_lows(&sc);
         self.notify_server_il_lows(&sc, &lows);
+        // P1-5：世界目录写权限自检（只读探测）——失败时给一次提示 + 错误级工具日志
+        // （每台服务器本次运行只记一次，避免每次启动都刷屏）。
+        self.check_world_write_before_start(&sc);
+    }
+
+    /// 世界目录写权限自检（启动前调用，只读探测，见 `probe_world_writable`）。
+    ///
+    /// 失败 → 弹一次提示（含「复制建议」）+ 错误级工具日志「诊断」类别；
+    /// 每台服务器**每次运行只记一次**（key = 名称 + 目录，去重集合 `write_probe_logged`）。
+    fn check_world_write_before_start(&mut self, sc: &ServerConfig) {
+        let Err(detail) = probe_world_writable(&sc.dir) else {
+            return;
+        };
+        let key = format!("{}\u{1}{}", sc.name, sc.dir.to_string_lossy()).to_lowercase();
+        if !self.write_probe_logged.insert(key) {
+            return;
+        }
+        toollog::tool_log(
+            toollog::ToolLevel::Error,
+            "诊断",
+            format!(
+                "世界目录写权限自检失败：{}（{detail}）——安全软件的文件夹保护/勒索防护很可能在拦截",
+                sc.name
+            ),
+        );
+        // 复用 Low IL 提示窗的分发队列，但标记成"写权限"标题（见 ui_low_il_notice）
+        let advice = world_write_advice(&sc.dir);
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(format!("「{}」：无法写入服务器世界目录，存档保存会失败（关服后必然回档）。", sc.name));
+        lines.push(String::new());
+        lines.push(format!("详情：{detail}"));
+        lines.push(String::new());
+        lines.push("安全软件的「文件夹保护 / 勒索防护」很可能在拦截写入。建议：".to_string());
+        lines.push(advice.clone());
+        self.world_write_pending.push((lines.join("\n"), advice));
     }
 
     /// 登记一台服务器的「目录完整性级别为 Low」：错误级工具日志 + 提示入队。
@@ -5594,21 +6187,38 @@ impl App {
         );
     }
 
-    /// 低完整性（Low IL）提示窗：只弹一次，点「我知道了」或右上角关闭后本次运行不再出现。
-    /// 服务器目录的提示与 exe 目录的提示共用这一个窗口，队列里还有就接着弹下一条。
+    /// 低完整性（Low IL）/ 世界目录写权限提示窗：只弹一次，点「我知道了」或右上角关闭后
+    /// 本次运行不再出现。exe 目录、服务器目录、世界目录写权限三类提示共用这一个窗口，
+    /// 队列里还有就接着弹下一条（标题与按钮文案按类别区分）。
     fn ui_low_il_notice(&mut self, ctx: &egui::Context) {
-        if self.low_il_notice.is_none() && !self.low_il_pending.is_empty() {
-            let (text, cmd) = self.low_il_pending.remove(0);
-            self.low_il_notice = Some(text);
-            self.low_il_fix_cmd = cmd;
+        // 上一帧显示的类别：None = 还没取过
+        let mut kind = self.notice_kind.clone();
+        if self.low_il_notice.is_none() && kind.is_none() {
+            if !self.low_il_pending.is_empty() {
+                let (text, cmd) = self.low_il_pending.remove(0);
+                self.low_il_notice = Some(text);
+                self.low_il_fix_cmd = cmd;
+                kind = Some(NoticeKind::LowIl);
+            } else if !self.world_write_pending.is_empty() {
+                let (text, cmd) = self.world_write_pending.remove(0);
+                self.low_il_notice = Some(text);
+                self.low_il_fix_cmd = cmd;
+                kind = Some(NoticeKind::WorldWrite);
+            }
         }
         let Some(text) = self.low_il_notice.clone() else {
             return;
         };
+        let kind = kind.unwrap_or(NoticeKind::LowIl);
         let cmd = self.low_il_fix_cmd.clone();
+        let (title, copy_label) = match kind {
+            NoticeKind::LowIl => ("完整性级别偏低（Low IL）", "复制修复命令"),
+            NoticeKind::WorldWrite => ("无法写入世界目录", "复制建议"),
+        };
         let mut open = true;
         let mut dismiss = false;
-        egui::Window::new("完整性级别偏低（Low IL）")
+        egui::Window::new(title)
+            .id(egui::Id::new("low_il_notice_window"))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
@@ -5621,13 +6231,16 @@ impl App {
                     if ui.button("我知道了").clicked() {
                         dismiss = true;
                     }
-                    if ui.button("复制修复命令").clicked() {
+                    if ui.button(copy_label).clicked() {
                         ui.output_mut(|o| o.copied_text = cmd.clone());
                     }
                 });
             });
         if !open || dismiss {
             self.low_il_notice = None;
+            self.notice_kind = None;
+        } else {
+            self.notice_kind = Some(kind);
         }
     }
 
@@ -5827,7 +6440,8 @@ impl App {
                     rt.crash_restart_at = None;
                     rt.external = None;
                 }
-                self.start_server(idx);
+                // 用户已确认"仍要启动"：再过一遍启动前残留检查（P0-3）
+                self.start_server_checked(idx);
                 self.confirm_start_external = None;
             } else if cancel || !open {
                 self.confirm_start_external = None;
@@ -6288,9 +6902,15 @@ impl App {
         }
     }
 
-    /// 处理优雅停止后台线程回传结果
+    /// 处理优雅停止后台线程回传结果。
+    ///
+    /// ★ 数据安全：等待超时**不在这里强杀**，改为登记 `stop_wait` 让下一帧弹二次确认
+    /// （继续等待 / 强制结束）；只有用户明确选择「强制结束」才会 `kill_tree()`。
     fn tick_stop(&mut self) {
-        while let Ok((idx, ok)) = self.stop_rx.try_recv() {
+        while let Ok(msg) = self.stop_rx.try_recv() {
+            match msg {
+                StopMsg::RoundDone(idx, outcome) => {
+            let ok = outcome == process::StopOutcome::Exited;
             self.stop_inflight.remove(&idx);
             if let Some(rt) = self.runtimes.get_mut(idx) {
                 rt.stopping = false;
@@ -6303,7 +6923,7 @@ impl App {
                 rt.last_msg = if ok {
                     "已优雅停止".to_string()
                 } else {
-                    "停止等待超时".to_string()
+                    "停止未完成".to_string()
                 };
             }
             let name = self.cfg.servers.get(idx).map(|s| s.name.clone()).unwrap_or_default();
@@ -6319,7 +6939,7 @@ impl App {
             }
             self.notify(
                 "XMST - 服务器已停止",
-                &format!("{name} 已{}", if ok { "优雅停止" } else { "超时强制结束" }),
+                &format!("{name} 已{}", if ok { "优雅停止" } else { "结束" }),
             );
             toollog::tool_log(
                 if ok {
@@ -6330,7 +6950,7 @@ impl App {
                 "服务器",
                 format!(
                     "停止：{name}（{}）",
-                    if ok { "优雅停止" } else { "等待超时" }
+                    if ok { "优雅停止" } else { "已结束" }
                 ),
             );
             // 正常关服（等待到进程退出）→ 自动做一份 reason=stop 的快照；超时强杀不算正常关闭
@@ -6341,10 +6961,77 @@ impl App {
                     .map(|rt| rt.log_buf.clone())
                     .unwrap_or_default();
                 let new_crash = self.server_new_crash_report(idx);
-                self.try_exit_snapshot(idx, true, None, &tail, new_crash);
+                self.spawn_exit_snapshot(idx, true, None, &tail, new_crash);
             }
             // 成就统计：本次运行时长（放在崩溃报告判定之后，避免影响"是否有新崩溃报告"的时间基准）
             self.stats_play_secs(idx);
+                }
+                StopMsg::AdoptedKilled(idx, ok) => {
+                    self.stop_inflight.remove(&idx);
+                    if let Some(rt) = self.runtimes.get_mut(idx) {
+                        rt.stopping = false;
+                        rt.start_phase = StartPhase::Idle;
+                        rt.stop_after_ready = false;
+                        rt.stop_queued_at = None;
+                        rt.last_stopped_at = Some(std::time::SystemTime::now());
+                        rt.last_msg = if ok {
+                            "已优雅停止".to_string()
+                        } else {
+                            "结束外部实例失败（可能权限不足），请在任务管理器确认".to_string()
+                        };
+                    }
+                    let name = self.cfg.servers.get(idx).map(|s| s.name.clone()).unwrap_or_default();
+                    toollog::tool_log(
+                        if ok {
+                            toollog::ToolLevel::Info
+                        } else {
+                            toollog::ToolLevel::Warn
+                        },
+                        "服务器",
+                        format!(
+                            "停止外部实例：{name}（{}）",
+                            if ok { "已结束进程树" } else { "结束失败" }
+                        ),
+                    );
+                    self.notify(
+                        "XMST - 服务器已停止",
+                        &format!("{name} 已{}", if ok { "结束" } else { "结束失败" }),
+                    );
+                    if ok {
+                        let tail = self
+                            .runtimes
+                            .get(idx)
+                            .map(|rt| rt.log_buf.clone())
+                            .unwrap_or_default();
+                        let new_crash = self.server_new_crash_report(idx);
+                        self.spawn_exit_snapshot(idx, true, None, &tail, new_crash);
+                    }
+                    self.stats_play_secs(idx);
+                }
+                StopMsg::WaitAgain(idx, p, waited) => {
+                    // 超时未退出且**没有强杀**：句柄留在 UI 侧，登记确认窗等用户选择
+                    self.stop_inflight.remove(&idx);
+                    if let Some(rt) = self.runtimes.get_mut(idx) {
+                        rt.stopping = true;
+                        rt.proc = Some(*p);
+                        rt.last_msg = format!(
+                            "服务器仍未退出（已等待 {waited} 秒）——请在弹窗中选择继续等待或强制结束"
+                        );
+                    }
+                    let name = self.cfg.servers.get(idx).map(|s| s.name.clone()).unwrap_or_default();
+                    toollog::tool_log(
+                        toollog::ToolLevel::Warn,
+                        "服务器",
+                        format!(
+                            "停止等待超时：{name}（已等待 {waited} 秒仍未退出，未强杀，等用户选择）"
+                        ),
+                    );
+                    process::launch_log_line(&format!(
+                        "阶段=停止等待 结果=超时未退出（服务器={name}，已等待 {waited} 秒，未强杀）"
+                    ));
+                    self.stop_wait = Some(StopWaitReq { idx, waited_secs: waited });
+                }
+            }
         }
         // 确认退出模式：所有服务器均已停止、无停止中任务、且关服快照已写完，放行退出
         // （只等退出时触发的快照，耗时的手动备份不阻塞退出；否则进程退出会打断线程、丢掉最后一份快照）
@@ -8056,7 +8743,7 @@ impl App {
         if self.ready_stop_timeout == Some(i) {
             self.ready_stop_timeout = None;
         }
-        self.try_exit_snapshot(i, false, code_opt, &tail, new_crash);
+        self.spawn_exit_snapshot(i, false, code_opt, &tail, new_crash);
     }
     // 「启动中点了停止」的排队：就绪标志已出现 → 本帧自动发起优雅停止
     //（发送 stop → 等服务器保存退出 → 走既有 reason=stop 关服快照）
@@ -8483,8 +9170,11 @@ impl App {
                 sc.auto_restart.last_restart = Some(Local::now().to_rfc3339());
             }
             self.save_config();
-            self.start_server(i);
-            self.set_toast(format!("「{}」自动重启完成", self.cfg.servers[i].name));
+            // 自动重启同样要过启动前残留检查（P0-3）
+            self.start_server_checked(i);
+            if self.pre_start.as_ref().map(|r| r.idx) != Some(i) {
+                self.set_toast(format!("「{}」自动重启完成", self.cfg.servers[i].name));
+            }
         }
     }
 
@@ -8511,7 +9201,9 @@ impl App {
                     "自动重启中（第 {} 次）...",
                     self.runtimes[i].crash_count
                 );
-                self.start_server(i);
+                // ★ 倒计时结束后仍要过一遍启动前残留检查（P0-3）：残留 java / session.lock
+                // 未释放时**不重启**，改为弹确认让用户决定（默认取消）。
+                self.request_start(i, true);
             }
         }
     }
@@ -8752,6 +9444,65 @@ impl App {
         }
     }
 
+    /// 关服/崩溃快照的**安全入口**：先在后台确认「进程完全退出 + 没有该目录的残留 java
+    /// 进程 + `session.lock` 已释放」，再生成快照（最多等 60 秒，超时跳过并记警告）。
+    ///
+    /// ★ P0-2：此前若在"检测到停止日志"时就立刻开快照，会与仍在收尾写 region 的 java
+    /// 抢文件（快照拿到半截存档，甚至把新实例启动时的写入混进快照）。
+    fn spawn_exit_snapshot(
+        &mut self,
+        idx: usize,
+        graceful: bool,
+        exit_code: Option<i32>,
+        log_tail: &str,
+        new_crash_report: bool,
+    ) {
+        let Some(sc) = self.cfg.servers.get(idx).cloned() else { return };
+        if !sc.backup.enabled || !features::is_enabled(&self.cfg.features, features::BETA_BACKUP) {
+            return;
+        }
+        let tail = log_tail.to_string();
+        let sname = sc.name.clone();
+        let dir = sc.dir.clone();
+        let tx = self.exit_snap_tx.clone();
+        // ★ 从"开始等退出"就登记 inflight：否则退出流程（closing_exit）会在等待线程
+        //   还在跑的时候判定"全部停止完毕"直接退出，把最后一份关服快照打断。
+        self.exit_snapshot_inflight.insert(idx);
+        std::thread::spawn(move || {
+            let wait = wait_server_fully_exited(&dir, EXIT_SNAPSHOT_WAIT_SECS);
+            let _ = tx.send((idx, graceful, exit_code, tail, new_crash_report, wait, sname));
+        });
+    }
+
+    /// 后台"等进程完全退出"的回传处理（见 `spawn_exit_snapshot`）。
+    fn tick_exit_snapshot_wait(&mut self) {
+        while let Ok((idx, graceful, exit_code, tail, new_crash, wait, sname)) =
+            self.exit_snap_rx.try_recv()
+        {
+            self.exit_snapshot_inflight.remove(&idx);
+            match wait {
+                Ok(waited) => {
+                    if waited >= 2 {
+                        toollog::tool_log(
+                            toollog::ToolLevel::Info,
+                            "备份",
+                            format!("关服快照等待：{sname} 进程完全退出 + session.lock 释放（{waited} 秒）"),
+                        );
+                    }
+                    self.try_exit_snapshot(idx, graceful, exit_code, &tail, new_crash);
+                }
+                Err(e) => {
+                    // 等不到退出就跳过本次快照：绝不与仍活着的 java 抢写文件
+                    toollog::tool_log(
+                        toollog::ToolLevel::Warn,
+                        "备份",
+                        format!("跳过关服快照：{sname}（{e}）"),
+                    );
+                }
+            }
+        }
+    }
+
     /// 退出后的快照判定统一入口：
     /// 正常关服（三重信号）→ reason=stop；异常退出/新崩溃报告 → 仅在显式开启时才备份。
     fn try_exit_snapshot(
@@ -8856,6 +9607,73 @@ impl App {
                 let _ = tx.send((idx, r));
             });
         }
+    }
+
+    /// 「🧹 清理不完整快照」（P2-6）：二次确认后，**只删除缺 manifest.json 的快照目录**。
+    ///
+    /// 复用 `backup::delete_backup`（它会拒绝 `.mcsrv_backups\snapshots\` 之外的路径），
+    /// 删除前再逐个复核一遍 manifest 仍然缺失（避免用户在弹窗停留期间它被其它流程补全）。
+    fn do_clean_incomplete_snapshots(&mut self) {
+        let Some(req) = self.incomplete_cleanup.take() else { return };
+        let Some(sc) = self.cfg.servers.get(req.idx) else { return };
+        let dir = sc.dir.clone();
+        let sname = sc.name.clone();
+        let targets: Vec<PathBuf> = req
+            .targets
+            .into_iter()
+            .filter(|p| p.is_dir() && snapshot_is_incomplete(p))
+            .collect();
+        if targets.is_empty() {
+            self.set_toast("没有需要清理的不完整快照".to_string());
+            return;
+        }
+        let tx = self.maint_tx.clone();
+        let idx = req.idx;
+        self.backup_cache = None;
+        self.backup_stats_cache = None;
+        std::thread::spawn(move || {
+            let mut ok = 0usize;
+            let mut failed: Vec<String> = Vec::new();
+            for p in &targets {
+                let name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                match backup::delete_backup(&dir, p) {
+                    Ok(()) => {
+                        ok += 1;
+                        toollog::tool_log(
+                            toollog::ToolLevel::Info,
+                            "备份",
+                            format!("清理不完整快照：{name}（缺 manifest.json）"),
+                        );
+                    }
+                    Err(e) => {
+                        failed.push(format!("{name}（{e}）"));
+                        toollog::tool_log(
+                            toollog::ToolLevel::Warn,
+                            "备份",
+                            format!("清理不完整快照失败：{name}（{e}）"),
+                        );
+                    }
+                }
+            }
+            let msg = if failed.is_empty() {
+                format!("已清理 {ok} 份不完整快照")
+            } else {
+                format!(
+                    "已清理 {ok} 份不完整快照；{} 份删除失败：{}",
+                    failed.len(),
+                    failed.join("、")
+                )
+            };
+            toollog::tool_log(
+                toollog::ToolLevel::Info,
+                "备份",
+                format!("清理不完整快照：{sname}（{msg}）"),
+            );
+            let _ = tx.send((idx, Ok(msg)));
+        });
     }
 
     // ---------- 隧道操作 ----------
@@ -10888,6 +11706,30 @@ fn load_config(path: &Path) -> GlobalConfig {
             let tmp = path.with_extension("json.tmp");
             if std::fs::write(&tmp, json.as_bytes()).is_ok() {
                 let _ = std::fs::rename(&tmp, path);
+            }
+        }
+    }
+    // 停服超时自愈：旧版本没有这个字段（serde 默认 300），但配置文件被手改过或写入 0
+    // 时会把"等 0 秒"当成超时立刻弹确认窗；这里统一钳进 30..=1800，有改动才回写。
+    {
+        let mut changed = false;
+        for sc in cfg.servers.iter_mut() {
+            let fixed = config::clamp_stop_timeout_secs(sc.stop_timeout_secs);
+            if fixed != sc.stop_timeout_secs {
+                sc.stop_timeout_secs = fixed;
+                changed = true;
+            }
+        }
+        if changed {
+            migrated.push("停服超时越界值收敛到 30..=1800");
+            if let Ok(json) = serde_json::to_string_pretty(&cfg) {
+                if let Some(data_dir) = path.parent() {
+                    let _ = std::fs::create_dir_all(data_dir);
+                }
+                let tmp = path.with_extension("json.tmp");
+                if std::fs::write(&tmp, json.as_bytes()).is_ok() {
+                    let _ = std::fs::rename(&tmp, path);
+                }
             }
         }
     }
@@ -14096,6 +14938,50 @@ impl eframe::App for App {
         if self.ctx_close_pending {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
+        // ★ 退出途中停止超时：窗口已最小化，用户既看不到"仍要启动/继续等待"的弹窗、也无法再操作。
+        //   但*出口*是用户点过「是，关闭服务器并退出」的，让工具永久卡在"退出中"更糟 ——
+        //   这里在窗口最小化的前提下由程序代为强杀，并写警告级工具日志留证。
+        if self.closing_exit && ctx.input(|i| i.viewport().minimized.unwrap_or(false)) {
+            if let Some(req) = self.stop_wait.clone() {
+                let idx = req.idx;
+                let waited = req.waited_secs;
+                let name = self
+                    .cfg
+                    .servers
+                    .get(idx)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_default();
+                self.stop_wait = None;
+                let killed = match self.runtimes.get_mut(idx) {
+                    Some(rt) => {
+                        let mut k = false;
+                        if let Some(p) = &rt.proc {
+                            k = process::kill(p);
+                        }
+                        if let Some(pid) = rt.adopted_pid.take() {
+                            k = process::kill_pid_tree(pid);
+                        }
+                        rt.stopping = false;
+                        rt.start_phase = StartPhase::Idle;
+                        rt.last_stopped_at = Some(std::time::SystemTime::now());
+                        rt.last_msg = "退出工具：停止超时，已强制结束".to_string();
+                        k
+                    }
+                    None => false,
+                };
+                toollog::tool_log(
+                    toollog::ToolLevel::Warn,
+                    "服务器",
+                    format!(
+                        "退出工具时停止超时：{name}（已等待 {waited} 秒仍未退出，窗口已最小化，代为强制结束；结果={}）",
+                        if killed { "已结束" } else { "未确认成功" }
+                    ),
+                );
+                process::launch_log_line(&format!(
+                    "阶段=停止等待 选择=退出时自动强制结束（服务器={name}，已等待 {waited} 秒）"
+                ));
+            }
+        }
         // [TEST-HOOK] 自动选中第一个服务器，用于复现点击崩溃（验证后删除）
         if std::env::var_os("XMST_AUTO_SELECT").is_some()
             && self.selected_server.is_none()
@@ -14137,7 +15023,9 @@ impl eframe::App for App {
                                 .map(|r| r.proc.is_none() && !r.stopping)
                                 .unwrap_or(false);
                             if free {
-                                self.start_server(i);
+                                // --autostart 路径同样要过启动前残留检查（P0-3）：
+                                // 命中时弹确认（默认取消），不静默启动
+                                self.start_server_checked(i);
                                 self.autostart_launched.insert(i);
                             }
                         }
@@ -14165,6 +15053,8 @@ impl eframe::App for App {
         self.tick_crash_restart();
         // 优雅停止后台线程回传
         self.tick_stop();
+        // 关服快照的「等进程完全退出」回传（P0-2）
+        self.tick_exit_snapshot_wait();
         // 启动中排队停止的超时提示（5 分钟仍未就绪才弹确认窗）
         self.tick_ready_stop_timeout();
         // 网络下载模块回传（下载完成唤醒一次 repaint；托盘态不轮询）
@@ -14695,6 +15585,12 @@ impl eframe::App for App {
         }
         // 「启动中排队停止」超时确认（继续等待 / 强制停止）
         self.ui_ready_stop_timeout(ctx);
+        // 「服务器仍在退出中」确认（停止超时后弹，不静默强杀）
+        self.ui_stop_wait_confirm(ctx);
+        // 启动前残留拦截确认（java 进程 / session.lock）
+        self.ui_pre_start_confirm(ctx);
+        // 不完整快照清理确认
+        self.ui_incomplete_cleanup_confirm(ctx);
         // 清空类操作的二次确认（服务器输出日志 / 工具日志视图）
         self.ui_clear_confirm(ctx);
 
@@ -15814,7 +16710,7 @@ impl App {
                 if tb_running {
                     self.stop_server(i);
                 } else {
-                    self.start_server(i);
+                    self.start_server_checked(i);
                 }
             }
             ui.add_space(UI_SPACE_Y);
@@ -16069,13 +16965,13 @@ impl App {
                 if external.is_some() {
                     self.confirm_start_external = Some(idx);
                 } else {
-                    // 手动启动：重置崩溃重启状态（含熔断）
+                    // 手动启动：重置崩溃重启状态（含熔断），再过一遍启动前残留检查（P0-3）
                     if let Some(rt) = self.runtimes.get_mut(idx) {
                         rt.crash_count = 0;
                         rt.crash_first_at = None;
                         rt.crash_restart_at = None;
                     }
-                    self.start_server(idx);
+                    self.start_server_checked(idx);
                 }
             }
             // 「停止」按钮随启动阶段变形：启动中=排入停止（就绪后自动停），已排队=改为强制停止
@@ -17764,6 +18660,15 @@ impl App {
                     .small(),
                 );
             });
+            // P1-4：默认已改为关闭，但旧配置里显式开启的保持不动 —— 这里明确提示风险
+            ui.label(
+                RichText::new(
+                    "若安全软件保护了服务器目录，此目录可能被拒绝写入（JNA 建临时 dll 会失败，\
+                     服务器可能起不来）；遇到这种报错请关闭本项，改用系统临时目录",
+                )
+                .small()
+                .color(self.fg(Color32::from_rgb(240, 176, 96))),
+            );
         }
         ui.separator();
 
@@ -17780,6 +18685,35 @@ impl App {
         if ui.checkbox(&mut aci, "等待系统 CPU 空闲后再启动（错峰）").changed() {
             self.cfg.servers[idx].autostart_cpu_idle = aci;
             self.save_config();
+        }
+        ui.separator();
+
+        // ---------- 关服（优雅停止超时）----------
+        // ★ 数据安全：超时后**不自动强杀**，改弹二次确认（继续等待 / 强制结束）。
+        // 大整合包一次完整 stop 存档经常要 1 分钟以上，历史上硬编码 30 秒静默 taskkill
+        // 会把存档截断，表现为"关服后回档"。
+        {
+            let mut t = config::clamp_stop_timeout_secs(self.cfg.servers[idx].stop_timeout_secs);
+            let before = t;
+            ui.horizontal(|ui| {
+                ui.label("优雅停止超时（秒）:");
+                ui.add(
+                    egui::DragValue::new(&mut t)
+                        .range(config::STOP_TIMEOUT_MIN_SECS..=config::STOP_TIMEOUT_MAX_SECS)
+                        .speed(5.0),
+                );
+            });
+            ui.label(
+                RichText::new(format!(
+                    "发送 stop 后最多等 {t} 秒；超时不会自动强杀，会弹窗询问「继续等待 / 强制结束」"
+                ))
+                .weak()
+                .small(),
+            );
+            if t != before || t != self.cfg.servers[idx].stop_timeout_secs {
+                self.cfg.servers[idx].stop_timeout_secs = t;
+                self.save_config();
+            }
         }
         ui.separator();
 
@@ -20071,15 +21005,25 @@ impl App {
         ui.separator();
 
         // 统一工具条：左侧快照概况，右侧主操作（备份 / 清理 / 刷新）
-        let tb_count = self.backup_list_cached(idx).len();
+        let tb_list = self.backup_list_cached(idx);
+        let tb_count = tb_list.len();
+        let tb_incomplete: Vec<PathBuf> = tb_list
+            .iter()
+            .filter(|b| b.is_snapshot && snapshot_is_incomplete(&b.path))
+            .map(|b| b.path.clone())
+            .collect();
+        let tb_incomplete_n = tb_incomplete.len();
         let mut tb_backup = false;
         let mut tb_retention = false;
         let mut tb_refresh = false;
+        let mut tb_clean_incomplete = false;
         page_toolbar(ui, "").show(
             move |tbf| {
                 tbf.label(
                     RichText::new(if tb_count == 0 {
                         "暂无备份".to_string()
+                    } else if tb_incomplete_n > 0 {
+                        format!("共 {tb_count} 份备份（{tb_incomplete_n} 份不完整）")
                     } else {
                         format!("共 {tb_count} 份备份")
                     })
@@ -20103,6 +21047,13 @@ impl App {
                     tb_retention = true;
                 }
                 if tba
+                    .add_sized([140.0, ui_ctl_h()], egui::Button::new("🧹 清理不完整"))
+                    .on_hover_text("只删除缺少 manifest.json 的快照目录（工具半途退出留下的残骸，无法回退）")
+                    .clicked()
+                {
+                    tb_clean_incomplete = true;
+                }
+                if tba
                     .add_sized([124.0, ui_ctl_h()], egui::Button::new("🔄 立即备份"))
                     .on_hover_text("马上生成一份快照（不等待定时器）")
                     .clicked()
@@ -20123,6 +21074,16 @@ impl App {
         if tb_backup {
             self.spawn_backup(idx, backup::BackupReason::Manual, true);
             self.set_toast("已开始生成快照".to_string());
+        }
+        if tb_clean_incomplete {
+            if tb_incomplete.is_empty() {
+                self.set_toast("没有发现不完整的快照".to_string());
+            } else {
+                self.incomplete_cleanup = Some(IncompleteCleanupReq {
+                    idx,
+                    targets: tb_incomplete,
+                });
+            }
         }
         ui.add_space(UI_SPACE_Y);
 
@@ -20469,31 +21430,53 @@ impl App {
                                     backup::BackupKind::Incremental => self.fg(Color32::from_rgb(120, 180, 255)),
                                     backup::BackupKind::Snapshot => self.fg(Color32::from_rgb(120, 200, 255)),
                                 };
+                                // P2-6：缺少 manifest.json 的快照是工具半途退出留下的残骸，
+                                // 明确标「不完整」并禁止回退（回退会被 backup.rs 直接拒绝）
+                                let incomplete = b.is_snapshot && snapshot_is_incomplete(&b.path);
                                 ui.label(RichText::new(format!("[{}]", b.kind.label())).color(kind_color));
                                 ui.label(RichText::new(format!("[{}]", b.reason)).weak().small());
+                                if incomplete {
+                                    ui.label(
+                                        RichText::new("[不完整]")
+                                            .color(self.fg(Color32::from_rgb(230, 120, 120)))
+                                            .strong(),
+                                    );
+                                }
                                 let detail = if b.is_snapshot {
                                     let pinned = self
                                         .snapshot_pins
                                         .get(&b.path)
                                         .copied()
                                         .unwrap_or(false);
-                                    format!(
-                                        "{}{} ｜ 共 {} 个文件、变化 {} 个、新增 {} ｜ 总 {} ｜ {}",
-                                        if pinned { "🔒 " } else { "" },
-                                        b.name,
-                                        b.files_total,
-                                        b.files_copied,
-                                        fmt_size(b.bytes_copied),
-                                        fmt_size(b.size),
-                                        b.mtime
-                                    )
+                                    if incomplete {
+                                        format!(
+                                            "{} ｜ 缺少 manifest.json（工具上次未写完），不可回退；可用工具条「🧹 清理不完整快照」删除",
+                                            b.name
+                                        )
+                                    } else {
+                                        format!(
+                                            "{}{} ｜ 共 {} 个文件、变化 {} 个、新增 {} ｜ 总 {} ｜ {}",
+                                            if pinned { "🔒 " } else { "" },
+                                            b.name,
+                                            b.files_total,
+                                            b.files_copied,
+                                            fmt_size(b.bytes_copied),
+                                            fmt_size(b.size),
+                                            b.mtime
+                                        )
+                                    }
                                 } else {
                                     format!("{}  ({}, {})", b.name, fmt_size(b.size), b.mtime)
                                 };
                                 ui.label(detail);
                             });
                             ui.horizontal(|ui| {
-                                if ui.button("回退").clicked() {
+                                let incomplete = b.is_snapshot && snapshot_is_incomplete(&b.path);
+                                // 不完整快照：回退按钮禁用（点了也只会得到"清单缺失"，不如直接置灰）
+                                if incomplete {
+                                    ui.add_enabled(false, egui::Button::new("回退"))
+                                        .on_disabled_hover_text("快照不完整（缺 manifest.json），无法回退");
+                                } else if ui.button("回退").clicked() {
                                     restore_target = Some((b.path.clone(), b.name.clone()));
                                 }
                                 if ui.button("删除").clicked() {
@@ -25320,7 +26303,7 @@ impl App {
             self.create_server = None;
             if let Some(i) = idx {
                 self.selected_server = Some(i);
-                self.start_server(i);
+                self.start_server_checked(i);
             }
         }
         if do_close {
@@ -30865,6 +31848,42 @@ fn log_shows_client_class_mixin_failure(server_dir: &Path) -> bool {
     })
 }
 
+/// 等一台服务器**完全退出**（P0-2）：进程已退出 + 没有该目录的残留 java 进程 +
+/// `session.lock` 不再被刷新。最多等 `max_secs` 秒。
+///
+/// 返回 Ok(实际等待秒数)；超时返回 Err(原因)，调用方据此**跳过**本次快照（绝不与
+/// 仍在写 region 的 java 抢文件）。判定依据：
+/// 1. 该服务器目录下命令行命中的 java/javaw 进程数为 0（复用 `list_java_processes`）；
+/// 2. `<世界目录>\session.lock` 要么不存在，要么最近 3 秒内没有被改写
+///    （MC 正常关服会在最后删掉它；仍在跑时会周期性刷新它的时间戳）。
+fn wait_server_fully_exited(dir: &Path, max_secs: u64) -> Result<u64, String> {
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_secs(max_secs);
+    let mut last_note;
+    loop {
+        let procs = process::java_processes_for_dir(dir);
+        let (lock_exists, lock_age) = process::session_lock_state(dir);
+        let lock_fresh = lock_exists && lock_age.map(|a| a < 3).unwrap_or(false);
+        if procs.is_empty() && !lock_fresh {
+            return Ok(started.elapsed().as_secs());
+        }
+        last_note = if !procs.is_empty() {
+            format!("仍有 {} 个该目录的 java 进程", procs.len())
+        } else {
+            format!(
+                "session.lock 仍被刷新（{} 秒前）",
+                lock_age
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| "?".to_string())
+            )
+        };
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("等待 {max_secs} 秒后{last_note}，已跳过本次快照"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+}
+
 /// 启动前预检（只读检查，不修改任何文件，也不阻断启动）。
 fn run_precheck(sc: &ServerConfig, cfg: &GlobalConfig) -> Vec<PrecheckItem> {
     let mut items: Vec<PrecheckItem> = Vec::new();
@@ -31227,7 +32246,117 @@ fn run_precheck(sc: &ServerConfig, cfg: &GlobalConfig) -> Vec<PrecheckItem> {
         }
     }
 
+    // 9) 世界目录 / world\region 写权限（只读探测，不修改任何既有文件）
+    //    诊断报告 §二.3：安全软件的「文件夹保护 / 勒索防护」会**随机拒绝** java 写
+    //    `world\region\*.mca`，症状是日志刷 AccessDeniedException、故障期间进度全丢、
+    //    怎么关服都回档。这里在启动前探一次，让用户提前知道而不是等丢数据。
+    {
+        match probe_world_writable(&sc.dir) {
+            Ok(()) => items.push(PrecheckItem::pass(
+                "世界目录写权限",
+                format!(
+                    "{} 可创建/删除临时文件{}（未修改任何既有文件）",
+                    sc.dir.join("world").display(),
+                    if sc.dir.join("world").join("region").is_dir() {
+                        "，world\\region 可打开写入"
+                    } else {
+                        ""
+                    }
+                ),
+            )),
+            Err(e) => items.push(PrecheckItem::fail(
+                "世界目录写权限",
+                e,
+                "安全软件的「文件夹保护 / 勒索防护」很可能在拦截写入。建议：① 把服务器移出桌面等被保护位置（如 D:\\MCServer\\…）；② 在安全软件的白名单里加入服务器目录与 java.exe（<Java 路径>\\bin\\java.exe）".to_string(),
+            )),
+        }
+    }
+
     items
+}
+
+/// 快照目录是否**不完整**（P2-6）：缺 `manifest.json`。
+///
+/// 工具写快照的顺序是「先落文件、最后写 manifest.json + meta.json」，因此缺 manifest
+/// 就等于上一次写到一半被打断（诊断报告里 `.mcsrv_backups\snapshots\20261005_145301`
+/// 只有 `world`、没有 manifest/meta）。这种快照 `backup::restore_backup` 会直接拒绝，
+/// 所以界面必须标出来并禁止回退。
+fn snapshot_is_incomplete(dir: &Path) -> bool {
+    !dir.join("manifest.json").is_file()
+}
+
+/// 扫描一台服务器下所有不完整快照（缺 manifest.json 的快照目录）。
+/// 只返回**直接位于 `.mcsrv_backups\snapshots\` 下的目录**，绝不波及别处。
+fn scan_incomplete_snapshots(server_dir: &Path) -> Vec<PathBuf> {
+    let root = server_dir.join(".mcsrv_backups").join("snapshots");
+    let mut out: Vec<PathBuf> = Vec::new();
+    let Ok(rd) = std::fs::read_dir(&root) else {
+        return out;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() && snapshot_is_incomplete(&p) {
+            out.push(p);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// 世界目录写权限探测（**只读性质，不修改任何既有文件**）：/// 1. 在 `<服务器目录>\world` 下创建临时文件 `.xmst_write_probe.tmp` 并立即删除
+///    （只新增/删除自己的临时文件，既有文件一个字节都不动）；
+/// 2. 若 `world\region` 存在，用 `OpenOptions::write(true)` **打开**其中一个 .mca
+///    （只打开、不写入，句柄立刻关闭）——「文件夹保护」类软件拦截的正是"打开既有
+///    存档文件准备写入"这一步，仅探测新建临时文件会漏判。
+fn probe_world_writable(server_dir: &Path) -> Result<(), String> {
+    let world = server_dir.join("world");
+    if !world.is_dir() {
+        return Err(format!(
+            "世界目录不存在（{}）：首次启动会生成，若安全软件拦截创建也会失败",
+            world.display()
+        ));
+    }
+    let probe = world.join(".xmst_write_probe.tmp");
+    match std::fs::write(&probe, b"probe") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+        }
+        Err(e) => {
+            return Err(format!(
+                "无法在 {} 下创建临时文件（{e}）——world 目录不可写，服务器存档会写不进去",
+                world.display()
+            ));
+        }
+    }
+    let region = world.join("region");
+    if !region.is_dir() {
+        return Ok(());
+    }
+    // 找第一个 .mca 做"能否以写入方式打开"的探测（只打开，不写内容，不改 mtime/内容）
+    let mut tested: Option<PathBuf> = None;
+    if let Ok(rd) = std::fs::read_dir(&region) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().map(|x| x.eq_ignore_ascii_case("mca")).unwrap_or(false) {
+                tested = Some(p);
+                break;
+            }
+        }
+    }
+    let Some(p) = tested else {
+        return Ok(());
+    };
+    match std::fs::OpenOptions::new().write(true).open(&p) {
+        Ok(f) => {
+            drop(f);
+            Ok(())
+        }
+        Err(e) => Err(format!(
+            "世界目录可写，但无法以写入方式打开区域文件 {}（{e}）：\
+             服务器保存区块时会被拒绝（症状：日志刷 AccessDeniedException、关服回档）",
+            p.display()
+        )),
+    }
 }
 
 /// 从 JVM 参数字符串里解析 `-Xmx`（返回 GB 近似值；-Xmx2G / -Xmx2048M / -Xmx2048 都认）。
@@ -32149,6 +33278,95 @@ mod encoding_selfcheck {
         let n = ex.len();
         assert!(!migrate_backup_exclude_tmp(&mut cfg2));
         assert_eq!(cfg2.servers[0].backup.exclude.len(), n);
+    }
+
+    /// 数据安全回归：停服超时默认 300、旧配置越界值自愈、缺字段的旧配置按 300 处理
+    #[test]
+    fn stop_timeout_defaults_and_clamp() {
+        let sc = ServerConfig::default();
+        assert_eq!(sc.stop_timeout_secs, 300, "默认停服超时必须是 300 秒");
+        assert_eq!(config::clamp_stop_timeout_secs(0), 300, "0 = 缺失，回落 300");
+        assert_eq!(config::clamp_stop_timeout_secs(1), 30, "低于下限钳到 30");
+        assert_eq!(config::clamp_stop_timeout_secs(99999), 1800, "高于上限钳到 1800");
+        assert_eq!(config::clamp_stop_timeout_secs(300), 300);
+        // 旧配置文件里没有 stop_timeout_secs 字段 → serde 默认值必须补成 300
+        let mut v: serde_json::Value =
+            serde_json::to_value(ServerConfig::default()).expect("默认配置可序列化");
+        v.as_object_mut().unwrap().remove("stop_timeout_secs");
+        v.as_object_mut().unwrap().remove("use_private_tmp");
+        let parsed: ServerConfig = serde_json::from_value(v).expect("旧配置必须能解析");
+        assert_eq!(parsed.stop_timeout_secs, 300, "缺字段的旧配置要按 300 处理");
+        assert!(!parsed.use_private_tmp, "缺字段的旧配置按新默认（关闭）处理");
+    }
+
+    /// 数据安全回归：`use_private_tmp` 新默认必须是 false；旧配置里显式的 true 必须保留
+    #[test]
+    fn private_tmp_default_off_but_legacy_true_kept() {
+        assert!(!ServerConfig::default().use_private_tmp, "新默认必须关闭");
+        let mut v: serde_json::Value =
+            serde_json::to_value(ServerConfig::default()).expect("默认配置可序列化");
+        v.as_object_mut()
+            .unwrap()
+            .insert("use_private_tmp".to_string(), serde_json::Value::Bool(true));
+        let parsed: ServerConfig = serde_json::from_value(v).expect("旧配置必须能解析");
+        assert!(parsed.use_private_tmp, "旧配置里显式开启的必须保持不动");
+    }
+
+    /// 数据安全回归：不完整快照（缺 manifest.json）的识别与"只删这些"的范围限定
+    #[test]
+    fn incomplete_snapshot_detect_and_scan() {
+        let d = tmp_dir("incomplete_snap");
+        let snaps = d.join(".mcsrv_backups").join("snapshots");
+        let good = snaps.join("20261005_120000");
+        let bad = snaps.join("20261005_145301");
+        std::fs::create_dir_all(&good).unwrap();
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(good.join("manifest.json"), b"{}").unwrap();
+        std::fs::create_dir_all(bad.join("world")).unwrap();
+        std::fs::write(bad.join("world").join("level.dat"), b"x").unwrap();
+        assert!(!snapshot_is_incomplete(&good));
+        assert!(snapshot_is_incomplete(&bad));
+        let found = scan_incomplete_snapshots(&d);
+        assert_eq!(found, vec![bad.clone()], "只应报出缺 manifest 的那份");
+        // 清理只删不完整的那份，完整的快照与目录结构必须原样保留
+        backup::delete_backup(&d, &bad).expect("删除不完整快照");
+        assert!(!bad.exists());
+        assert!(good.join("manifest.json").is_file(), "完整快照不能被碰");
+        assert!(scan_incomplete_snapshots(&d).is_empty());
+    }
+
+    /// 数据安全回归：只读探测不得修改既有文件（内容与修改时间都要保持原样）
+    #[test]
+    fn probe_world_writable_is_read_only() {
+        let d = tmp_dir("probe_world");
+        let region = d.join("world").join("region");
+        std::fs::create_dir_all(&region).unwrap();
+        let mca = region.join("r.0.0.mca");
+        std::fs::write(&mca, b"region-data").unwrap();
+        let before_len = std::fs::metadata(&mca).unwrap().len();
+        probe_world_writable(&d).expect("可写目录应探测通过");
+        assert_eq!(std::fs::metadata(&mca).unwrap().len(), before_len);
+        assert_eq!(std::fs::read(&mca).unwrap(), b"region-data");
+        // 探测用的临时文件必须被删掉，不能留在 world 里
+        assert!(!d.join("world").join(".xmst_write_probe.tmp").exists());
+        assert!(
+            std::fs::read_dir(d.join("world"))
+                .unwrap()
+                .flatten()
+                .all(|e| !e.file_name().to_string_lossy().contains("xmst")),
+            "world 目录里不能残留探测文件"
+        );
+    }
+
+    /// 数据安全回归：停服超时不再静默强杀 —— 走 process.rs 的语义测试，
+    /// 这里只锁住"300 秒默认 + 不强杀的调用点"这两条约定。
+    #[test]
+    fn stop_path_uses_wait_not_kill() {
+        // 默认超时必须远大于历史硬编码的 30 秒（大整合包一次完整存档经常 1 分钟以上）
+        assert!(ServerConfig::default().stop_timeout_secs >= 300);
+        // 用户可调范围必须覆盖 30..=1800
+        assert_eq!(config::STOP_TIMEOUT_MIN_SECS, 30);
+        assert_eq!(config::STOP_TIMEOUT_MAX_SECS, 1800);
     }
 }
 

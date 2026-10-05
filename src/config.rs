@@ -273,11 +273,34 @@ fn default_true() -> bool {
     true
 }
 
-/// 独立临时目录默认开启：把服务器的 TEMP/TMP 与 java.io.tmpdir 指向服务器目录下的子目录，
-/// 避免 JNA / sqlite-jdbc 之类需要把原生 DLL 解压到 java.io.tmpdir 的库，
-/// 在全局临时目录存在残留（jna-*/sqlite-* 旧目录）时加载失败。
+/// 独立临时目录默认**关闭**（2026-10-05 改）。
+///
+/// 历史默认是 true（把 TEMP/TMP 与 java.io.tmpdir 指向 `<服务器目录>\tmp`，绕过
+/// "JNA/SQLite 解压原生 DLL 到全局临时目录失败"）。但诊断报告实录了更严重的后果：
+/// **在带「文件夹保护 / 勒索防护」的机器上，这个目录会被拒绝访问** —— JNA 建临时
+/// dll 直接报 `UnsatisfiedLinkError: ... 拒绝访问`，服务器启动失败。
+/// 而它当初要绕的"工具拉不起 run.bat"根因已经修掉（GBK 读取 bug，见 §6.1 第 36 条），
+/// 故新配置默认关闭。**旧配置里显式写了 `use_private_tmp: true` 的保持原值不动。**
 fn default_use_private_tmp() -> bool {
-    true
+    false
+}
+
+/// 优雅停止的最长等待秒数默认 300：MC 大整合包（3 GB region + 20+ 维度）一次完整
+/// `stop` 存档经常要 1 分钟以上，历史上硬编码 30 秒 → 超时静默 taskkill → 存档截断回档。
+fn default_stop_timeout_secs() -> u64 {
+    300
+}
+
+/// 优雅停服超时的合法区间（界面 DragValue 与自愈都用它）
+pub const STOP_TIMEOUT_MIN_SECS: u64 = 30;
+pub const STOP_TIMEOUT_MAX_SECS: u64 = 1800;
+
+/// 把停服超时钳进合法区间；0/越界值自愈为默认 300（旧配置里没有该字段时也走这里）。
+pub fn clamp_stop_timeout_secs(v: u64) -> u64 {
+    if v == 0 {
+        return default_stop_timeout_secs();
+    }
+    v.clamp(STOP_TIMEOUT_MIN_SECS, STOP_TIMEOUT_MAX_SECS)
 }
 
 fn default_private_tmp_name() -> String {
@@ -440,11 +463,18 @@ pub struct ServerConfig {
     #[serde(default = "default_launch_mode")]
     pub launch_mode: String,
     /// 启动时使用服务器目录下的独立临时目录（TEMP/TMP + java.io.tmpdir）
+    ///
+    /// ★ 默认 false：带「文件夹保护 / 勒索防护」的机器会拒绝写入该目录（JNA 建临时 dll
+    /// 失败 → 服务器起不来，见 config.rs 的 `default_use_private_tmp` 说明）。
     #[serde(default = "default_use_private_tmp")]
     pub use_private_tmp: bool,
     /// 独立临时目录名（相对服务器目录，默认 tmp）
     #[serde(default = "default_private_tmp_name")]
     pub private_tmp_name: String,
+    /// 优雅停止（发 stop 后）的最长等待秒数；超时**不自动强杀**，改弹二次确认。
+    /// 默认 300，区间 30..=1800（越界值由 `clamp_stop_timeout_secs` 自愈）。
+    #[serde(default = "default_stop_timeout_secs")]
+    pub stop_timeout_secs: u64,
     /// 是否被用户收藏（收藏的服务器在列表中置顶）
     #[serde(default)]
     pub favorited: bool,
@@ -486,6 +516,7 @@ impl Default for ServerConfig {
             launch_mode: default_launch_mode(),
             use_private_tmp: default_use_private_tmp(),
             private_tmp_name: default_private_tmp_name(),
+            stop_timeout_secs: default_stop_timeout_secs(),
             favorited: false,
             autostart_enabled: false,
             autostart_cpu_idle: true,

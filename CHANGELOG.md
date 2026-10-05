@@ -44,6 +44,18 @@
 - **搜索位置**：取消"顶栏搜索"写法 —— 设置项搜索移到左侧分区导航里（搜的就是那些分区）、日志页过滤贴着日志列表、下载页顶部重复搜索框删除
 - **文案**：继续清除解释工具内部机制的说明（如"（与脚本一致，不会双重启）""（后台执行：…）""（平时自动保存）""（占用整份空间）""已锁定为独立归档（不再随源文件变化）""正在后台清理超出保留策略的快照…""关闭后过渡立即完成，后台刷新率降到最低"、Java 分组的机制 hint、"服务器控制台日志在 服务器 → 控制台…"等）
 
+### 数据安全（关服回档专项，2026-10-05 第四批）
+> 起因：ATM10 世界「stop 关服后回档」诊断报告（`D:\Desktop\[7.3] AllTheMod10`）。结论是「30 秒超时静默强杀 + 桌面目录写入被拒 + 快照在进程未退出时开跑 + 启动前不查残留」四件事叠加。
+
+- **停服超时 30 → 300 秒，且超时不再静默强杀**：`process::stop_gracefully_wait` 超时只回报 `StopOutcome::StillRunning`（**不 taskkill**），UI 弹「服务器仍在退出中（已等待 N 秒）」→「继续等待（再等一轮，可反复）/ 强制结束（才 kill_tree，并写警告级工具日志）」。新增每服务器配置 `stop_timeout_secs`（默认 300，区间 30..=1800，UI 在「服务器 → 设置 → 启动参数」里，带一行说明）；越界/为 0 的旧配置在 `load_config` 里自愈回写。既有「排队优雅停止（`stop_after_ready`）」与「就绪后自动停止」逻辑未改动。工具退出（窗口已最小化）途中若停止超时，由程序代为强杀并留警告日志，避免永久卡在"退出中"。
+- **「强制停止（含进程树）」二次确认文案加强**：明确写"不发 stop、不会保存世界、未保存的进度会丢失（世界可能回档到上一次自动保存）"。
+- **关服快照等进程完全退出后才开始**：`wait_server_fully_exited`（最多 60 秒）确认「没有该目录的 java 进程 + `world\session.lock` 不再被刷新」，超时则**跳过快照并记警告**（绝不与仍在写 region 的 java 抢文件）；等待期间就登记 `exit_snapshot_inflight`，退出流程不会打断最后一份快照。
+- **启动前必须查残留 / `session.lock`**：「启动服务器」「--autostart」「崩溃自动重启」「run.bat 失败回退」四条路径统一走 `request_start` → `pre_start_issue`（复用 `list_java_processes` 的命令行匹配 + `session.lock` 新鲜度）；命中不再静默启动，弹确认「仍要启动 / 取消」（**默认取消，取消在左**）；崩溃重启被拦下时明确提示「已取消本次自动重启」。
+- **`use_private_tmp` 默认改为关闭**：诊断报告实录「文件夹保护」机器上 `<服务器目录>\tmp` 被拒绝写入，JNA 建临时 dll 直接 `UnsatisfiedLinkError`；而它当初要绕的"工具拉不起 run.bat"根因已修（GBK 读取 bug）。**旧配置里显式 `true` 的保持不动**，只在该选项下加一行橙色提示「若安全软件保护了服务器目录，此目录可能被拒绝写入」。
+- **世界目录写权限自检**（启动前预检第 9 项）：只读探测 —— 在 `world\` 下建/删临时文件 + 以写入方式**打开**一个既有 `.mca`（只打开、不写入、不改任何既有文件）；失败判「失败」并给"文件夹保护/勒索防护在拦截"的建议（移出桌面 + 白名单加服务器目录与 `java.exe`）与「复制建议」按钮，错误级工具日志每台每次运行只记一次。
+- **不完整快照识别与清理**：缺 `manifest.json` 的快照在备份列表里标 `[不完整]` 且**回退按钮置灰**；工具条新增「🧹 清理不完整」（二次确认后只删除 `.mcsrv_backups\snapshots\` 下缺 manifest 的目录，删除前逐个复核，绝不碰其它快照与旧版 zip）。
+- 回归测试 +5：`stop_timeout_defaults_and_clamp`、`private_tmp_default_off_but_legacy_true_kept`、`incomplete_snapshot_detect_and_scan`、`probe_world_writable_is_read_only`、`stop_path_uses_wait_not_kill`（另在 `process.rs` 新增 `java_proc_scan_is_safe_and_normalized`、`session_lock_state_reads_age`、`stop_gracefully_wait_does_not_kill`——最后一条直接断言"超时后进程必须仍然活着"）。
+
 ### 稳定性与性能
 - 锁访问统一为中毒可恢复（`main.rs` 9 处、`process.rs`、`modrinth.rs` 6 处），全仓不再有 `.lock().ok()`
 - 下载状态的 `unwrap()` 解包收敛为一次性取值，避免 `panic=abort` 下任一处失手直接闪退；下载落盘统一走 `.part` → 校验字节/哈希 → `rename`；目录体积统计（`dir_stats`）接入缓存，渲染路径不再每帧遍历

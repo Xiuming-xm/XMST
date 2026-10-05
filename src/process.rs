@@ -973,25 +973,95 @@ pub fn start_ready_seen(buf: &str) -> bool {
     buf.contains("Done (") || buf.contains("For help, type \"help\"")
 }
 
-/// 尝试优雅停止：写入 stop，最多等待 timeout 秒，超时则强制终止整个进程树
-/// 注意：必须在后台线程中调用，避免阻塞 UI
-pub fn stop_gracefully(proc: &ManagedProcess, timeout_secs: u64) -> bool {
+/// 优雅停止的等待结果：区分「进程确实退出了」与「等到超时仍未退出」。
+///
+/// ★ 数据安全：超时**不代表**可以强杀 —— MC 关服要写 level.dat + 全部 region，
+/// 大整合包（3 GB region / 20+ 维度）一次完整保存经常要 1 分钟以上。调用方必须把
+/// `StillRunning` 呈现给用户（继续等待 / 强制结束），不能静默 taskkill（见
+/// `stop_gracefully` 的历史行为与 `StopOutcome` 的用法）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopOutcome {
+    /// 进程已在超时前自行退出（存档流程走完了）
+    Exited,
+    /// 等到超时仍未退出：**没有**做任何强杀，句柄留给调用方处置
+    StillRunning,
+}
+
+/// 写入 stop 后最多等待 timeout 秒，**超时不强杀**（返回 `StillRunning`）。
+///
+/// 注意：必须在后台线程中调用，避免阻塞 UI。
+pub fn stop_gracefully_wait(proc: &ManagedProcess, timeout_secs: u64) -> StopOutcome {
     let _ = write_stdin(proc, "stop");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
         {
             let mut child = proc.child.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(status) = child.try_wait().unwrap_or(None) {
-                let _ = status;
-                return true;
+            match child.try_wait() {
+                Ok(Some(_)) => return StopOutcome::Exited,
+                // 查询失败（句柄异常）：不再空等，交给调用方按"仍在运行"处理
+                Err(_) => return StopOutcome::StillRunning,
+                Ok(None) => {}
             }
         }
         if std::time::Instant::now() >= deadline {
-            kill_tree(proc);
-            return false;
+            return StopOutcome::StillRunning;
         }
         std::thread::sleep(std::time::Duration::from_millis(300));
     }
+}
+
+/// 尝试优雅停止：写入 stop，最多等待 timeout 秒，**超时则强制终止整个进程树**，返回是否优雅退出。
+///
+/// 调用方注意：这是"会强杀"的简化版本，只适合「强杀可接受」的场景（如回退前必须停服、
+/// 工具退出时的静默关服）。用户手动点「停止服务器」必须走 `stop_gracefully_wait` +
+/// 二次确认，**不能**用这个函数（历史 bug：30 秒超时静默 taskkill 造成存档截断回档）。
+pub fn stop_gracefully(proc: &ManagedProcess, timeout_secs: u64) -> bool {
+    match stop_gracefully_wait(proc, timeout_secs) {
+        StopOutcome::Exited => true,
+        StopOutcome::StillRunning => {
+            kill_tree(proc);
+            false
+        }
+    }
+}
+
+/// 找出命令行中包含 `dir` 的 java/javaw 进程（即"这个服务器目录的 java 实例"）。
+///
+/// 用途：启动前残留检测与"等进程完全退出"。`list_java_processes` 已经拿了命令行，
+/// 这里只做大小写不敏感的路径匹配；取不到命令行（权限不足）的进程**不计入**
+/// （宁可漏报也不误判，误判会把用户正常的启动拦下来）。
+pub fn java_processes_for_dir(dir: &Path) -> Vec<JavaProc> {
+    let needle = dir.to_string_lossy().replace('/', "\\").to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    list_java_processes()
+        .into_iter()
+        .filter(|p| {
+            p.cmdline
+                .as_deref()
+                .map(|c| c.replace('/', "\\").to_lowercase().contains(&needle))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+/// `<服务器目录>\session.lock` 的 (存在?, 最近修改秒数)。
+///
+/// MC 用"写入并保持一个随机 long"来判断世界是否已被别的实例打开；这里按
+/// **存在 + 时间戳很新** 作为"可能仍在运行"的旁证（工具自己没有它的句柄，
+/// 无法做真正的独占锁探测，故只作为辅助信号，与 java 进程扫描一起用）。
+pub fn session_lock_state(server_dir: &Path) -> (bool, Option<u64>) {
+    let p = server_dir.join("world").join("session.lock");
+    let Ok(md) = std::fs::metadata(&p) else {
+        return (false, None);
+    };
+    let age = md
+        .modified()
+        .ok()
+        .and_then(|t| SystemTime::now().duration_since(t).ok())
+        .map(|d| d.as_secs());
+    (true, age)
 }
 
 /// 强制杀死整个进程树（cmd -> java 等子进程一并终止）
@@ -2200,5 +2270,97 @@ fn read_command_line_x64(pid: u32) -> Option<String> {
         } else {
             Some(s)
         }
+    }
+}
+
+#[cfg(test)]
+mod data_safety_selfcheck {
+    use super::*;
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("xmst_proc_{name}"));
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::create_dir_all(&d);
+        d
+    }
+
+    /// 造一个只用到 child 的 ManagedProcess（日志通道用一个丢弃接收端的空管道即可）。
+    fn wrap(child: Child) -> ManagedProcess {
+        let (tx, rx) = mpsc::channel::<String>();
+        drop(tx);
+        ManagedProcess {
+            child: Arc::new(Mutex::new(child)),
+            log_rx: rx,
+            allow_stdin: false,
+            stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
+            cmdline: String::new(),
+            _job: None,
+        }
+    }
+
+    /// `java_processes_for_dir`：不存在的目录必须返回空（不误报），
+    /// 且大小写/分隔符差异不应影响匹配（同一目录写成 `/` 与 `\` 都算同一个）。
+    #[test]
+    fn java_proc_scan_is_safe_and_normalized() {
+        let d = tmp_dir("javaproc");
+        assert!(java_processes_for_dir(&d).is_empty(), "无 java 进程时必须为空");
+        // 大小写不同的同一路径：走小写归一化，结果一致（都是空表，不 panic）
+        let upper = PathBuf::from(d.to_string_lossy().to_uppercase());
+        assert_eq!(
+            java_processes_for_dir(&upper).len(),
+            java_processes_for_dir(&d).len()
+        );
+        // 空路径绝不能匹配到所有 java（那会把用户的启动全拦下来）
+        assert!(java_processes_for_dir(Path::new("")).is_empty());
+    }
+
+    /// `session_lock_state`：不存在返回 (false, None)；存在时返回年龄秒数。
+    #[test]
+    fn session_lock_state_reads_age() {
+        let d = tmp_dir("sessionlock");
+        assert_eq!(session_lock_state(&d), (false, None));
+        let world = d.join("world");
+        std::fs::create_dir_all(&world).unwrap();
+        std::fs::write(world.join("session.lock"), b"12345678").unwrap();
+        let (exists, age) = session_lock_state(&d);
+        assert!(exists);
+        assert!(age.map(|a| a <= 5).unwrap_or(false), "刚写的锁年龄应接近 0");
+    }
+
+    /// 停服等待超时**不得**强杀（P0-1）：对不会自己退出的进程返回 StillRunning，
+    /// 且进程必须仍然活着（历史 bug 就是在这里 taskkill，导致存档截断回档）。
+    #[test]
+    fn stop_gracefully_wait_does_not_kill() {
+        let child = Command::new("cmd")
+            .args(["/c", "ping -n 60 127.0.0.1 > NUL"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn 长睡进程");
+        let pid = child.id();
+        let mp = wrap(child);
+        // 只等 1 秒：远小于进程存活时间，必然走超时分支
+        assert_eq!(
+            stop_gracefully_wait(&mp, 1),
+            StopOutcome::StillRunning,
+            "超时必须报 StillRunning"
+        );
+        assert!(pid_alive(pid), "★ 超时绝不能强杀（否则就是截断存档的回档 bug）");
+
+        // 自查：真能自己退出的进程必须报 Exited
+        let fast = Command::new("cmd")
+            .args(["/c", "exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn 立即退出进程");
+        assert_eq!(stop_gracefully_wait(&wrap(fast), 10), StopOutcome::Exited);
+
+        // 收尾：显式强杀"仍在运行"的那个（与上面"不强杀"的语义对照）
+        assert!(kill_tree(&mp), "显式强杀才允许结束进程树");
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!pid_alive(pid), "显式强杀后必须真的退出");
     }
 }
